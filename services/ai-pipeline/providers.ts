@@ -7,7 +7,10 @@ export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; 
 export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]>; }
 
 export class OpenAITranscriptionProvider implements TranscriptionProvider {
-  constructor(private readonly apiKey: string, private readonly endpoint = "https://api.openai.com/v1/audio/transcriptions", private readonly model = "whisper-1") {}
+  private readonly apiKey: string;
+  private readonly endpoint: string;
+  private readonly model: string;
+  constructor(apiKey: string, endpoint = "https://api.openai.com/v1/audio/transcriptions", model = "whisper-1") { this.apiKey = apiKey; this.endpoint = endpoint; this.model = model; }
   async transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript> {
     const form = new FormData(); form.append("file", new Blob([input.audio], { type: "audio/wav" }), "audio.wav"); form.append("model", this.model); form.append("response_format", "verbose_json");
     const response = await fetch(this.endpoint, { method: "POST", headers: { Authorization: `Bearer ${this.apiKey}` }, body: form, signal: input.signal });
@@ -20,7 +23,10 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
 }
 
 export class GeminiHighlightProvider implements HighlightProvider {
-  constructor(private readonly apiKey: string, private readonly model = "gemini-2.0-flash", private readonly endpoint = "https://generativelanguage.googleapis.com/v1beta/models") {}
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly endpoint: string;
+  constructor(apiKey: string, model = "gemini-2.0-flash", endpoint = "https://generativelanguage.googleapis.com/v1beta/models") { this.apiKey = apiKey; this.model = model; this.endpoint = endpoint; }
   async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
     const prompt = `Return JSON array only. Choose 3-5 complete short-video highlights. Each item has start,end,title,hook,score,reason,wordIds. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(input.transcript)}`;
     const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }), signal: input.signal });

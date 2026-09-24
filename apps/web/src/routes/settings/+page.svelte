@@ -2,15 +2,18 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
 
-  let model = $state("tiny");
-  let device = $state("cpu");
-  let runtimeReady = $state(false);
-  let runtimeMessage = $state("Checking…");
-  let storageMessage = $state("…");
-  let licenseMessage = $state("…");
-  let modelBusy = $state(false);
-  let message = $state("");
-  let bundled = $state({ node: false, ffmpeg: false, ffprobe: false });
+let model = $state("tiny");
+let device = $state("cpu");
+let runtimeReady = $state(false);
+let runtimeMessage = $state("Checking…");
+let storageMessage = $state("…");
+let licenseMessage = $state("…");
+let modelBusy = $state(false);
+let message = $state("");
+let bundled = $state({ node: false, ffmpeg: false, ffprobe: false });
+let strategy = $state("heuristic");
+let geminiKey = $state("");
+let strategyBusy = $state(false);
 
   async function refresh() {
     try {
@@ -26,6 +29,16 @@
     } catch (error) { message = `Refresh failed: ${String(error)}`; }
   }
 
+  async function saveStrategy(next: string, key: string) {
+    strategyBusy = true;
+    try {
+      strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key });
+      geminiKey = next === "semantic" ? key : "";
+      message = next === "semantic" ? "Semantic (Gemini) strategy saved — API key stored locally in runtime.env." : "Heuristic strategy saved — no cloud calls.";
+    } catch (error) { message = `Strategy change failed: ${String(error)}`; }
+    finally { strategyBusy = false; }
+  }
+
   async function setModel(next: string) {
     modelBusy = true;
     try { model = await invoke<string>("set_runtime_model", { model: next }); message = `Model set to ${model}.`; }
@@ -34,7 +47,15 @@
   }
 
   function formatBytes(bytes: number) { return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`; }
-  onMount(refresh);
+  async function readStrategy() {
+  try {
+    const status = await invoke<{ strategy?: string; hasKey?: boolean }>("highlight_strategy_status");
+    strategy = status.strategy === "semantic" ? "semantic" : "heuristic";
+    geminiKey = status.hasKey ? "••••••••" : "";
+  } catch { /* not in Tauri (browser dev): keep defaults */ }
+}
+onMount(refresh);
+onMount(readStrategy);
 </script>
 
 <h1>Settings</h1>
@@ -48,6 +69,7 @@
   </dl>
   <p class="hint">Bundled binaries: Node {bundled.node ? "✓" : "—"} · FFmpeg {bundled.ffmpeg ? "✓" : "—"} · ffprobe {bundled.ffprobe ? "✓" : "—"}</p>
   <button onclick={refresh}>Refresh</button>
+  <button onclick={readStrategy} class="hint-btn">Reload strategy</button>
 </section>
 
 <section class="card">
@@ -58,6 +80,20 @@
   </div>
   <p class="hint">Current: {model} on {device === "cuda" ? "GPU" : "CPU"}.</p>
   {#if message}<p aria-live="polite">{message}</p>{/if}
+</section>
+
+<section class="card">
+  <h2>Highlight strategy</h2>
+  <p class="hint">Heuristic = offline, deterministic, no cost. Semantic = Gemini LLM proposes clips by meaning (uses your API key, local storage only).</p>
+  <div class="model-row">
+    <button class="chip" class:sel={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "")}>Heuristic (offline)</button>
+    <button class="chip" class:sel={strategy === "semantic"} disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic", geminiKey)}>Semantic (Gemini BYOK)</button>
+  </div>
+  {#if strategy === "semantic"}
+    <label class="hint">Gemini API key <input type="password" value={geminiKey} oninput={(e) => geminiKey = e.currentTarget.value} placeholder="AIza..." /></label>
+    <button class="chip" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic", geminiKey)}>Save key</button>
+  {/if}
+  <p class="hint">Current: {strategy}{strategy === "semantic" ? (geminiKey ? " · key stored" : " · no key yet") : ""}.</p>
 </section>
 
 <section class="card">

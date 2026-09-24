@@ -152,3 +152,18 @@ export function createMockSemanticProvider(
     },
   };
 }
+
+/**
+ * Adapts the existing LLM HighlightProvider interface (Gemini, etc.) to the
+ * SemanticHighlightProvider shape expected by the local-first pipeline.
+ */
+export class SemanticProviderAdapter implements SemanticHighlightProvider {
+  private readonly inner: { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> };
+  private readonly name: string;
+  constructor(inner: { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> }, name = "semantic-llm") { this.inner = inner; this.name = name; }
+
+  async generate(input: { transcript: Transcript; options?: SemanticHighlightOptions; signal?: AbortSignal }): Promise<SemanticHighlightResult> {
+    const highlights = await this.inner.choose({ transcript: input.transcript, signal: input.signal });
+    return { highlights, provider: this.name, rawProposals: highlights.map((h) => ({ start: h.start, end: h.end, wordIds: h.wordIds, title: h.title, hook: h.hook, score: h.score, reason: h.reason })) };
+  }
+}

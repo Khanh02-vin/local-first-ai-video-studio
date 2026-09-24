@@ -1,4 +1,5 @@
-import { analyzeLocalVideo } from "../services/ai-pipeline/index.ts";
+import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
+import { GeminiHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -31,24 +32,49 @@ process.on("SIGINT", onSignal);
 try {
   store?.update(jobId!, { status: "running", phase: "transcribe", progress: 0.1 });
   store?.setWorkerPid(jobId!, process.pid);
-  const result = await analyzeLocalVideo(mediaPath, sourceArtifactId, rangeEnd - rangeStart, {
-    command: process.env.WHISPER_COMMAND,
-    model: process.env.WHISPER_MODEL,
-    language: process.env.WHISPER_LANGUAGE,
-    device: process.env.WHISPER_DEVICE,
-    fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true",
-    offsetSeconds: rangeStart,
-    sourceDuration: duration,
-    onChunkStart: (index, total) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
-    onChunkComplete: (index, total, cacheHit) => {
-      store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });
-      store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * (index + 1) / total });
-      // Real progress proves the worker is healthy, so the crash budget restarts.
-      store?.resetAttempts(jobId!);
-    },
-    onChunkFail: (index, total, error) => store?.updateChunk(jobId!, index, { status: "failed", error }),
-    onProgress: (completed, total) => store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * completed / total }),
-  });
+  const strategy = process.env.HIGHLIGHT_STRATEGY ?? "heuristic";
+  const geminiKey = process.env.GEMINI_API_KEY ?? "";
+  let result: Awaited<ReturnType<typeof analyzeLocalVideo>>;
+  if (strategy === "semantic" && geminiKey) {
+    const semanticProvider: SemanticHighlightProvider = new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini");
+    result = await analyzeLocalVideoWithSemantic(mediaPath, sourceArtifactId, rangeEnd - rangeStart, {
+      semanticProvider,
+      semanticLimit: 5,
+      command: process.env.WHISPER_COMMAND,
+      model: process.env.WHISPER_MODEL,
+      language: process.env.WHISPER_LANGUAGE,
+      device: process.env.WHISPER_DEVICE,
+      fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true",
+      offsetSeconds: rangeStart,
+      sourceDuration: duration,
+      onChunkStart: (index, total) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
+      onChunkComplete: (index, total, cacheHit) => {
+        store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });
+        store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * (index + 1) / total });
+        store?.resetAttempts(jobId!);
+      },
+      onChunkFail: (index, total, error) => store?.updateChunk(jobId!, index, { status: "failed", error }),
+      onProgress: (completed, total) => store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * completed / total }),
+    });
+  } else {
+    result = await analyzeLocalVideo(mediaPath, sourceArtifactId, rangeEnd - rangeStart, {
+      command: process.env.WHISPER_COMMAND,
+      model: process.env.WHISPER_MODEL,
+      language: process.env.WHISPER_LANGUAGE,
+      device: process.env.WHISPER_DEVICE,
+      fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true",
+      offsetSeconds: rangeStart,
+      sourceDuration: duration,
+      onChunkStart: (index, total) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
+      onChunkComplete: (index, total, cacheHit) => {
+        store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });
+        store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * (index + 1) / total });
+        store?.resetAttempts(jobId!);
+      },
+      onChunkFail: (index, total, error) => store?.updateChunk(jobId!, index, { status: "failed", error }),
+      onProgress: (completed, total) => store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * completed / total }),
+    });
+  }
   if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
   // Free tier: only the top 3 highlights, CPU + tiny already enforced by start_analysis.
   if (process.env.LICENSE_TIER !== "pro") result.highlights = result.highlights.slice(0, 3);

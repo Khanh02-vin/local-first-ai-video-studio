@@ -2,7 +2,7 @@ import { transcribeWithWhisper, type WhisperOptions } from "../../adapters/local
 import { transcribeChunkedWithWhisper, type ChunkedWhisperOptions } from "../../adapters/local/chunked-whisper.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
-import { validateHighlights } from "../../packages/contracts/highlight.ts";
+import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
 import { mockHighlights, mockTranscribe } from "../../adapters/providers/mock.ts";
 
@@ -46,13 +46,21 @@ export async function analyzeLocalVideoWithSemantic(
     : await transcribeWithWhisper(audioPath, sourceArtifactId, sourceDuration, options);
 
   const provider = options.semanticProvider ?? new NotImplementedSemanticProvider();
-  const highlights = await generateSemanticHighlights(transcript, provider, {
-    category: options.semanticCategory,
-    limit: options.semanticLimit,
-    minDuration: 10,
-    maxDuration: 90,
-  });
-
+  let highlights: Highlight[];
+  try {
+    highlights = await generateSemanticHighlights(transcript, provider, {
+      category: options.semanticCategory,
+      limit: options.semanticLimit,
+      minDuration: 10,
+      maxDuration: 90,
+    });
+  } catch (error) {
+    // Provider (e.g. Gemini) failure or unsupported input: fall back to the
+    // deterministic selector so the user still gets candidates instead of a hard error.
+    const fallback = duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);
+    console.warn(`[ai-pipeline] semantic provider failed (${error instanceof Error ? error.message : error}); fell back to ${duration > 120 ? "content" : "heuristic"} selector`);
+    highlights = fallback;
+  }
   validateTranscript(transcript);
   validateHighlights(highlights, duration);
   return { transcript, highlights };

@@ -46,10 +46,40 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
     let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let fp16 = if device == "cuda" { "True" } else { "False" };
-    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\n");
+    let highlight_strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
+    let gemini_api_key = file.get("GEMINI_API_KEY").cloned().filter(|c| !c.is_empty()).unwrap_or_default();
+    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={highlight_strategy}\nGEMINI_API_KEY={gemini_api_key}\n");
     std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
     std::fs::write(state_dir().join("runtime.env"), text).map_err(|e| format!("RUNTIME_ENV:{e}"))?;
     Ok(model)
+}
+
+/// Persists the highlight strategy ("heuristic" or "semantic") and an optional Gemini API key
+/// into runtime.env so the analysis worker picks the right strategy.
+#[tauri::command]
+fn set_highlight_strategy(_app: tauri::AppHandle, strategy: String, gemini_api_key: String) -> Result<String, String> {
+    if !["heuristic", "semantic"].contains(&strategy.as_str()) { return Err("INVALID_STRATEGY: choose heuristic or semantic".into()); }
+    let file = runtime_env();
+    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
+    let model = file.get("WHISPER_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "tiny".into());
+    let device = file.get("WHISPER_DEVICE").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "cpu".into());
+    let fp16 = file.get("WHISPER_FP16").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "False".into());
+    // Keep the previously stored key when switching back to heuristic so the user's key is not lost.
+    let key = if strategy == "semantic" { gemini_api_key.clone() } else { file.get("GEMINI_API_KEY").cloned().unwrap_or_default() };
+    if strategy == "semantic" && key.trim().is_empty() { return Err("SEMANTIC_REQUIRES_GEMINI_API_KEY".into()); }
+    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={strategy}\nGEMINI_API_KEY={key}\n");
+    std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
+    std::fs::write(state_dir().join("runtime.env"), text).map_err(|e| format!("RUNTIME_ENV:{e}"))?;
+    Ok(strategy)
+}
+/// Reports the currently stored highlight strategy and whether a Gemini key is present
+/// (the key itself is never returned to the UI — only a hasKey flag).
+#[tauri::command]
+fn highlight_strategy_status(_app: tauri::AppHandle) -> serde_json::Value {
+    let file = runtime_env();
+    let strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
+    let has_key = file.get("GEMINI_API_KEY").cloned().map(|k| !k.trim().is_empty()).unwrap_or(false);
+    serde_json::json!({ "strategy": strategy, "hasKey": has_key })
 }
 fn node_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "node/bin/node", "node") }
 fn ffmpeg_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffmpeg", "ffmpeg") }
@@ -280,7 +310,7 @@ fn main() {
         .manage(jobs)
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
         .run(tauri::generate_context!())
         .expect("error while running desktop application");
 }
