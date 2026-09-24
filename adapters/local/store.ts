@@ -68,7 +68,15 @@ export class LocalStore {
   create(job: JobCreateInput): LocalJob {
     const key = job.idempotencyKey ?? jobContentKey(job.input, job.start, job.end, job.aspectRatio);
     const existing = this.db.prepare("SELECT * FROM jobs WHERE idempotency_key=?").get(key) as Raw | undefined;
-    if (existing) return map(existing);
+    if (existing) {
+      // "Re-render" after a terminal state: the user clicked again, so restart the same
+      // record from scratch instead of handing back a dead one.
+      if (existing.status === "cancelled" || existing.status === "failed") {
+        this.db.prepare("UPDATE jobs SET status='queued', progress=0, attempts=0, error=null WHERE id=?").run(existing.id);
+        return this.get(existing.id)!;
+      }
+      return map(existing);
+    }
     this.db.prepare("INSERT INTO jobs (id,input,output,start,end,aspect_ratio,status,max_attempts,idempotency_key,analysis_job_id) VALUES (?,?,?,?,?,?, 'queued', ?,?,?)")
       .run(job.id, job.input, job.output, job.start, job.end, job.aspectRatio, job.maxAttempts ?? 2, key, job.analysisJobId ?? null);
     return this.get(job.id)!;

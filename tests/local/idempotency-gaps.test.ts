@@ -86,6 +86,22 @@ try {
   const jobB = await api.createRenderJob(["src-1"], "cloud", "client-key-1");
   assertFixed("GAP-4", typeof api === "object" && jobA.idempotencyKey === "client-key-1" && jobA.idempotencyKey === jobB.idempotencyKey,
     "ApiService parses in strip-only mode and preserves a caller-supplied idempotency key (repeatable requests stay identifiable)");
+
+  // GAP-5: requeue on terminal state — clicking "Render" again must restart the job, not
+  // hand back a dead one. create() on the same key returns a re-queued job for cancelled
+  // and failed states (both are "user gave up, try again" — not a live in-flight job).
+  const requeueStore = LocalStore.open(join(root, "requeue-jobs.sqlite"));
+  const jobCancelled = requeueStore.create({ id: "rc", input: "vid-a.mp4", output: "o-a.mp4", start: 0, end: 5, aspectRatio: "9:16" });
+  requeueStore.update(jobCancelled.id, { status: "cancelled" });
+  const retryCancelled = requeueStore.create({ id: "rc2", input: "vid-a.mp4", output: "o-a.mp4", start: 0, end: 5, aspectRatio: "9:16" });
+  assertFixed("GAP-5", retryCancelled.id === jobCancelled.id && retryCancelled.status === "queued",
+    "create() on a cancelled job re-queues the same record instead of returning a dead one");
+  const jobFailed = requeueStore.create({ id: "rf", input: "vid-b.mp4", output: "o-b.mp4", start: 0, end: 5, aspectRatio: "9:16" });
+  requeueStore.update(jobFailed.id, { status: "failed", error: "attempt budget exhausted" });
+  const retryFailed = requeueStore.create({ id: "rf2", input: "vid-b.mp4", output: "o-b.mp4", start: 0, end: 5, aspectRatio: "9:16" });
+  assertFixed("GAP-5b", retryFailed.id === jobFailed.id && retryFailed.status === "queued" && retryFailed.attempts === 0,
+    "create() on a failed job (retry exhausted) resets the crash budget and re-queues the same record");
+  requeueStore.close();
 } finally {
   await rm(root, { recursive: true, force: true });
 }
