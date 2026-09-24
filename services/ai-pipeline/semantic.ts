@@ -23,6 +23,8 @@ export type SemanticHighlightOptions = {
   limit?: number;
   minDuration?: number;
   maxDuration?: number;
+  minWindowDuration?: number;
+  maxWindowDuration?: number;
 };
 
 export interface SemanticHighlightProvider {
@@ -103,11 +105,13 @@ export async function generateSemanticHighlights(
   provider: SemanticHighlightProvider,
   options: SemanticHighlightOptions = {}
 ): Promise<Highlight[]> {
-  const mergedOptions: Required<SemanticHighlightOptions> = {
+  const mergedOptions = {
     category: options.category ?? "default",
     limit: options.limit ?? 5,
     minDuration: options.minDuration ?? 10,
     maxDuration: options.maxDuration ?? 90,
+    minWindowDuration: options.minWindowDuration ?? 60,
+    maxWindowDuration: options.maxWindowDuration ?? 180,
   };
 
   const result = await provider.generate({ transcript, options: mergedOptions });

@@ -22,19 +22,74 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
   }
 }
 
+type LlmHighlightProposal = { start: number; end: number; wordIds: string[]; title: string; hook?: string; score: number; reason?: string };
+
 export class GeminiHighlightProvider implements HighlightProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly endpoint: string;
   constructor(apiKey: string, model = "gemini-2.0-flash", endpoint = "https://generativelanguage.googleapis.com/v1beta/models") { this.apiKey = apiKey; this.model = model; this.endpoint = endpoint; }
   async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
-    const prompt = `Return JSON array only. Choose 3-5 complete short-video highlights. Each item has start,end,title,hook,score,reason,wordIds. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(input.transcript)}`;
-    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }), signal: input.signal });
+    // Long videos exceed a single comfortable LLM context, so split the transcript into
+    // windows, get per-window proposals, then merge and de-overlap into the final 3-5.
+    const windows = highlightWindows(input.transcript, 20 * 60, 5 * 60);
+    const perWindow: Highlight[][] = [];
+    for (let i = 0; i < windows.length; i++) {
+      const { from, to, window } = windows[i];
+      const local = await this.chooseTranscript(window, input.signal);
+      const shifted = local.map((item, index) => ({ ...item, id: `h-${i}-${index}`, start: from + item.start, end: from + item.end }));
+      perWindow.push(shifted);
+    }
+    const highlights = mergeWindowHighlights(perWindow, input.transcript);
+    validateHighlights(highlights, input.transcript.duration); return highlights;
+  }
+  async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
+    const prompt = `Return JSON array only. Choose up to 5 complete short-video highlights from this transcript window. Each item has start,end,title,hook,score,reason,wordIds, with times relative to the window start. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(transcript)}`;
+    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }), signal });
     if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
     const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
     const parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")) as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
-    const highlights = parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: input.transcript.sourceArtifactId }));
-    validateHighlights(highlights, input.transcript.duration); return highlights;
+    const highlights = parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end }));
+    for (const item of highlights) if (item.end - item.start > transcript.duration) { item.end = item.start + Math.min(transcript.duration, Math.max(5, item.end - item.start)); }
+    return highlights;
   }
+}
+
+/** Slice a transcript into consecutive windows (with overlap) so a long recording never
+ *  exceeds a single LLM call. Windows are offset in seconds; each carries the original
+ *  transcript-relative time so proposals can be shifted back to absolute timestamps.
+ */
+export function highlightWindows(transcript: Transcript, windowSeconds = 20 * 60, overlapSeconds = 5 * 60): Array<{ from: number; to: number; window: Transcript }> {
+  const duration = transcript.duration;
+  const windows: Array<{ from: number; to: number; window: Transcript }> = [];
+  const step = Math.max(1, windowSeconds - overlapSeconds);
+  for (let from = 0; from < duration; from += step) {
+    const to = Math.min(duration, from + windowSeconds);
+    // LLM highlight selection only needs the words (the text + timings). Segments are
+    // dropped when slicing a window: a segment that straddles the window boundary cannot be
+    // shifted reliably, and a truncated segment would break word-order validation.
+    const inWindow = transcript.words.filter((word) => word.end > from && word.start < to);
+    const window: Transcript = { version: transcript.version, sourceArtifactId: transcript.sourceArtifactId, language: transcript.language, duration: to - from, words: inWindow.map((word) => ({ ...word, start: word.start - from, end: word.end - from })), segments: [], provider: transcript.provider };
+    validateTranscript(window);
+    windows.push({ from, to, window });
+    if (to === duration) break;
+  }
+  return windows.length ? windows : [{ from: 0, to: duration, window: transcript }];
+}
+
+/** Merge per-window proposals: clamp to the source, sort by score, drop overlaps, cap at 5. */
+export function mergeWindowHighlights(perWindow: Highlight[][], source: Transcript): Highlight[] {
+  const all = perWindow.flat();
+  const ranked = all
+    .filter((item) => item.start >= 0 && item.end <= source.duration && item.end > item.start)
+    .sort((a, b) => b.score - a.score || a.start - b.start)
+    .slice(0, 5);
+  const chosen: Highlight[] = [];
+  for (const candidate of ranked) {
+    if (chosen.some((other) => candidate.start < other.end && other.start < candidate.end)) continue;
+    chosen.push(candidate);
+    if (chosen.length >= 5) break;
+  }
+  return chosen.sort((a, b) => a.start - b.start);
 }

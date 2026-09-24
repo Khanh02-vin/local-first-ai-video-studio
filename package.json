@@ -2,7 +2,9 @@
   "name": "local-first-ai-video-studio",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test:contracts": "node --experimental-strip-types tests/contracts/contracts.test.ts",
     "test:engine-parity": "node --experimental-strip-types tests/engine-parity/media-engine.test.ts",
@@ -12,6 +14,7 @@
     "test:security": "node --experimental-strip-types tests/security/platform-boundaries.test.ts",
     "test:semantic": "node --experimental-strip-types tests/ai-pipeline/semantic.test.ts",
     "test:idempotency": "node --experimental-strip-types tests/local/idempotency-gaps.test.ts",
-    "test": "npm run test:contracts && npm run test:engine-parity && npm run test:local && npm run test:pipeline && npm run test:local-mvp && npm run test:security && npm run test:semantic && npm run test:idempotency"
+    "test": "npm run test:contracts && npm run test:engine-parity && npm run test:local && npm run test:pipeline && npm run test:local-mvp && npm run test:security && npm run test:semantic && npm run test:idempotency && npm run test:long-video",
+    "test:long-video": "node --experimental-strip-types tests/ai-pipeline/long-video.test.ts"
   }
 }
