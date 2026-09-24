@@ -1,0 +1,15 @@
+{
+  "name": "@local-first-ai-video-studio/media-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./probe": "./probe/index.ts",
+    "./transcript": "./transcript/index.ts",
+    "./reframe": "./reframe/index.ts",
+    "./subtitles": "./subtitles/index.ts",
+    "./render-plan": "./render-plan/index.ts",
+    "./validation": "./validation/index.ts"
+  }
+}

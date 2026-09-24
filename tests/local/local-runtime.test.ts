@@ -1,0 +1,24 @@
+import assert from "node:assert/strict";
+import { mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { LocalRunner } from "../../adapters/local/runner.ts";
+
+const root = "/tmp/local-first-ai-video-studio-test";
+await rm(root, { recursive: true, force: true });
+await mkdir(root, { recursive: true });
+const input = join(root, "input.mp4");
+const output = join(root, "output.mp4");
+const ffmpeg = process.env.FFMPEG_PATH ?? "/home/khanh/.local/bin/ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH ?? "/home/khanh/.local/bin/ffprobe";
+const { execFile } = await import("node:child_process");
+const { promisify } = await import("node:util");
+await promisify(execFile)(ffmpeg, ["-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-f", "lavfi", "-i", "sine=frequency=1000", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", input]);
+const runner = new LocalRunner({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
+const job = runner.enqueue({ input, output });
+assert.equal(job.status, "queued");
+await runner.drain();
+assert.equal(runner.store.get(job.id)?.status, "completed");
+assert.ok((runner.store.get(job.id)?.outputBytes ?? 0) > 0);
+assert.throws(() => runner.enqueue({ input, output: input }), /OUTPUT_MUST_DIFFER_FROM_INPUT/);
+runner.close();
+console.log("local runtime tests: ok");

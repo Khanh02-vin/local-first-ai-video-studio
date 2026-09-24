@@ -1,0 +1,92 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { LocalRunner } from "../../adapters/local/runner.ts";
+import { LocalStore } from "../../adapters/local/store.ts";
+import { AnalysisStore } from "../../adapters/local/analysis-store.ts";
+import { chunkCacheKey, sourceFingerprint } from "../../adapters/local/analysis-cache.ts";
+import { ApiService } from "../../services/api/index.ts";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const root = await mkdtemp(join(tmpdir(), "idempotency-gaps-"));
+const ffmpeg = process.env.FFMPEG_PATH ?? "/home/khanh/.local/bin/ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH ?? "/home/khanh/.local/bin/ffprobe";
+
+function assertFixed(name: string, fact: boolean, description: string): void {
+  assert.ok(fact, `${name}: ${description}`);
+  console.log(`${name} fixed: ${description}`);
+}
+
+async function makeMp4(path: string, seconds = 2): Promise<void> {
+  await execFileAsync(ffmpeg, [
+    "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10",
+    "-f", "lavfi", "-i", "sine=frequency=1000", "-t", String(seconds),
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", path,
+  ]);
+}
+
+try {
+  // GAP-1: two user clicks on the same render request must dedupe to one job.
+  const input = join(root, "input.mp4");
+  const output = join(root, "output.mp4");
+  await makeMp4(input, 2);
+  const runner = new LocalRunner({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
+  const click1 = runner.enqueue({ input, output, aspectRatio: "9:16" });
+  const click2 = runner.enqueue({ input, output, aspectRatio: "9:16" });
+  assertFixed("GAP-1", click1.id === click2.id && runner.store.list().length === 1,
+    "two identical enqueues now return the same job instead of stacking a second one");
+  const otherAspect = runner.enqueue({ input, output: join(root, "o2.mp4"), aspectRatio: "16:9" });
+  assertFixed("GAP-1b", otherAspect.id !== click1.id && runner.store.list().length === 2,
+    "a different aspect ratio is a distinct render and still enqueues its own job");
+  runner.close();
+
+  // GAP-2: a render bound to an analysis job is deferred until that analysis completes.
+  const analysisDb = join(root, "analysis.sqlite");
+  const jobsDb = join(root, "jobs.sqlite");
+  const analysis = AnalysisStore.open(analysisDb);
+  analysis.create("an-1", "vid.mp4", 60);
+  analysis.update("an-1", { status: "running", phase: "transcribe", progress: 0.2 });
+  const store = LocalStore.open(jobsDb, analysisDb);
+  store.create({ id: "r-1", input: "vid.mp4", output: "out.mp4", start: null, end: null, aspectRatio: "9:16", analysisJobId: "an-1" });
+  const whileRunning = store.claim();
+  assertFixed("GAP-2", whileRunning === undefined,
+    "claim() refuses to start a render whose analysis job has not completed");
+  analysis.update("an-1", { status: "completed" });
+  const afterCompletion = store.claim();
+  assertFixed("GAP-2b", afterCompletion?.id === "r-1" && afterCompletion.status === "running",
+    "the render is claimed only after the analysis it depends on is completed");
+  store.close();
+  analysis.close();
+
+  // GAP-3: the chunk cache key is stable for an untouched source but invalidates when the
+  // source file is replaced at the same path; a stale initial fingerprint can never hit a live entry.
+  const mediaDir = join(root, "media");
+  await mkdir(mediaDir, { recursive: true });
+  const mediaPath = join(mediaDir, "video.mp4");
+  await makeMp4(mediaPath, 2);
+  const fpBefore = await sourceFingerprint(mediaPath);
+  const stableKey = await chunkCacheKey(mediaPath, 0, 0, 5, "tiny", "auto", "cpu", false, fpBefore);
+  const stableKeyAgain = await chunkCacheKey(mediaPath, 0, 0, 5, "tiny", "auto", "cpu", false, await sourceFingerprint(mediaPath));
+  assertFixed("GAP-3", stableKey === stableKeyAgain,
+    "the chunk cache key stays stable across re-runs for an unchanged source (no cache churn)");
+  await writeFile(mediaPath, "replaced-content", "utf8");
+  const replacedKey = await chunkCacheKey(mediaPath, 0, 0, 5, "tiny", "auto", "cpu", false, await sourceFingerprint(mediaPath));
+  assertFixed("GAP-3b", stableKey !== replacedKey,
+    "a replaced source file at the same path produces a different cache key, so stale transcripts cannot be returned");
+
+  // GAP-4 (parse defect): ApiService and its idempotency-key generation are loadable in the
+  // strip-types runtime and accept a client-supplied idempotency key.
+  const api = new ApiService();
+  const jobA = await api.createRenderJob(["src-1"], "cloud", "client-key-1");
+  const jobB = await api.createRenderJob(["src-1"], "cloud", "client-key-1");
+  assertFixed("GAP-4", typeof api === "object" && jobA.idempotencyKey === "client-key-1" && jobA.idempotencyKey === jobB.idempotencyKey,
+    "ApiService parses in strip-only mode and preserves a caller-supplied idempotency key (repeatable requests stay identifiable)");
+} finally {
+  await rm(root, { recursive: true, force: true });
+}
+console.log("idempotency gap tests: ok (all 4 gaps fixed)");

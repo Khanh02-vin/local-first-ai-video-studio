@@ -1,0 +1,15 @@
+keys/
+*.pem
+node_modules/
+.venv/
+target/
+.svelte-kit/
+build/
+dist/
+uploads/
+output/
+*.log
+.DS_Store
+apps/desktop/src-tauri/resources/node/
+apps/desktop/src-tauri/resources/ffmpeg
+apps/desktop/src-tauri/resources/ffprobe

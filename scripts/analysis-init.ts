@@ -1,0 +1,7 @@
+import { AnalysisStore } from "../adapters/local/analysis-store.ts";
+import { sourceFingerprint, chunkCacheKey } from "../adapters/local/analysis-cache.ts";
+const [dbPath,id,input,durationText,startText,endText] = process.argv.slice(2);
+if (!dbPath || !id || !input) process.exit(2);
+const store = AnalysisStore.open(dbPath);
+const duration = Number(durationText); const rangeStart = Number(startText ?? 0); const rangeEnd = Math.min(duration, Number(endText ?? duration)); const setupKey = `${input}|${rangeStart.toFixed(3)}|${rangeEnd.toFixed(3)}|${process.env.WHISPER_MODEL ?? "tiny"}|${process.env.WHISPER_LANGUAGE ?? "auto"}`; if (!store.get(id)) store.create(id,input,duration,rangeStart,rangeEnd,setupKey);
+const chunkSeconds = Math.max(30, Number(process.env.WHISPER_CHUNK_SECONDS ?? 120)); const overlap = Math.min(5, Math.max(0, Number(process.env.WHISPER_OVERLAP_SECONDS ?? 1))); const source = await sourceFingerprint(input); const chunks = []; for (let index = 0; index < Math.max(1, Math.ceil((rangeEnd - rangeStart) / chunkSeconds)); index++) { const start = rangeStart + Math.max(0, index * chunkSeconds - (index ? overlap : 0)); const end = Math.min(rangeEnd, rangeStart + (index + 1) * chunkSeconds); chunks.push({ chunkIndex: index, start, end, cacheKey: await chunkCacheKey(input, index, start, end, process.env.WHISPER_MODEL ?? "tiny", process.env.WHISPER_LANGUAGE, process.env.WHISPER_DEVICE ?? "cpu", process.env.WHISPER_FP16 === "1" || process.env.WHISPER_DEVICE === "cuda", source) }); } store.createChunks(id, chunks); store.close();
