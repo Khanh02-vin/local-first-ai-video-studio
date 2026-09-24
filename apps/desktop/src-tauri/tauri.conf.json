@@ -41,7 +41,8 @@
       "./resources/node": "node",
       "./resources/ffmpeg": "ffmpeg",
       "./resources/ffprobe": "ffprobe",
-      "./resources/models": "models"
+      "./resources/models": "models",
+      "./resources/models/llama": "models/llama"
     },
     "createUpdaterArtifacts": false
   }

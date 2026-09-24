@@ -101,6 +101,86 @@ fn whisper_command() -> String {
     if let Ok(home) = std::env::var("HOME") { if Path::new(&home).join(".local/bin/whisper").is_file() { return format!("{home}/.local/bin/whisper"); } }
     "whisper".into()
 }
+type LlamaState = Arc<Mutex<Option<u32>>>; // pid of the detached llama-server, if running
+fn llama_binary() -> PathBuf {
+    if let Ok(path) = std::env::var("LOCAL_LLM_BINARY") { if Path::new(&path).is_file() { return PathBuf::from(path); } }
+    if let Ok(state) = std::env::var("LOCAL_FIRST_STATE_DIR") {
+        let candidate = Path::new(&state).join("llama/llama-server");
+        if candidate.is_file() { return candidate; }
+    }
+    let project_resource = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/llama/llama-server");
+    if project_resource.is_file() { return project_resource; }
+    PathBuf::from("llama-server")
+}
+fn local_llm_model_path(app: &tauri::AppHandle, model: &str) -> Option<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    let state = state_dir();
+    let candidates = [
+        state.join("models/llama").join(format!("{model}.gguf")),
+        resource_dir.join("models/llama").join(format!("{model}.gguf")),
+    ];
+    for candidate in &candidates { if candidate.is_file() { return Some(candidate.clone()); } }
+    None
+}
+fn ensure_llama_server(state: &LlamaState, app: &tauri::AppHandle, port: u16) -> Result<(), String> {
+    // If a llama-server is already answering on this port, reuse it.
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    if Command::new("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &health_url]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200").unwrap_or(false) {
+        return Ok(());
+    }
+    let binary = llama_binary();
+    let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
+    let model_path = local_llm_model_path(app, &model).ok_or_else(|| format!("LLAMA_MODEL_MISSING:{model}"))?;
+    let mut cmd = Command::new(&binary);
+    cmd.arg("-m").arg(&model_path)
+        .arg("--port").arg(port.to_string())
+        .arg("--host").arg("127.0.0.1")
+        .arg("--ctx-size").arg("4096")
+        .arg("--parallel").arg("2")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let spawned = cmd.spawn().map_err(|e| format!("LLAMA_SPAWN:{e}"))?;
+    let pid = spawned.id();
+    // Detach: drop our handle but keep the pid so we can stop it later.
+
+    drop(spawned);
+    let mut ready = false;
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if Command::new("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &health_url]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200").unwrap_or(false) {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        #[cfg(unix)] let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        return Err("LLAMA_SERVER_TIMEOUT".into());
+    }
+    if let Ok(mut guard) = state.lock() { let _ = guard.insert(pid); }
+    Ok(())
+}
+
+#[tauri::command]
+fn start_local_llm(app: tauri::AppHandle, state: tauri::State<'_, LlamaState>) -> Result<String, String> {
+    let port: u16 = 8080;
+    ensure_llama_server(&state, &app, port)?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+#[tauri::command]
+fn stop_local_llm(state: tauri::State<'_, LlamaState>) -> Result<(), String> {
+    if let Ok(mut guard) = state.lock() {
+        if let Some(pid) = guard.take() {
+            #[cfg(unix)] { let _ = nix_kill(pid); }
+            #[cfg(not(unix))] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status(); }
+        }
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn nix_kill(pid: u32) -> std::io::Result<()> {
+    std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().map(|_| ())
+}
 fn status_script(app: &tauri::AppHandle) -> Result<PathBuf, String> { app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}")).map(|dir| dir.join("scripts/analysis-status.ts")) }
 const NODE_ARGS: &[&str] = &["--experimental-strip-types"];
 fn run_status_script(app: &tauri::AppHandle, args: &[String]) -> Result<serde_json::Value, String> { let script = status_script(app)?; let mut cmd = Command::new(node_bin(app)); cmd.args(NODE_ARGS).arg(script).arg(jobs_path()).args(args); for (key, value) in helper_env(app, &[]) { cmd.env(key, value); } let output = cmd.output().map_err(|e| format!("STATUS_SPAWN:{e}"))?; if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); } serde_json::from_slice(&output.stdout).map_err(|e| format!("STATUS_JSON:{e}")) }
@@ -336,11 +416,25 @@ fn stop_analysis(app: tauri::AppHandle, id: String) -> Result<serde_json::Value,
 fn main() {
     let jobs: Jobs = Arc::new(Mutex::new(HashMap::new()));
     let supervisor_jobs = jobs.clone();
-    tauri::Builder::default()
+    let llama_state: LlamaState = Arc::new(Mutex::new(None));
+    let app = tauri::Builder::default()
         .manage(jobs)
+        .manage(llama_state.clone())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
-        .run(tauri::generate_context!())
-        .expect("error while running desktop application");
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
+        .build(tauri::generate_context!())
+        .expect("error while building desktop application");
+    let llama_shutdown = llama_state.clone();
+    app.run(move |_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            // App is exiting: stop a detached llama-server if it is running.
+            if let Ok(mut guard) = llama_shutdown.lock() {
+                if let Some(pid) = guard.take() {
+                    #[cfg(unix)] { let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status(); }
+                    #[cfg(not(unix))] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status(); }
+                }
+            }
+        }
+    });
 }

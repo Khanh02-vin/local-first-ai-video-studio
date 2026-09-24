@@ -103,6 +103,16 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
   private readonly baseUrl: string;
   private readonly model: string;
   constructor(baseUrl = "http://127.0.0.1:8080", model = "qwen2.5-3b-instruct") { this.baseUrl = baseUrl.replace(/\/+$/, ""); this.model = model; }
+  private modelId?: string;
+  private async resolvedModelId(signal?: AbortSignal): Promise<string> {
+    if (this.modelId) return this.modelId;
+    const response = await fetch(`${this.baseUrl}/v1/models`, { signal });
+    if (!response.ok) throw new Error(`LLAMA_CPP_MODELS_${response.status}`);
+    const raw = await response.json() as { data?: Array<{ id?: string }> };
+    const id = raw.data?.[0]?.id;
+    if (!id) throw new Error("LLAMA_CPP_NO_MODEL_LOADED");
+    this.modelId = id; return id;
+  }
   async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
     const windows = highlightWindows(input.transcript, 20 * 60, 5 * 60);
     const perWindow: Highlight[][] = [];
@@ -115,12 +125,68 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
+    const modelId = await this.resolvedModelId(signal);
     const prompt = `Return a JSON array only. Choose up to 5 complete short-video highlights from this transcript window. Each item: {"start":number,"end":number,"wordIds":string[],"title":string,"hook":string,"score":0-100,"reason":string}. Times are relative to window start. Use only the supplied word IDs. Transcript: ${JSON.stringify(transcript)}`;
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: this.model, temperature: 0.2, messages: [{ role: "user", content: prompt }] }), signal });
-    if (!response.ok) throw new Error(`LLAMA_CPP_PROVIDER_${response.status}`);
+    // Local CPU inference can take minutes per window; give it room without letting a
+    // hung server block forever.
+    const timeout = AbortSignal.timeout(15 * 60_000);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, messages: [{ role: "user", content: prompt }] }), signal: combined });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`LLAMA_CPP_PROVIDER_${response.status}:${body.slice(0, 200)}`);
+    }
     const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
     const text = raw.choices?.[0]?.message?.content ?? "";
-    const parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")) as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
-    return parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end }));
+    // Local models may wrap the array in a code fence or truncate mid-generation
+    // (max_tokens); repair both cases instead of failing the whole analysis.
+    let parsed: Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
+    const start = fenced.indexOf("[");
+    if (start === -1) throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`);
+    let candidate = fenced.slice(start);
+    try { parsed = JSON.parse(candidate); }
+    catch {
+      const repaired = repairTruncatedJsonArray(candidate.trimEnd());
+      try { parsed = JSON.parse(repaired); }
+      catch { throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`); }
+    }
+    // Small local models sometimes emit probability-style scores (0.95) or >100;
+    // normalize so the shared contract (0..100) always holds.
+    return parsed
+      .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start)
+      .map((item, index) => {
+        const rawScore = Number(item.score);
+        const score = Number.isFinite(rawScore) ? (rawScore <= 1 ? Math.round(rawScore * 100) : Math.round(rawScore)) : 0;
+        return { ...item, score: Math.max(0, Math.min(100, score)), title: (item.title || "").trim().slice(0, 120) || "Highlight", version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end };
+      });
   }
+}
+
+/** Best-effort repair of a JSON array that was cut off mid-generation: closes any open
+ *  string, drops a dangling `:`/`,`, and appends missing `}`/`]` in correct nesting order. */
+export function repairTruncatedJsonArray(input: string): string {
+  const withoutFence = input.replace(/```+\s*$/, "");
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of withoutFence) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[") stack.push("]");
+    else if (ch === "{") stack.push("}");
+    else if (ch === "]" || ch === "}") stack.pop();
+  }
+  let out = withoutFence;
+  if (inString) out += '"'; // close the truncated string
+  // Drop a dangling key (`,"key"` or `,"key":`) but never a completed quoted value
+  // (which is preceded by `:` rather than `{`/`,`).
+  out = out.replace(/([,{])\s*"[^"]*"\s*:?\s*$/, "$1").replace(/[:,\s]+$/, "");
+  if (out === "[" || out === "") return "[]";
+  return out + stack.reverse().join("");
 }
