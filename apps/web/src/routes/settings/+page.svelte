@@ -16,6 +16,41 @@ let geminiKey = $state("");
 let localLlmUrl = $state("http://127.0.0.1:8080");
 let localLlmModel = $state("qwen2.5-3b-instruct");
 let strategyBusy = $state(false);
+type Progress = { phase: string; message: string; done: boolean; error?: string | null };
+let whisperProgress = $state<Progress | null>(null);
+let whisperBusy = $state(false);
+let modelProgress = $state<Progress | null>(null);
+let modelPresent = $state(false);
+let llmModelBusy = $state(false);
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+async function setupWhisper() {
+  whisperBusy = true;
+  try { await invoke("bootstrap_whisper"); await pollWhisper(); }
+  catch (error) { message = `Whisper setup failed: ${String(error)}`; whisperBusy = false; }
+}
+async function pollWhisper() {
+  const progress = await invoke<Progress>("whisper_bootstrap_status");
+  whisperProgress = progress;
+  if (progress?.done) { whisperBusy = false; await refresh(); message = progress.error ? `Whisper setup error: ${progress.error}` : "Whisper is ready."; }
+}
+async function downloadModel() {
+  llmModelBusy = true;
+  try { await invoke("download_llm_model"); await pollModel(); }
+  catch (error) { message = `Model download failed: ${String(error)}`; llmModelBusy = false; }
+}
+async function pollModel() {
+  const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("model_download_status");
+  modelProgress = status.progress; modelPresent = status.modelPresent;
+  if (status.progress?.done || modelPresent) { llmModelBusy = false; message = status.progress?.error ? `Model error: ${status.progress.error}` : "Local LLM model ready."; }
+}
+async function reloadSetupState() {
+  try {
+    whisperProgress = await invoke<Progress>("whisper_bootstrap_status");
+    const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("model_download_status");
+    modelProgress = status.progress; modelPresent = status.modelPresent;
+  } catch { /* browser dev: ignore */ }
+}
 
   async function refresh() {
     try {
@@ -66,6 +101,15 @@ let strategyBusy = $state(false);
 }
 onMount(refresh);
 onMount(readStrategy);
+onMount(() => {
+  void reloadSetupState();
+  // Poll while a long-running first-run setup is in flight.
+  pollTimer = setInterval(() => {
+    if (whisperBusy) void pollWhisper();
+    if (llmModelBusy) void pollModel();
+  }, 2000);
+  return () => { if (pollTimer) clearInterval(pollTimer); };
+});
 </script>
 
 <h1>Settings</h1>
@@ -80,6 +124,30 @@ onMount(readStrategy);
   <p class="hint">Bundled binaries: Node {bundled.node ? "✓" : "—"} · FFmpeg {bundled.ffmpeg ? "✓" : "—"} · ffprobe {bundled.ffprobe ? "✓" : "—"}</p>
   <button onclick={refresh}>Refresh</button>
   <button onclick={readStrategy} class="hint-btn">Reload strategy</button>
+</section>
+
+<section class="card">
+  <h2>Whisper (transcription)</h2>
+  <p class="hint">First run on a clean machine: the app creates its own Python environment and installs openai-whisper (downloads PyTorch, a few GB, one time).</p>
+  {#if whisperProgress}
+    <p aria-live="polite">{whisperProgress.message}{whisperProgress.error ? ` — ${whisperProgress.error}` : ""}</p>
+  {:else}
+    <p class="hint">Status unknown — press Setup to check.</p>
+  {/if}
+  <button class="chip" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Setup Whisper"}</button>
+</section>
+
+<section class="card">
+  <h2>Local LLM model</h2>
+  <p class="hint">Offline highlight strategy needs the Qwen2.5-3B GGUF (~2.1 GB). Downloaded once, checksum-verified, stored on this machine.</p>
+  {#if modelPresent}
+    <p class="hint">Model present on disk.</p>
+  {:else if modelProgress}
+    <p aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>
+  {:else}
+    <p class="hint">Not downloaded yet.</p>
+  {/if}
+  <button class="chip" disabled={llmModelBusy || modelPresent} onclick={downloadModel}>{modelPresent ? "Downloaded" : llmModelBusy ? "Downloading…" : "Download model (2.1 GB)"}</button>
 </section>
 
 <section class="card">

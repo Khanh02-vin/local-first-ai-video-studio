@@ -95,7 +95,13 @@ fn ffprobe_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffprobe", 
 /// env/runtime.env first, then a venv next to the app, then plain PATH.
 fn whisper_command() -> String {
     if let Ok(cmd) = std::env::var("WHISPER_COMMAND") { if !cmd.is_empty() { return cmd; } }
-    if let Some(cmd) = runtime_env().get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()) { return cmd; }
+    // runtime.env is authoritative only while the binary it names still exists.
+    if let Some(cmd) = runtime_env().get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()) {
+        if !cmd.contains('/') || Path::new(&cmd).is_file() { return cmd; }
+    }
+    // App-owned venv created by the first-run bootstrap.
+    let app_venv = whisper_venv_bin("whisper");
+    if app_venv.is_file() { return app_venv.to_string_lossy().into_owned(); }
     let project_venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.venv/bin/whisper");
     if project_venv.is_file() { return project_venv.to_string_lossy().into_owned(); }
     if let Ok(home) = std::env::var("HOME") { if Path::new(&home).join(".local/bin/whisper").is_file() { return format!("{home}/.local/bin/whisper"); } }
@@ -219,6 +225,148 @@ fn ensure_bundled_whisper_model(app: &tauri::AppHandle, model: &str) -> Result<(
     }
     std::fs::copy(&source, &dest).map_err(|e| format!("WHISPER_MODEL_COPY:{e}"))?;
     Ok(())
+}
+
+/// Where the app-owned whisper venv lives (created on first run for machines that have
+/// neither a project venv nor a whisper on PATH).
+fn whisper_venv_dir() -> PathBuf { state_dir().join(".venv") }
+fn whisper_venv_bin(name: &str) -> PathBuf {
+    #[cfg(windows)] { whisper_venv_dir().join("Scripts").join(format!("{name}.exe")) }
+    #[cfg(not(windows))] { whisper_venv_dir().join("bin").join(name) }
+}
+
+#[derive(Clone)]
+struct BootstrapState(Arc<Mutex<Option<BootstrapProgress>>>);
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapProgress { phase: String, message: String, done: bool, error: Option<String> }
+/// Picks a Python interpreter that can build a venv, preferring a version torch still
+/// supports (3.10–3.13); falls back to python3 on PATH.
+fn python_binary() -> String {
+    for candidate in ["python3.12", "python3.11", "python3.13", "python3.10", "python3"] {
+        if Command::new(candidate).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) { return candidate.to_string(); }
+    }
+    "python3".into()
+}
+fn set_bootstrap(state: &BootstrapState, phase: &str, message: &str, done: bool, error: Option<String>) {
+    if let Ok(mut guard) = state.0.lock() { let _ = guard.insert(BootstrapProgress { phase: phase.into(), message: message.into(), done, error }); }
+}
+/// Idempotent first-run setup: create the app venv, install openai-whisper, then write
+/// runtime.env so every helper resolves the same whisper. Progress is polled by the UI.
+fn run_whisper_bootstrap(app: &tauri::AppHandle, state: &BootstrapState) -> Result<String, String> {
+    let venv = whisper_venv_dir();
+    let whisper = whisper_venv_bin("whisper");
+    if whisper.is_file() {
+        set_bootstrap(state, "ready", "Whisper already installed.", true, None);
+        return Ok(whisper.to_string_lossy().into_owned());
+    }
+    // Fast path: a usable whisper already exists on this machine (project venv, install
+    // prefix, or PATH). Never re-install a multi-GB PyTorch stack in that case.
+    let existing = whisper_command();
+    let usable = if existing.contains('/') { Path::new(&existing).is_file() } else { command_ready(&existing) };
+    if usable {
+        let file = runtime_env();
+        let model = file.get("WHISPER_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "tiny".into());
+        let _ = ensure_bundled_whisper_model(app, &model);
+        write_runtime_env(&existing, &model);
+        set_bootstrap(state, "ready", "Whisper found on this machine.", true, None);
+        return Ok(existing);
+    }
+    let python = python_binary();
+    if !venv.join("pyvenv.cfg").is_file() {
+        set_bootstrap(state, "venv", &format!("Creating Python environment with {python}…"), false, None);
+        std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
+        let out = Command::new(&python).args(["-m", "venv"]).arg(&venv).output().map_err(|e| format!("PYTHON_SPAWN:{e}"))?;
+        if !out.status.success() { return Err(format!("VENV_FAILED:{}", String::from_utf8_lossy(&out.stderr).trim())); }
+    }
+    let pip = whisper_venv_bin("pip");
+    set_bootstrap(state, "pip", "Upgrading pip…", false, None);
+    let _ = Command::new(&pip).args(["install", "--upgrade", "pip"]).output();
+    set_bootstrap(state, "whisper", "Installing openai-whisper (this downloads PyTorch, a few GB)…", false, None);
+    let install = Command::new(&pip).args(["install", "openai-whisper"]).output().map_err(|e| format!("PIP_SPAWN:{e}"))?;
+    if !install.status.success() { return Err(format!("WHISPER_INSTALL_FAILED:{}", String::from_utf8_lossy(&install.stderr).lines().last().unwrap_or("").trim())); }
+    if !whisper.is_file() { return Err("WHISPER_BINARY_MISSING".into()); }
+    let model = runtime_env().get("WHISPER_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "tiny".into());
+    let _ = ensure_bundled_whisper_model(app, &model);
+    set_bootstrap(state, "env", "Writing runtime configuration…", false, None);
+    write_runtime_env(&whisper.to_string_lossy(), &model)?;
+    set_bootstrap(state, "ready", "Whisper is ready.", true, None);
+    Ok(whisper.to_string_lossy().into_owned())
+}
+
+/// Writes runtime.env preserving every previously chosen option (strategy, keys, endpoints).
+fn write_runtime_env(whisper_path: &str, model: &str) -> Result<(), String> {
+    let file = runtime_env();
+    let strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
+    let gemini = file.get("GEMINI_API_KEY").cloned().unwrap_or_default();
+    let llama_url = file.get("LOCAL_LLM_BASE_URL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "http://127.0.0.1:8080".into());
+    let llama_model = file.get("LOCAL_LLM_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
+    let device = std::env::var("WHISPER_DEVICE").ok().unwrap_or_else(|| "cpu".into());
+    let fp16 = if device == "cuda" { "True" } else { "False" };
+    let text = format!("WHISPER_COMMAND={whisper_path}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={strategy}\nGEMINI_API_KEY={gemini}\nLOCAL_LLM_BASE_URL={llama_url}\nLOCAL_LLM_MODEL={llama_model}\n");
+    std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
+    std::fs::write(state_dir().join("runtime.env"), text).map_err(|e| format!("RUNTIME_ENV:{e}"))
+}
+
+/// Starts the whisper bootstrap in the background (first run on a clean machine).
+#[tauri::command]
+fn bootstrap_whisper(app: tauri::AppHandle, state: tauri::State<'_, BootstrapState>) -> Result<(), String> {
+    if let Ok(guard) = state.0.lock() { if let Some(progress) = guard.as_ref() { if !progress.done { return Ok(()); } } }
+    set_bootstrap(&state, "starting", "Preparing Whisper…", false, None);
+    let app_handle = app.clone();
+    let shared = state.inner().clone();
+    thread::spawn(move || { if let Err(error) = run_whisper_bootstrap(&app_handle, &shared) { set_bootstrap(&shared, "failed", "Whisper setup failed.", true, Some(error)); } });
+    Ok(())
+}
+
+#[tauri::command]
+fn whisper_bootstrap_status(state: tauri::State<'_, BootstrapState>) -> Option<BootstrapProgress> {
+    state.0.lock().ok().and_then(|guard| guard.clone())
+}
+
+#[derive(Clone)]
+struct ModelDownloadState(Arc<Mutex<Option<BootstrapProgress>>>);
+const LLM_MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf";
+const LLM_MODEL_SHA256: &str = "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d";
+fn llm_model_file(model: &str) -> PathBuf { state_dir().join("models/llama").join(format!("{model}.gguf")) }
+fn set_download(state: &ModelDownloadState, phase: &str, message: &str, done: bool, error: Option<String>) {
+    if let Ok(mut guard) = state.0.lock() { let _ = guard.insert(BootstrapProgress { phase: phase.into(), message: message.into(), done, error }); }
+}
+/// Downloads the local-LLM weights on demand (2.1 GB) and verifies the SHA-256 before use.
+fn run_model_download(state: &ModelDownloadState, model: &str) -> Result<String, String> {
+    let target = llm_model_file(model);
+    if target.is_file() {
+        set_download(state, "ready", "Model already downloaded.", true, None);
+        return Ok(target.to_string_lossy().into_owned());
+    }
+    if let Some(parent) = target.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("MODEL_DIR:{e}"))?; }
+    let part = target.with_extension("gguf.part");
+    set_download(state, "download", "Downloading Qwen2.5-3B (~2.1 GB)…", false, None);
+    let curl = Command::new("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(LLM_MODEL_URL).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
+    if !curl.status.success() { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
+    set_download(state, "verify", "Verifying checksum…", false, None);
+    let digest = Command::new("sha256sum").arg(&part).output().map_err(|e| format!("SHA256_SPAWN:{e}"))?;
+    let actual = String::from_utf8_lossy(&digest.stdout).split_whitespace().next().unwrap_or("").to_string();
+    if actual != LLM_MODEL_SHA256 { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_CHECKSUM_MISMATCH:{actual}")); }
+    std::fs::rename(&part, &target).map_err(|e| format!("MODEL_RENAME:{e}"))?;
+    set_download(state, "ready", "Model ready.", true, None);
+    Ok(target.to_string_lossy().into_owned())
+}
+#[tauri::command]
+fn download_llm_model(state: tauri::State<'_, ModelDownloadState>) -> Result<(), String> {
+    if let Ok(guard) = state.0.lock() { if let Some(progress) = guard.as_ref() { if !progress.done { return Ok(()); } } }
+    let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
+    set_download(&state, "starting", "Preparing download…", false, None);
+    let shared = state.inner().clone();
+    thread::spawn(move || { if let Err(error) = run_model_download(&shared, &model) { set_download(&shared, "failed", "Model download failed.", true, Some(error)); } });
+    Ok(())
+}
+#[tauri::command]
+fn model_download_status(state: tauri::State<'_, ModelDownloadState>, app: tauri::AppHandle) -> serde_json::Value {
+    let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
+    let progress = state.0.lock().ok().and_then(|guard| guard.clone());
+    let present = local_llm_model_path(&app, &model).is_some();
+    serde_json::json!({ "progress": progress, "modelPresent": present, "model": model })
 }
 fn storage(path: &Path, required: u64) -> serde_json::Value { let output = Command::new("df").args(["-Pk"]).arg(path).output(); let parsed = output.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|text| text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))); let free = parsed.map(|kb| kb * 1024); serde_json::json!({"path": path, "freeBytes": free, "requiredBytes": required, "ready": free.map(|n| n >= required).unwrap_or(false), "quotaKnown": false}) }
 fn io_error(code: &str, message: impl std::fmt::Display) -> String { let text = message.to_string(); if text.contains("ENOSPC") || text.contains("No space left") { format!("STORAGE_FULL:{text}") } else if text.contains("EDQUOT") || text.contains("Disk quota") { format!("QUOTA_EXCEEDED:{text}") } else { format!("{code}:{text}") } }
@@ -417,12 +565,16 @@ fn main() {
     let jobs: Jobs = Arc::new(Mutex::new(HashMap::new()));
     let supervisor_jobs = jobs.clone();
     let llama_state: LlamaState = Arc::new(Mutex::new(None));
+    let bootstrap_state = BootstrapState(Arc::new(Mutex::new(None)));
+    let download_state = ModelDownloadState(Arc::new(Mutex::new(None)));
     let app = tauri::Builder::default()
         .manage(jobs)
         .manage(llama_state.clone())
+        .manage(bootstrap_state)
+        .manage(download_state)
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();
