@@ -13,6 +13,8 @@ let message = $state("");
 let bundled = $state({ node: false, ffmpeg: false, ffprobe: false });
 let strategy = $state("heuristic");
 let geminiKey = $state("");
+let localLlmUrl = $state("http://127.0.0.1:8080");
+let localLlmModel = $state("qwen2.5-3b-instruct");
 let strategyBusy = $state(false);
 
   async function refresh() {
@@ -29,12 +31,19 @@ let strategyBusy = $state(false);
     } catch (error) { message = `Refresh failed: ${String(error)}`; }
   }
 
-  async function saveStrategy(next: string, key: string) {
+  async function saveStrategy(next: string, key: string, llamaUrl: string, llamaModel: string) {
     strategyBusy = true;
     try {
-      strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key });
-      geminiKey = next === "semantic" ? key : "";
-      message = next === "semantic" ? "Semantic (Gemini) strategy saved — API key stored locally in runtime.env." : "Heuristic strategy saved — no cloud calls.";
+      strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key, localLlmBaseUrl: llamaUrl, localLlmModel: llamaModel });
+      if (next === "semantic-gemini") { geminiKey = key; localLlmUrl = ""; localLlmModel = ""; }
+      else if (next === "semantic-local") { localLlmUrl = llamaUrl; localLlmModel = llamaModel; geminiKey = ""; }
+      else { geminiKey = ""; localLlmUrl = ""; localLlmModel = ""; }
+      const labels: Record<string, string> = {
+        "heuristic": "Heuristic strategy saved — offline, deterministic, no cost.",
+        "semantic-gemini": "Semantic (Gemini) strategy saved — API key stored locally in runtime.env.",
+        "semantic-local": "Local LLM strategy saved — runs offline on this machine (llama.cpp), no API key.",
+      };
+      message = labels[next] ?? "Strategy saved.";
     } catch (error) { message = `Strategy change failed: ${String(error)}`; }
     finally { strategyBusy = false; }
   }
@@ -49,9 +58,10 @@ let strategyBusy = $state(false);
   function formatBytes(bytes: number) { return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`; }
   async function readStrategy() {
   try {
-    const status = await invoke<{ strategy?: string; hasKey?: boolean }>("highlight_strategy_status");
-    strategy = status.strategy === "semantic" ? "semantic" : "heuristic";
+    const status = await invoke<{ strategy?: string; hasKey?: boolean; hasLocalUrl?: boolean }>("highlight_strategy_status");
+    strategy = status.strategy === "semantic-gemini" ? "semantic-gemini" : status.strategy === "semantic-local" ? "semantic-local" : "heuristic";
     geminiKey = status.hasKey ? "••••••••" : "";
+    localLlmUrl = status.hasLocalUrl ? localLlmUrl : "http://127.0.0.1:8080";
   } catch { /* not in Tauri (browser dev): keep defaults */ }
 }
 onMount(refresh);
@@ -84,16 +94,22 @@ onMount(readStrategy);
 
 <section class="card">
   <h2>Highlight strategy</h2>
-  <p class="hint">Heuristic = offline, deterministic, no cost. Semantic = Gemini LLM proposes clips by meaning (uses your API key, local storage only).</p>
+  <p class="hint">Heuristic = offline, deterministic, no cost. Semantic = LLM proposes clips by meaning (Gemini needs your API key; Local LLM needs llama.cpp running, no key).</p>
   <div class="model-row">
-    <button class="chip" class:sel={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "")}>Heuristic (offline)</button>
-    <button class="chip" class:sel={strategy === "semantic"} disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic", geminiKey)}>Semantic (Gemini BYOK)</button>
+    <button class="chip" class:sel={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "", "", "")}>Heuristic (offline)</button>
+    <button class="chip" class:sel={strategy === "semantic-gemini"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Semantic (Gemini BYOK)</button>
+    <button class="chip" class:sel={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Local LLM (offline)</button>
   </div>
-  {#if strategy === "semantic"}
+  {#if strategy === "semantic-gemini"}
     <label class="hint">Gemini API key <input type="password" value={geminiKey} oninput={(e) => geminiKey = e.currentTarget.value} placeholder="AIza..." /></label>
-    <button class="chip" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic", geminiKey)}>Save key</button>
+    <button class="chip" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Save key</button>
   {/if}
-  <p class="hint">Current: {strategy}{strategy === "semantic" ? (geminiKey ? " · key stored" : " · no key yet") : ""}.</p>
+  {#if strategy === "semantic-local"}
+    <label class="hint">Local LLM URL <input type="text" value={localLlmUrl} oninput={(e) => localLlmUrl = e.currentTarget.value} placeholder="http://127.0.0.1:8080" /></label>
+    <label class="hint">Model <input type="text" value={localLlmModel} oninput={(e) => localLlmModel = e.currentTarget.value} placeholder="qwen2.5-3b-instruct" /></label>
+    <button class="chip" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Save</button>
+  {/if}
+  <p class="hint">Current: {strategy}{strategy === "semantic-gemini" ? (geminiKey ? " · key stored" : " · no key yet") : strategy === "semantic-local" ? " · local LLM" : ""}.</p>
 </section>
 
 <section class="card">

@@ -48,38 +48,45 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
     let fp16 = if device == "cuda" { "True" } else { "False" };
     let highlight_strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
     let gemini_api_key = file.get("GEMINI_API_KEY").cloned().filter(|c| !c.is_empty()).unwrap_or_default();
-    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={highlight_strategy}\nGEMINI_API_KEY={gemini_api_key}\n");
+    let local_llm_base_url = file.get("LOCAL_LLM_BASE_URL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "http://127.0.0.1:8080".into());
+    let local_llm_model = file.get("LOCAL_LLM_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct".into());
+    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={highlight_strategy}\nGEMINI_API_KEY={gemini_api_key}\nLOCAL_LLM_BASE_URL={local_llm_base_url}\nLOCAL_LLM_MODEL={local_llm_model}\n");
     std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
     std::fs::write(state_dir().join("runtime.env"), text).map_err(|e| format!("RUNTIME_ENV:{e}"))?;
     Ok(model)
 }
 
-/// Persists the highlight strategy ("heuristic" or "semantic") and an optional Gemini API key
-/// into runtime.env so the analysis worker picks the right strategy.
+/// Persists the highlight strategy ("heuristic" | "semantic-gemini" | "semantic-local"),
+/// an optional Gemini API key, and the local-LLM endpoint into runtime.env so the
+/// analysis worker picks the right strategy.
 #[tauri::command]
-fn set_highlight_strategy(_app: tauri::AppHandle, strategy: String, gemini_api_key: String) -> Result<String, String> {
-    if !["heuristic", "semantic"].contains(&strategy.as_str()) { return Err("INVALID_STRATEGY: choose heuristic or semantic".into()); }
+fn set_highlight_strategy(_app: tauri::AppHandle, strategy: String, gemini_api_key: String, local_llm_base_url: String, local_llm_model: String) -> Result<String, String> {
+    if !["heuristic", "semantic-gemini", "semantic-local"].contains(&strategy.as_str()) { return Err("INVALID_STRATEGY: choose heuristic, semantic-gemini or semantic-local".into()); }
     let file = runtime_env();
     let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
     let model = file.get("WHISPER_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "tiny".into());
     let device = file.get("WHISPER_DEVICE").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "cpu".into());
     let fp16 = file.get("WHISPER_FP16").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "False".into());
-    // Keep the previously stored key when switching back to heuristic so the user's key is not lost.
-    let key = if strategy == "semantic" { gemini_api_key.clone() } else { file.get("GEMINI_API_KEY").cloned().unwrap_or_default() };
-    if strategy == "semantic" && key.trim().is_empty() { return Err("SEMANTIC_REQUIRES_GEMINI_API_KEY".into()); }
-    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={strategy}\nGEMINI_API_KEY={key}\n");
+    // Keep previously stored values when switching strategies so the user's key/url are not lost.
+    let key = if strategy == "semantic-gemini" { gemini_api_key.clone() } else { file.get("GEMINI_API_KEY").cloned().unwrap_or_default() };
+    let llama_url = if strategy == "semantic-local" { local_llm_base_url.clone() } else { file.get("LOCAL_LLM_BASE_URL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "http://127.0.0.1:8080".into()) };
+    let llama_model = if strategy == "semantic-local" { local_llm_model.clone() } else { file.get("LOCAL_LLM_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct".into()) };
+    if strategy == "semantic-gemini" && key.trim().is_empty() { return Err("SEMANTIC_REQUIRES_GEMINI_API_KEY".into()); }
+    if strategy == "semantic-local" && llama_url.trim().is_empty() { return Err("LOCAL_LLM_REQUIRES_BASE_URL".into()); }
+    let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\nHIGHLIGHT_STRATEGY={strategy}\nGEMINI_API_KEY={key}\nLOCAL_LLM_BASE_URL={llama_url}\nLOCAL_LLM_MODEL={llama_model}\n");
     std::fs::create_dir_all(state_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
     std::fs::write(state_dir().join("runtime.env"), text).map_err(|e| format!("RUNTIME_ENV:{e}"))?;
     Ok(strategy)
 }
-/// Reports the currently stored highlight strategy and whether a Gemini key is present
-/// (the key itself is never returned to the UI — only a hasKey flag).
+/// Reports the currently stored highlight strategy plus key/url presence flags
+/// (the key and url themselves are never returned to the UI).
 #[tauri::command]
 fn highlight_strategy_status(_app: tauri::AppHandle) -> serde_json::Value {
     let file = runtime_env();
     let strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
     let has_key = file.get("GEMINI_API_KEY").cloned().map(|k| !k.trim().is_empty()).unwrap_or(false);
-    serde_json::json!({ "strategy": strategy, "hasKey": has_key })
+    let has_local_url = file.get("LOCAL_LLM_BASE_URL").cloned().map(|k| !k.trim().is_empty()).unwrap_or(false);
+    serde_json::json!({ "strategy": strategy, "hasKey": has_key, "hasLocalUrl": has_local_url })
 }
 fn node_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "node/bin/node", "node") }
 fn ffmpeg_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffmpeg", "ffmpeg") }

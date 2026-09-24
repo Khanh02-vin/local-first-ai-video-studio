@@ -93,3 +93,34 @@ export function mergeWindowHighlights(perWindow: Highlight[][], source: Transcri
   }
   return chosen.sort((a, b) => a.start - b.start);
 }
+
+/**
+ * Local LLM via llama.cpp's llama-server (OpenAI-compatible /v1/chat/completions).
+ * No API key, no network egress — the model runs on this machine. Uses the same
+ * window + merge strategy as the cloud Gemini provider, so long videos stay bounded.
+ */
+export class LlamaCppHighlightProvider implements HighlightProvider {
+  private readonly baseUrl: string;
+  private readonly model: string;
+  constructor(baseUrl = "http://127.0.0.1:8080", model = "qwen2.5-3b-instruct") { this.baseUrl = baseUrl.replace(/\/+$/, ""); this.model = model; }
+  async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
+    const windows = highlightWindows(input.transcript, 20 * 60, 5 * 60);
+    const perWindow: Highlight[][] = [];
+    for (let i = 0; i < windows.length; i++) {
+      const { from, window } = windows[i];
+      const local = await this.chooseTranscript(window, input.signal);
+      perWindow.push(local.map((item, index) => ({ ...item, id: `h-${i}-${index}`, start: from + item.start, end: from + item.end })));
+    }
+    const highlights = mergeWindowHighlights(perWindow, input.transcript);
+    validateHighlights(highlights, input.transcript.duration); return highlights;
+  }
+  async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
+    const prompt = `Return a JSON array only. Choose up to 5 complete short-video highlights from this transcript window. Each item: {"start":number,"end":number,"wordIds":string[],"title":string,"hook":string,"score":0-100,"reason":string}. Times are relative to window start. Use only the supplied word IDs. Transcript: ${JSON.stringify(transcript)}`;
+    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: this.model, temperature: 0.2, messages: [{ role: "user", content: prompt }] }), signal });
+    if (!response.ok) throw new Error(`LLAMA_CPP_PROVIDER_${response.status}`);
+    const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const text = raw.choices?.[0]?.message?.content ?? "";
+    const parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")) as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+    return parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end }));
+  }
+}
