@@ -43,7 +43,7 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
     if !["tiny", "base", "small"].contains(&model.as_str()) { return Err("INVALID_MODEL: choose tiny, base or small".into()); }
     if license_tier() != "pro" && model != "tiny" { return Err("PRO_REQUIRED: larger Whisper models need a Pro license".into()); }
     let file = runtime_env();
-    let command = file.get("WHISPER_COMMAND").cloned().unwrap_or_else(|| "whisper".into());
+    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let fp16 = if device == "cuda" { "True" } else { "False" };
     let text = format!("WHISPER_COMMAND={command}\nWHISPER_MODEL={model}\nWHISPER_DEVICE={device}\nWHISPER_FP16={fp16}\n");
@@ -54,6 +54,16 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
 fn node_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "node/bin/node", "node") }
 fn ffmpeg_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffmpeg", "ffmpeg") }
 fn ffprobe_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffprobe", "ffprobe") }
+/// Resolve the whisper CLI the way the local whisper adapter will find it:
+/// env/runtime.env first, then a venv next to the app, then plain PATH.
+fn whisper_command() -> String {
+    if let Ok(cmd) = std::env::var("WHISPER_COMMAND") { if !cmd.is_empty() { return cmd; } }
+    if let Some(cmd) = runtime_env().get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()) { return cmd; }
+    let project_venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.venv/bin/whisper");
+    if project_venv.is_file() { return project_venv.to_string_lossy().into_owned(); }
+    if let Ok(home) = std::env::var("HOME") { if Path::new(&home).join(".local/bin/whisper").is_file() { return format!("{home}/.local/bin/whisper"); } }
+    "whisper".into()
+}
 fn status_script(app: &tauri::AppHandle) -> Result<PathBuf, String> { app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}")).map(|dir| dir.join("scripts/analysis-status.ts")) }
 const NODE_ARGS: &[&str] = &["--experimental-strip-types"];
 fn run_status_script(app: &tauri::AppHandle, args: &[String]) -> Result<serde_json::Value, String> { let script = status_script(app)?; let mut cmd = Command::new(node_bin(app)); cmd.args(NODE_ARGS).arg(script).arg(jobs_path()).args(args); for (key, value) in helper_env(app, &[]) { cmd.env(key, value); } let output = cmd.output().map_err(|e| format!("STATUS_SPAWN:{e}"))?; if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); } serde_json::from_slice(&output.stdout).map_err(|e| format!("STATUS_JSON:{e}")) }
@@ -97,7 +107,7 @@ fn preflight_analyze(path: String) -> Result<serde_json::Value, String> { let in
 #[tauri::command]
 fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     let file = runtime_env();
-    let whisper = std::env::var("WHISPER_COMMAND").ok().or_else(|| file.get("WHISPER_COMMAND").cloned()).unwrap_or("whisper".to_string());
+    let whisper = std::env::var("WHISPER_COMMAND").ok().filter(|c| !c.is_empty()).or_else(|| file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty())).unwrap_or_else(whisper_command);
     let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or("tiny".to_string());
     let model_ready = std::env::var("WHISPER_MODEL_PATH").map(|p| Path::new(&p).exists()).unwrap_or_else(|_| std::env::var("HOME").ok().map(|p| Path::new(&p).join(".cache/whisper").join(format!("{model}.pt")).exists()).unwrap_or(false));
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or("cpu".to_string());
