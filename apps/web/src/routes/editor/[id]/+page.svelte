@@ -19,9 +19,82 @@
   let video: HTMLVideoElement;
   let activeCaptionId = "";
   let draftCaption = "";
+  let timeline: HTMLElement;
+  let dragging: "range" | "in" | "out" | null = null;
+  let dragStartX = 0;
+  let dragStartRange = { start: 0, end: 0 };
 
   $: activeCaption = state.plan.captions.find((caption) => caption.id === activeCaptionId) ?? state.plan.captions[0];
   $: range = state.plan.ranges[0];
+
+  function clientXToTime(event: MouseEvent): number {
+    const rect = timeline.getBoundingClientRect();
+    return Math.max(0, Math.min(sourceDuration, ((event.clientX - rect.left) / rect.width) * sourceDuration));
+  }
+
+  function onRangeKeydown(event: KeyboardEvent) {
+    const step = event.shiftKey ? 1 : 0.25;
+    let handled = true;
+    try {
+      if (event.key === "ArrowLeft" || event.key === "ArrowDown") { state = updateRange(state, { start: Math.max(0, range.start - step), end: range.end }); }
+      else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }); }
+      else handled = false;
+    } catch { handled = false; }
+    if (handled) { studioState.plan = state.plan; event.preventDefault(); }
+  }
+
+  function onTimelineMouseDown(event: MouseEvent) {
+    seekTimeline(event);
+    dragging = "range";
+    dragStartX = event.clientX;
+    dragStartRange = { start: range.start, end: range.end };
+    const onMove = (moveEvent: MouseEvent) => {
+      if (!dragging) return;
+      const rect = timeline.getBoundingClientRect();
+      const movedByClientX = ((moveEvent.clientX - dragStartX) / rect.width) * sourceDuration;
+      let nextStart = dragStartRange.start + movedByClientX;
+      let nextEnd = dragStartRange.end + movedByClientX;
+      if (nextStart < 0) { nextEnd += -nextStart; nextStart = 0; }
+      if (nextEnd > sourceDuration) { nextStart -= nextEnd - sourceDuration; nextEnd = sourceDuration; }
+      try { state = updateRange(state, { start: nextStart, end: nextEnd }); studioState.plan = state.plan; } catch { /* keep the last valid range */ }
+      moveEvent.preventDefault();
+    };
+    const onUp = () => {
+      dragging = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function beginHandleDrag(kind: "in" | "out", event: MouseEvent) {
+    event.stopPropagation();
+    event.preventDefault();
+    dragging = kind;
+    dragStartX = event.clientX;
+    dragStartRange = { start: range.start, end: range.end };
+    const onMove = (moveEvent: MouseEvent) => {
+      if (!dragging) return;
+      const rect = timeline.getBoundingClientRect();
+      const t = ((moveEvent.clientX - rect.left) / rect.width) * sourceDuration;
+      if (dragging === "in") {
+        const nextStart = Math.max(0, Math.min(t, dragStartRange.end - 0.2));
+        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }); studioState.plan = state.plan; seek(nextStart); } catch { /* keep last valid range */ }
+      } else {
+        const nextEnd = Math.min(sourceDuration, Math.max(t, dragStartRange.start + 0.2));
+        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }); studioState.plan = state.plan; seek(nextEnd); } catch { /* keep last valid range */ }
+      }
+      moveEvent.preventDefault();
+    };
+    const onUp = () => {
+      dragging = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   onMount(() => {
     candidates = studioState.highlights.length ? studioState.highlights : [fallback];
@@ -100,11 +173,21 @@
           <div class="frame-guide {state.plan.aspectRatio === "9:16" ? "r916" : state.plan.aspectRatio === "1:1" ? "r11" : "r169"}"><i></i></div>
         </div>
         <div class="transport"><button class="btn btn-icon" aria-label={playing ? "Pause" : "Play"} onclick={togglePlay}>{playing ? "Ⅱ" : "▶"}</button><span class="tc">{clock(currentTime)}</span><span class="transport-track"><span style={`width:${pct(currentTime)}`}></span></span><span class="tc muted">{clock(sourceDuration)}</span></div>
-        <div class="timeline" aria-label="Editor timeline">
-          <div class="tl-ruler" onclick={seekTimeline}>{#each [0, 0.25, 0.5, 0.75, 1] as tick}<span class="tl-tick" style={`left:${tick * 100}%`}></span><span class="tl-tick-label" style={`left:${tick * 100}%`}>{clock(sourceDuration * tick)}</span>{/each}</div>
-          <div class="timeline-label">VIDEO</div><div class="tl-lane" onclick={seekTimeline} role="slider" tabindex="0" aria-label="Video timeline" aria-valuemin="0" aria-valuemax={sourceDuration} aria-valuenow={currentTime}><div class="tl-range" style={`left:${pct(range.start)};width:${(Math.max(0, range.end - range.start) / Math.max(sourceDuration, 1)) * 100}%`}></div><div class="tl-playhead" style={`left:${pct(currentTime)}`}></div></div>
-          <div class="timeline-label">CAPTIONS</div><div class="tl-lane captions" onclick={seekTimeline}>{#each state.plan.captions as caption}<button class="tl-clip" class:on={caption.id === activeCaption?.id} style={`left:${pct(caption.start)};width:${(Math.max(0.5, caption.end - caption.start) / Math.max(sourceDuration, 1)) * 100}%`} onclick={(event) => { event.stopPropagation(); activeCaptionId = caption.id; draftCaption = caption.text; seek(caption.start); }}>{caption.text}</button>{/each}</div>
-          {#if state.plan.hook}<div class="timeline-label">HOOK</div><div class="tl-lane captions" onclick={seekTimeline}><button class="tl-clip tl-hook" style={`left:${pct(state.plan.hook.start)};width:${(Math.max(0.5, state.plan.hook.end - state.plan.hook.start) / Math.max(sourceDuration, 1)) * 100}%`} onclick={(event) => { event.stopPropagation(); seek(state.plan.hook?.start ?? range.start); }}>{state.plan.hook.text}</button></div>{/if}
+        <div class="timeline" aria-label="Editor timeline" bind:this={timeline}>
+          <div class="tl-ruler" role="presentation" onclick={seekTimeline}>{#each [0, 0.25, 0.5, 0.75, 1] as tick}<span class="tl-tick" style={`left:${tick * 100}%`}></span><span class="tl-tick-label" style={`left:${tick * 100}%`}>{clock(sourceDuration * tick)}</span>{/each}</div>
+          <div class="timeline-label">VIDEO</div>
+          <div class="tl-lane" role="presentation" onclick={seekTimeline}>
+            <div class="tl-clip-base"></div>
+            <div class="tl-range" class:dragging={dragging === "range"} style={`left:${pct(range.start)};width:${(Math.max(0, range.end - range.start) / Math.max(sourceDuration, 1)) * 100}%`}
+                 onmousedown={onTimelineMouseDown} onkeydown={onRangeKeydown} role="slider" tabindex="0"
+                 aria-label="Selected range" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={sourceDuration} aria-valuenow={Math.round(range.start * 100) / 100} aria-valuetext={`${clock(range.start)} to ${clock(range.end)}`}>
+              <span class="tl-handle in" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={Math.round(range.end * 100) / 100} aria-valuenow={Math.round(range.start * 100) / 100} aria-label="Trim in" onmousedown={(event) => beginHandleDrag("in", event)}></span>
+              <span class="tl-handle out" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin={Math.round(range.start * 100) / 100} aria-valuemax={sourceDuration} aria-valuenow={Math.round(range.end * 100) / 100} aria-label="Trim out" onmousedown={(event) => beginHandleDrag("out", event)}></span>
+            </div>
+            <div class="tl-playhead" style={`left:${pct(currentTime)}`}></div>
+          </div>
+          <div class="timeline-label">CAPTIONS</div><div class="tl-lane captions" role="presentation" onclick={seekTimeline}>{#each state.plan.captions as caption}<button class="tl-clip" class:on={caption.id === activeCaption?.id} style={`left:${pct(caption.start)};width:${(Math.max(0.5, caption.end - caption.start) / Math.max(sourceDuration, 1)) * 100}%`} onclick={(event) => { event.stopPropagation(); activeCaptionId = caption.id; draftCaption = caption.text; seek(caption.start); }}>{caption.text}</button>{/each}</div>
+          {#if state.plan.hook}<div class="timeline-label">HOOK</div><div class="tl-lane captions" role="presentation" onclick={seekTimeline}><button class="tl-clip tl-hook" style={`left:${pct(state.plan.hook.start)};width:${(Math.max(0.5, state.plan.hook.end - state.plan.hook.start) / Math.max(sourceDuration, 1)) * 100}%`} onclick={(event) => { event.stopPropagation(); seek(state.plan.hook?.start ?? range.start); }}>{state.plan.hook.text}</button></div>{/if}
         </div>
       </div>
     </div>

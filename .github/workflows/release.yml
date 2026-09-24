@@ -1,0 +1,114 @@
+# Release pipeline with code signing.
+#
+# Secrets to configure (org/repo → Settings → Secrets):
+#   APPLE_IDENTITY            — base64 PKCS12 (.p12) of the Apple Developer ID app cert
+#   APPLE_IDENTITY_PASSWORD   — p12 export password
+#   APPLE_TEAM_ID             — Apple Team ID (for notarization)
+#   APPLE_ID                  — Apple ID used for notarization
+#   APPLE_PASSWORD            — App-specific password for notarization
+#   WINDOWS_SIGNING_CERT     — base64 PFX (Windows) code-signing cert (optional)
+#   WINDOWS_SIGNING_PASSWORD — PFX password (optional)
+#
+# On this machine (Linux) these targets are skipped; the pipeline runs on the
+# correct runners when the secrets exist.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+      - run: cargo check
+        working-directory: apps/desktop/src-tauri
+
+  macos:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Restore p12
+        if: ${{ secrets.APPLE_IDENTITY != '' }}
+        run: |
+          echo "${{ secrets.APPLE_IDENTITY }}" | base64 -d > signing.p12
+          security create-keychain -p build build.keychain
+          security import signing.p12 -k build.keychain -P "${{ secrets.APPLE_IDENTITY_PASSWORD }}" -T /usr/bin/codesign
+          security set-keychain-settings -u build.keychain
+          echo "APPLE_SIGNING_IDENTITY=$(security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" '\" 'NR==1{print $2}')" >> "$GITHUB_ENV"
+      - name: Build + sign + notarize
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_IDENTITY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          cd apps/desktop
+          npm install
+          npx tauri build --bundles app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+
+  windows:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build + sign
+        env:
+          # Tauri 2 signs when these are set; otherwise it builds unsigned.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cd apps/desktop
+          npm install
+          npx tauri build --bundles msi,nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/msi/*
+            apps/desktop/src-tauri/target/release/bundle/nsis/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Build bundles
+        run: |
+          cd apps/desktop
+          npm install
+          npx tauri build --bundles deb,rpm,appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/deb/*
+            apps/desktop/src-tauri/target/release/bundle/rpm/*
+            apps/desktop/src-tauri/target/release/bundle/appimage/*

@@ -322,7 +322,15 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .tl-tick-label { position: absolute; top: 0; font: 500 9px/1 var(--mono); color: var(--faint); padding-left: 3px; transform: translateX(-2px); }
 .tl-lane { position: relative; height: 34px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); overflow: hidden; cursor: crosshair; }
 .tl-lane.captions { height: 28px; }
-.tl-range { position: absolute; top: 0; bottom: 0; background: var(--volt-soft); border-left: 2px solid var(--volt); border-right: 2px solid var(--volt); }
+.tl-range { position: absolute; top: 0; bottom: 0; background: var(--volt-soft); border-left: 2px solid var(--volt); border-right: 2px solid var(--volt); cursor: grab; }
+.tl-range.dragging { cursor: grabbing; background: var(--volt-soft); }
+.tl-clip-base { position: absolute; inset: 0; background: var(--surface-3); opacity: 0.35; pointer-events: none; }
+.tl-handle { position: absolute; top: 0; bottom: 0; width: 10px; cursor: ew-resize; background: transparent; z-index: 1; }
+.tl-handle.in { left: -2px; }
+.tl-handle.out { right: -2px; }
+.tl-handle::after { content: ""; position: absolute; top: 30%; bottom: 30%; width: 3px; background: var(--volt); border-radius: 2px; }
+.tl-handle.in::after { left: 2px; }
+.tl-handle.out::after { right: 2px; }
 .tl-playhead { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); pointer-events: none; z-index: 2; }
 .tl-clip { position: absolute; top: 2px; bottom: 2px; border-radius: 3px; background: var(--surface-3); border: 1px solid var(--line); font: 500 10px/20px var(--mono); color: var(--ink-2); padding: 0 5px; overflow: hidden; white-space: nowrap; cursor: pointer; }
 .tl-clip.on { border-color: var(--volt-line); color: var(--volt); }

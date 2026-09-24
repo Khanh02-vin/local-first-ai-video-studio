@@ -112,6 +112,27 @@ fn command_ready(command: &str) -> bool {
     if command.contains('/') { return Path::new(command).is_file(); }
     Command::new("which").arg(command).output().map(|o| o.status.success()).unwrap_or(false)
 }
+/// Copies the bundled Whisper model into ~/.cache/whisper so the openai-whisper CLI
+/// (which looks there by default) finds it without downloading. No-op if the
+/// model is already present.
+fn ensure_bundled_whisper_model(app: &tauri::AppHandle, model: &str) -> Result<(), String> {
+    let model_name = model.to_string();
+    let dest = match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".cache/whisper").join(format!("{model_name}.pt")),
+        Err(_) => return Ok(()),
+    };
+    if dest.exists() { return Ok(()); }
+    let source = match app.path().resource_dir() {
+        Ok(dir) => dir.join(format!("models/{model_name}.pt")),
+        Err(_) => return Ok(()),
+    };
+    if !source.is_file() { return Ok(()); }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("WHISPER_MODEL_DIR:{e}"))?;
+    }
+    std::fs::copy(&source, &dest).map_err(|e| format!("WHISPER_MODEL_COPY:{e}"))?;
+    Ok(())
+}
 fn storage(path: &Path, required: u64) -> serde_json::Value { let output = Command::new("df").args(["-Pk"]).arg(path).output(); let parsed = output.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|text| text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))); let free = parsed.map(|kb| kb * 1024); serde_json::json!({"path": path, "freeBytes": free, "requiredBytes": required, "ready": free.map(|n| n >= required).unwrap_or(false), "quotaKnown": false}) }
 fn io_error(code: &str, message: impl std::fmt::Display) -> String { let text = message.to_string(); if text.contains("ENOSPC") || text.contains("No space left") { format!("STORAGE_FULL:{text}") } else if text.contains("EDQUOT") || text.contains("Disk quota") { format!("QUOTA_EXCEEDED:{text}") } else { format!("{code}:{text}") } }
 
@@ -138,9 +159,11 @@ fn preflight_analyze(path: String) -> Result<serde_json::Value, String> { let in
 fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     let file = runtime_env();
     let whisper = std::env::var("WHISPER_COMMAND").ok().filter(|c| !c.is_empty()).or_else(|| file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty())).unwrap_or_else(whisper_command);
-    let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or("tiny".to_string());
+    let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or_else(|| "tiny".into());
+    // Ship the bundled model to the whisper cache so the CLI needs no download.
+    let _ = ensure_bundled_whisper_model(&app, &model);
     let model_ready = std::env::var("WHISPER_MODEL_PATH").map(|p| Path::new(&p).exists()).unwrap_or_else(|_| std::env::var("HOME").ok().map(|p| Path::new(&p).join(".cache/whisper").join(format!("{model}.pt")).exists()).unwrap_or(false));
-    let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or("cpu".to_string());
+    let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let ffmpeg = ffmpeg_bin(&app); let ffprobe = ffprobe_bin(&app); let node = node_bin(&app);
     serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": Path::new(&whisper).exists() || command_ready(&whisper), "model": model, "modelReady": model_ready, "device": device, "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file() } })
 }

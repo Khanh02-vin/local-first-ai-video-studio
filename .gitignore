@@ -13,3 +13,4 @@ output/
 apps/desktop/src-tauri/resources/node/
 apps/desktop/src-tauri/resources/ffmpeg
 apps/desktop/src-tauri/resources/ffprobe
+apps/desktop/src-tauri/resources/models/
