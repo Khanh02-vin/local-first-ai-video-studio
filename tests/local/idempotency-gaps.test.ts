@@ -87,9 +87,7 @@ try {
   assertFixed("GAP-4", typeof api === "object" && jobA.idempotencyKey === "client-key-1" && jobA.idempotencyKey === jobB.idempotencyKey,
     "ApiService parses in strip-only mode and preserves a caller-supplied idempotency key (repeatable requests stay identifiable)");
 
-  // GAP-5: requeue on terminal state — clicking "Render" again must restart the job, not
-  // hand back a dead one. create() on the same key returns a re-queued job for cancelled
-  // and failed states (both are "user gave up, try again" — not a live in-flight job).
+  // GAP-5: terminal jobs are re-queued so clicking "Render" again restarts them.
   const requeueStore = LocalStore.open(join(root, "requeue-jobs.sqlite"));
   const jobCancelled = requeueStore.create({ id: "rc", input: "vid-a.mp4", output: "o-a.mp4", start: 0, end: 5, aspectRatio: "9:16" });
   requeueStore.update(jobCancelled.id, { status: "cancelled" });
@@ -101,8 +99,26 @@ try {
   const retryFailed = requeueStore.create({ id: "rf2", input: "vid-b.mp4", output: "o-b.mp4", start: 0, end: 5, aspectRatio: "9:16" });
   assertFixed("GAP-5b", retryFailed.id === jobFailed.id && retryFailed.status === "queued" && retryFailed.attempts === 0,
     "create() on a failed job (retry exhausted) resets the crash budget and re-queues the same record");
+
+  // GAP-6: a completed SQLite row is reusable only while its local artifact is intact.
+  const missingOutput = join(root, "missing-output.mp4");
+  await writeFile(missingOutput, Buffer.alloc(11));
+  const completedMissing = requeueStore.create({ id: "gm", input: "vid-missing.mp4", output: missingOutput, start: 0, end: 5, aspectRatio: "9:16" });
+  requeueStore.update(completedMissing.id, { status: "completed", progress: 1, outputBytes: 11 });
+  await rm(missingOutput, { force: true });
+  const rerunMissing = requeueStore.create({ id: "gm-retry", input: "vid-missing.mp4", output: missingOutput, start: 0, end: 5, aspectRatio: "9:16" });
+  assertFixed("GAP-6", rerunMissing.id === completedMissing.id && rerunMissing.status === "queued" && rerunMissing.attempts === 0 && rerunMissing.outputBytes === null,
+    "create() invalidates a completed job when its output file is missing");
+
+  const changedOutput = join(root, "changed-output.mp4");
+  await writeFile(changedOutput, Buffer.alloc(7));
+  const completedChanged = requeueStore.create({ id: "gs", input: "vid-changed.mp4", output: changedOutput, start: 0, end: 5, aspectRatio: "9:16" });
+  requeueStore.update(completedChanged.id, { status: "completed", progress: 1, outputBytes: 11 });
+  const rerunChanged = requeueStore.create({ id: "gs-retry", input: "vid-changed.mp4", output: changedOutput, start: 0, end: 5, aspectRatio: "9:16" });
+  assertFixed("GAP-6b", rerunChanged.id === completedChanged.id && rerunChanged.status === "queued" && rerunChanged.attempts === 0 && rerunChanged.outputBytes === null,
+    "create() invalidates a completed job when its output size no longer matches SQLite metadata");
   requeueStore.close();
 } finally {
   await rm(root, { recursive: true, force: true });
 }
-console.log("idempotency gap tests: ok (all 4 gaps fixed)");
+console.log("idempotency gap tests: ok (all 6 gaps fixed)");

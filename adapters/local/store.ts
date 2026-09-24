@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { AnalysisStore } from "./analysis-store.ts";
 
 export type LocalJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
@@ -75,6 +75,11 @@ export class LocalStore {
         this.db.prepare("UPDATE jobs SET status='queued', progress=0, attempts=0, error=null WHERE id=?").run(existing.id);
         return this.get(existing.id)!;
       }
+      if (existing.status === "completed" && !artifactIsIntact(existing)) {
+        this.db.prepare("UPDATE jobs SET status='queued', progress=0, attempts=0, error=?, output_bytes=null WHERE id=?")
+          .run(artifactError(existing), existing.id);
+        return this.get(existing.id)!;
+      }
       return map(existing);
     }
     this.db.prepare("INSERT INTO jobs (id,input,output,start,end,aspect_ratio,status,max_attempts,idempotency_key,analysis_job_id) VALUES (?,?,?,?,?,?, 'queued', ?,?,?)")
@@ -111,5 +116,22 @@ export class LocalStore {
   }
   update(id: string, patch: Partial<Pick<LocalJob, "status" | "progress" | "error" | "outputBytes">>): LocalJob | undefined { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const columns = entries.map(([key]) => `${key === "outputBytes" ? "output_bytes" : key}=?`).join(","); this.db.prepare(`UPDATE jobs SET ${columns} WHERE id=?`).run(...entries.map(([, value]) => value), id); return this.get(id); }
   recover(): void { this.db.prepare("UPDATE jobs SET status=CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'interrupted' END, error=CASE WHEN attempts < max_attempts THEN 'recovered after restart' ELSE 'attempt budget exhausted' END WHERE status='running'").run(); }
+}
+function artifactIsIntact(row: Raw): boolean {
+  if (row.output_bytes === null) return false;
+  try {
+    const info = statSync(row.output);
+    return info.isFile() && info.size === row.output_bytes;
+  } catch {
+    return false;
+  }
+}
+function artifactError(row: Raw): string {
+  try {
+    const info = statSync(row.output);
+    return info.isFile() ? "output artifact size mismatch" : "output artifact is not a file";
+  } catch {
+    return "output artifact missing";
+  }
 }
 function map(row: Raw): LocalJob { return { id: row.id, input: row.input, output: row.output, start: row.start, end: row.end, aspectRatio: row.aspect_ratio, status: row.status as LocalJobStatus, progress: row.progress, attempts: row.attempts, maxAttempts: row.max_attempts, error: row.error, outputBytes: row.output_bytes, idempotencyKey: row.idempotency_key, analysisJobId: row.analysis_job_id }; }
