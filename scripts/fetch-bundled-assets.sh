@@ -166,7 +166,7 @@ else
   echo "==> llama.cpp: fetching $asset"
   tmp="$(mktemp -d)"
   curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}"
-  if [[ "$asset" == *.zip" ]]; then
+  if [[ "$asset" == *.zip ]]; then
     mkdir -p "$tmp/x"
     extract_zip "$tmp/llama.pkg" "$tmp/x"
   else
