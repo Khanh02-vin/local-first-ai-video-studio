@@ -81,7 +81,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         run: |
-          # If no signing cert is available, set TAURI_SKIP_CODESIGN=1 to skip codesign
+          # If no signing cert is available, use --no-sign to skip codesign
           cd apps/desktop
           npm install
           if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
@@ -91,7 +91,7 @@ jobs:
             npx tauri build -b app
           else
             echo "No signing identity available; building unsigned."
-            TAURI_SKIP_CODESIGN=1 npx tauri build -b app
+            npx tauri build -b app --no-sign
           fi
           fi
       - uses: actions/upload-artifact@v4
@@ -123,12 +123,12 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-          npx tauri build -b nsis
+          npx tauri build -b msi
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            apps/desktop/src-tauri/target/release/bundle/nsis/*
+            apps/desktop/src-tauri/target/release/bundle/msi/*
 
   linux:
     runs-on: ubuntu-latest
