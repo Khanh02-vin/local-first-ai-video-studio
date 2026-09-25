@@ -73,9 +73,6 @@ jobs:
           cd apps/web
           npm ci
           npm run build
-      - name: Clean npm cache (disk space)
-        if: runner.os == 'macOS'
-        run: rm -rf ~/.npm apps/web/node_modules
       - name: Build + sign + notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
@@ -123,9 +120,6 @@ jobs:
           cd apps/web
           npm ci
           npm run build
-      - name: Clean npm cache (disk space)
-        if: runner.os == 'Windows'
-        run: rm -rf ~/.npm apps/web/node_modules
       - name: Build + sign
         env:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
@@ -161,9 +155,10 @@ jobs:
           cd apps/web
           npm ci
           npm run build
-      - name: Clean npm cache (disk space)
+      - name: Clean cargo cache + npm cache (disk space)
         if: runner.os == 'Linux'
         run: |
+          cd apps/desktop && cargo clean
           rm -rf ~/.npm
           rm -rf apps/web/node_modules
       - name: Build bundles

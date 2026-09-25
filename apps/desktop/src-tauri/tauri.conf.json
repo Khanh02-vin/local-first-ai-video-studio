@@ -5,7 +5,7 @@
   "identifier": "com.localfirst.aivideostudio",
   "build": {
     "beforeDevCommand": "cd ../web && npm run dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "cd ../web && npm run build",
+    "beforeBuildCommand": "cd ../web && npm ci && npm run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/build"
   },
