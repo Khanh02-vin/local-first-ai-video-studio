@@ -43,7 +43,7 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
     if !["tiny", "base", "small"].contains(&model.as_str()) { return Err("INVALID_MODEL: choose tiny, base or small".into()); }
     if license_tier() != "pro" && model != "tiny" { return Err("PRO_REQUIRED: larger Whisper models need a Pro license".into()); }
     let file = runtime_env();
-    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
+    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty() && whisper_usable(c)).unwrap_or_else(whisper_command);
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let fp16 = if device == "cuda" { "True" } else { "False" };
     let highlight_strategy = file.get("HIGHLIGHT_STRATEGY").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "heuristic".into());
@@ -63,7 +63,7 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
 fn set_highlight_strategy(_app: tauri::AppHandle, strategy: String, gemini_api_key: String, local_llm_base_url: String, local_llm_model: String) -> Result<String, String> {
     if !["heuristic", "semantic-gemini", "semantic-local"].contains(&strategy.as_str()) { return Err("INVALID_STRATEGY: choose heuristic, semantic-gemini or semantic-local".into()); }
     let file = runtime_env();
-    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()).unwrap_or_else(whisper_command);
+    let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty() && whisper_usable(c)).unwrap_or_else(whisper_command);
     let model = file.get("WHISPER_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "tiny".into());
     let device = file.get("WHISPER_DEVICE").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "cpu".into());
     let fp16 = file.get("WHISPER_FP16").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "False".into());
