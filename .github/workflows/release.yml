@@ -67,6 +67,8 @@ jobs:
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build web frontend
         run: |
@@ -93,7 +95,6 @@ jobs:
             echo "No signing identity available; building unsigned."
             npx tauri build -b app --no-sign
           fi
-          fi
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
@@ -109,6 +110,8 @@ jobs:
           node-version: 24
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build web frontend
         run: |
@@ -143,6 +146,8 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build web frontend
         run: |
