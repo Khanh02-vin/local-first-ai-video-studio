@@ -80,6 +80,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # Disable codesign when no signing identity is available
+          APPLE_CODESIGN_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         run: |
           # Identity is handed from the previous step through a file (env context is
           # not allowed in a step env map).
@@ -87,16 +89,13 @@ jobs:
             APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
             export APPLE_SIGNING_IDENTITY
             echo "Signing identity: $APPLE_SIGNING_IDENTITY"
-          else
-            echo "No signing identity available; building unsigned."
-          fi
-          cd apps/desktop
-          npm install
-          # Tauri auto-codesigns if APPLE_SIGNING_IDENTITY is empty/blank — must
-          # explicitly disable with empty string.
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            cd apps/desktop
+            npm install
             npx tauri build --bundles app
           else
+            echo "No signing identity available; building unsigned."
+            cd apps/desktop
+            npm install
             APPLE_CODESIGN_IDENTITY="" npx tauri build --bundles app
           fi
       - uses: actions/upload-artifact@v4
@@ -128,12 +127,11 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-          npx tauri build --bundles msi,nsis
+          npx tauri build --bundle nsis
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            apps/desktop/src-tauri/target/release/bundle/msi/*
             apps/desktop/src-tauri/target/release/bundle/nsis/*
 
   linux:
@@ -162,7 +160,7 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-          npx tauri build --bundles deb,rpm,appimage
+          npx tauri build --bundle appimage
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
