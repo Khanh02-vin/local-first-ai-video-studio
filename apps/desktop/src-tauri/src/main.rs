@@ -93,17 +93,27 @@ fn ffmpeg_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffmpeg", "f
 fn ffprobe_bin(app: &tauri::AppHandle) -> PathBuf { bundled_bin(app, "ffprobe", "ffprobe") }
 /// Resolve the whisper CLI the way the local whisper adapter will find it:
 /// env/runtime.env first, then a venv next to the app, then plain PATH.
+/// True when a whisper CLI string can actually be executed: a path that exists, or a
+/// bare name resolvable via PATH. Guards stale runtime.env entries like `whisper` when
+/// whisper is not installed system-wide.
+fn whisper_usable(cmd: &str) -> bool {
+    if cmd.contains('/') { Path::new(cmd).is_file() } else { command_ready(cmd) }
+}
 fn whisper_command() -> String {
-    if let Ok(cmd) = std::env::var("WHISPER_COMMAND") { if !cmd.is_empty() { return cmd; } }
-    // runtime.env is authoritative only while the binary it names still exists.
+    if let Ok(cmd) = std::env::var("WHISPER_COMMAND") { if !cmd.is_empty() && whisper_usable(&cmd) { return cmd; } }
+    // runtime.env is authoritative only while the command it names still resolves.
     if let Some(cmd) = runtime_env().get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty()) {
-        if !cmd.contains('/') || Path::new(&cmd).is_file() { return cmd; }
+        if whisper_usable(&cmd) { return cmd; }
     }
-    // App-owned venv created by the first-run bootstrap.
+    // App-owned venv created by the first-run bootstrap (client machines).
     let app_venv = whisper_venv_bin("whisper");
     if app_venv.is_file() { return app_venv.to_string_lossy().into_owned(); }
-    let project_venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.venv/bin/whisper");
-    if project_venv.is_file() { return project_venv.to_string_lossy().into_owned(); }
+    // Project venv: repo root is three levels up from src-tauri; also accept the legacy
+    // apps/desktop/.venv location from earlier checkouts.
+    for rel in ["../../../.venv/bin/whisper", "../.venv/bin/whisper"] {
+        let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        if candidate.is_file() { return candidate.to_string_lossy().into_owned(); }
+    }
     if let Ok(home) = std::env::var("HOME") { if Path::new(&home).join(".local/bin/whisper").is_file() { return format!("{home}/.local/bin/whisper"); } }
     "whisper".into()
 }
@@ -118,7 +128,7 @@ fn llama_binary() -> PathBuf {
     if project_resource.is_file() { return project_resource; }
     PathBuf::from("llama-server")
 }
-fn local_llm_model_path(app: &tauri::AppHandle, model: &str) -> Option<PathBuf> {
+fn local_llm_model_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>, model: &str) -> Option<PathBuf> {
     let resource_dir = app.path().resource_dir().ok()?;
     let state = state_dir();
     let candidates = [
@@ -128,7 +138,7 @@ fn local_llm_model_path(app: &tauri::AppHandle, model: &str) -> Option<PathBuf> 
     for candidate in &candidates { if candidate.is_file() { return Some(candidate.clone()); } }
     None
 }
-fn ensure_llama_server(state: &LlamaState, app: &tauri::AppHandle, port: u16) -> Result<(), String> {
+fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHandle<R>, port: u16) -> Result<(), String> {
     // If a llama-server is already answering on this port, reuse it.
     let health_url = format!("http://127.0.0.1:{port}/health");
     if Command::new("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &health_url]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200").unwrap_or(false) {
@@ -208,7 +218,7 @@ fn command_ready(command: &str) -> bool {
 /// Copies the bundled Whisper model into ~/.cache/whisper so the openai-whisper CLI
 /// (which looks there by default) finds it without downloading. No-op if the
 /// model is already present.
-fn ensure_bundled_whisper_model(app: &tauri::AppHandle, model: &str) -> Result<(), String> {
+fn ensure_bundled_whisper_model<R: tauri::Runtime>(app: &tauri::AppHandle<R>, model: &str) -> Result<(), String> {
     let model_name = model.to_string();
     let dest = match std::env::var("HOME") {
         Ok(home) => PathBuf::from(home).join(".cache/whisper").join(format!("{model_name}.pt")),
@@ -237,7 +247,7 @@ fn whisper_venv_bin(name: &str) -> PathBuf {
 
 #[derive(Clone)]
 struct BootstrapState(Arc<Mutex<Option<BootstrapProgress>>>);
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapProgress { phase: String, message: String, done: bool, error: Option<String> }
 /// Picks a Python interpreter that can build a venv, preferring a version torch still
@@ -253,7 +263,7 @@ fn set_bootstrap(state: &BootstrapState, phase: &str, message: &str, done: bool,
 }
 /// Idempotent first-run setup: create the app venv, install openai-whisper, then write
 /// runtime.env so every helper resolves the same whisper. Progress is polled by the UI.
-fn run_whisper_bootstrap(app: &tauri::AppHandle, state: &BootstrapState) -> Result<String, String> {
+fn run_whisper_bootstrap<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &BootstrapState) -> Result<String, String> {
     let venv = whisper_venv_dir();
     let whisper = whisper_venv_bin("whisper");
     if whisper.is_file() {
@@ -263,12 +273,13 @@ fn run_whisper_bootstrap(app: &tauri::AppHandle, state: &BootstrapState) -> Resu
     // Fast path: a usable whisper already exists on this machine (project venv, install
     // prefix, or PATH). Never re-install a multi-GB PyTorch stack in that case.
     let existing = whisper_command();
-    let usable = if existing.contains('/') { Path::new(&existing).is_file() } else { command_ready(&existing) };
-    if usable {
+    if whisper_usable(&existing) {
         let file = runtime_env();
         let model = file.get("WHISPER_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "tiny".into());
         let _ = ensure_bundled_whisper_model(app, &model);
-        write_runtime_env(&existing, &model);
+        // A failed runtime.env write must surface: reporting success without it would
+        // leave the analysis worker resolving the wrong whisper later.
+        write_runtime_env(&existing, &model)?;
         set_bootstrap(state, "ready", "Whisper found on this machine.", true, None);
         return Ok(existing);
     }
@@ -333,24 +344,30 @@ fn set_download(state: &ModelDownloadState, phase: &str, message: &str, done: bo
     if let Ok(mut guard) = state.0.lock() { let _ = guard.insert(BootstrapProgress { phase: phase.into(), message: message.into(), done, error }); }
 }
 /// Downloads the local-LLM weights on demand (2.1 GB) and verifies the SHA-256 before use.
-fn run_model_download(state: &ModelDownloadState, model: &str) -> Result<String, String> {
-    let target = llm_model_file(model);
+/// Fetch `url` into `target`, verify its SHA-256 against `expected_sha`, then rename the
+/// partial file into place. Leftover partials are removed on any failure so a retry
+/// starts clean. Kept separate from run_model_download so tests can drive it with
+/// file:// URLs instead of a 2.1 GB network download.
+fn download_and_verify(state: &ModelDownloadState, url: &str, expected_sha: &str, target: &Path) -> Result<String, String> {
     if target.is_file() {
         set_download(state, "ready", "Model already downloaded.", true, None);
         return Ok(target.to_string_lossy().into_owned());
     }
     if let Some(parent) = target.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("MODEL_DIR:{e}"))?; }
-    let part = target.with_extension("gguf.part");
+    let part = PathBuf::from(format!("{}.part", target.display()));
     set_download(state, "download", "Downloading Qwen2.5-3B (~2.1 GB)…", false, None);
-    let curl = Command::new("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(LLM_MODEL_URL).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
+    let curl = Command::new("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(url).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
     if !curl.status.success() { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
     set_download(state, "verify", "Verifying checksum…", false, None);
     let digest = Command::new("sha256sum").arg(&part).output().map_err(|e| format!("SHA256_SPAWN:{e}"))?;
     let actual = String::from_utf8_lossy(&digest.stdout).split_whitespace().next().unwrap_or("").to_string();
-    if actual != LLM_MODEL_SHA256 { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_CHECKSUM_MISMATCH:{actual}")); }
-    std::fs::rename(&part, &target).map_err(|e| format!("MODEL_RENAME:{e}"))?;
+    if actual != expected_sha { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_CHECKSUM_MISMATCH:{actual}")); }
+    std::fs::rename(&part, target).map_err(|e| format!("MODEL_RENAME:{e}"))?;
     set_download(state, "ready", "Model ready.", true, None);
     Ok(target.to_string_lossy().into_owned())
+}
+fn run_model_download(state: &ModelDownloadState, model: &str) -> Result<String, String> {
+    download_and_verify(state, LLM_MODEL_URL, LLM_MODEL_SHA256, &llm_model_file(model))
 }
 #[tauri::command]
 fn download_llm_model(state: tauri::State<'_, ModelDownloadState>) -> Result<(), String> {
@@ -589,4 +606,105 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
+    /// process-wide env vars, so they take turns on this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard { dir: PathBuf, old_state: Option<String>, old_whisper: Option<String> }
+    impl EnvGuard {
+        fn new(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("lfai-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let old_state = std::env::var("LOCAL_FIRST_STATE_DIR").ok();
+            let old_whisper = std::env::var("WHISPER_COMMAND").ok();
+            std::env::set_var("LOCAL_FIRST_STATE_DIR", &dir);
+            EnvGuard { dir, old_state, old_whisper }
+        }
+        fn state_file(&self) -> PathBuf { self.dir.join("runtime.env") }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old_state { Some(v) => std::env::set_var("LOCAL_FIRST_STATE_DIR", v), None => std::env::remove_var("LOCAL_FIRST_STATE_DIR") }
+            match &self.old_whisper { Some(v) => std::env::set_var("WHISPER_COMMAND", v), None => std::env::remove_var("WHISPER_COMMAND") }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn write_runtime_env_preserves_strategy_key_and_endpoints() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("preserve");
+        std::fs::write(guard.state_file(), "HIGHLIGHT_STRATEGY=semantic-gemini\nGEMINI_API_KEY=sk-test-123\nLOCAL_LLM_BASE_URL=http://127.0.0.1:9999\nLOCAL_LLM_MODEL=qwen-test\n").unwrap();
+        write_runtime_env("/opt/custom/whisper", "base").unwrap();
+        let text = std::fs::read_to_string(guard.state_file()).unwrap();
+        assert!(text.contains("WHISPER_COMMAND=/opt/custom/whisper"), "{text}");
+        assert!(text.contains("WHISPER_MODEL=base"), "{text}");
+        // Rebooting the app must not lose the choices the user already made.
+        assert!(text.contains("HIGHLIGHT_STRATEGY=semantic-gemini"), "{text}");
+        assert!(text.contains("GEMINI_API_KEY=sk-test-123"), "{text}");
+        assert!(text.contains("LOCAL_LLM_BASE_URL=http://127.0.0.1:9999"), "{text}");
+        assert!(text.contains("LOCAL_LLM_MODEL=qwen-test"), "{text}");
+    }
+
+    #[test]
+    fn bootstrap_fast_path_adopts_existing_whisper_without_installing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("fastpath");
+        // A usable whisper (absolute path to an existing file) stands in for a machine
+        // that already has one; the fast path must adopt it and never start pip.
+        let fake = guard.dir.join("whisper-bin");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        std::env::set_var("WHISPER_COMMAND", &fake);
+        // Any pre-existing choices must survive the bootstrap.
+        std::fs::write(guard.state_file(), "HIGHLIGHT_STRATEGY=semantic-local\n").unwrap();
+
+        let app = tauri::test::mock_app();
+        let state = BootstrapState(Arc::new(Mutex::new(None)));
+        let resolved = run_whisper_bootstrap(app.handle(), &state).expect("fast path must succeed");
+        assert_eq!(resolved, fake.to_string_lossy(), "must adopt the existing whisper");
+
+        let progress = state.0.lock().unwrap().clone().expect("progress reported");
+        assert!(progress.done && progress.error.is_none(), "{progress:?}");
+        let text = std::fs::read_to_string(guard.state_file()).unwrap();
+        assert!(text.contains("HIGHLIGHT_STRATEGY=semantic-local"), "{text}");
+        assert!(text.contains("WHISPER_COMMAND="), "{text}");
+    }
+
+    #[test]
+    fn download_and_verify_accepts_good_checksum_and_rejects_bad_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("download");
+        // file:// URL keeps the test offline: same curl/sha path as the real 2.1 GB download.
+        let source = guard.dir.join("weights.bin");
+        std::fs::write(&source, b"local-first-llm-model-bytes").unwrap();
+        let sha_out = Command::new("sha256sum").arg(&source).output().expect("sha256sum");
+        let sha = String::from_utf8_lossy(&sha_out.stdout).split_whitespace().next().unwrap().to_string();
+        let url = format!("file://{}", source.display());
+        let target = guard.dir.join("model.gguf");
+        let state = ModelDownloadState(Arc::new(Mutex::new(None)));
+
+        let ok = download_and_verify(&state, &url, &sha, &target);
+        assert!(ok.is_ok(), "expected ok, got {ok:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"local-first-llm-model-bytes");
+        assert!(!guard.dir.join("model.gguf.part").exists(), "partial file must be gone");
+        let progress = state.0.lock().unwrap().clone().unwrap();
+        assert!(progress.done && progress.phase == "ready", "{progress:?}");
+
+        // Corrupted download: wrong checksum must fail loudly, leave nothing behind.
+        std::fs::remove_file(&target).unwrap();
+        let bad = download_and_verify(&state, &url, &"0".repeat(64), &target);
+        let err = bad.expect_err("checksum mismatch must fail");
+        assert!(err.contains("MODEL_CHECKSUM_MISMATCH"), "{err}");
+        assert!(!target.exists(), "failed download must not leave a target file");
+        assert!(!guard.dir.join("model.gguf.part").exists(), "failed download must clean the partial");
+    }
 }

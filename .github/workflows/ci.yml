@@ -10,8 +10,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      # Repo root IS the project (package.json sits at root on GitHub), so no
+      # working-directory prefix — the previous value pointed at a folder that
+      # does not exist in the repository and made every CI run fail.
       - run: npm test
-        working-directory: local-first-ai-video-studio
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+        working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high
-        working-directory: local-first-ai-video-studio
         continue-on-error: true
