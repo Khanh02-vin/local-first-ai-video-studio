@@ -139,7 +139,7 @@ for model in $WHISPER_MODELS; do
     small) url="https://openaipublic.blob.core.windows.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt"; sha="9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794" ;;
     *) echo "    unknown whisper model '$model'" >&2; exit 1 ;;
   esac
-  curl -L --fail --retry 3 -o "$dest" "$url"
+  echo "  Fetching: $url" && curl -L --fail --retry 3 -o "$dest" "$url"
   actual="$(sha256sum "$dest" | awk '{print $1}')"
   [[ "$actual" == "$sha" ]] || { echo "    checksum mismatch for $model: $actual" >&2; exit 1; }
 done
