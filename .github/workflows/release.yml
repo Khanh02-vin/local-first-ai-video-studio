@@ -73,6 +73,9 @@ jobs:
           cd apps/web
           npm ci
           npm run build
+      - name: Clean npm cache (disk space)
+        if: runner.os == 'macOS'
+        run: rm -rf ~/.npm apps/web/node_modules
       - name: Build + sign + notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
@@ -92,10 +95,12 @@ jobs:
           fi
           cd apps/desktop
           npm install
+          # Tauri auto-codesigns if APPLE_SIGNING_IDENTITY is empty/blank — must
+          # explicitly disable with empty string.
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            npx tauri build --bundles app --target-signed
-          else
             npx tauri build --bundles app
+          else
+            APPLE_CODESIGN_IDENTITY="" npx tauri build --bundles app
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -118,6 +123,9 @@ jobs:
           cd apps/web
           npm ci
           npm run build
+      - name: Clean npm cache (disk space)
+        if: runner.os == 'Windows'
+        run: rm -rf ~/.npm apps/web/node_modules
       - name: Build + sign
         env:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
@@ -153,6 +161,11 @@ jobs:
           cd apps/web
           npm ci
           npm run build
+      - name: Clean npm cache (disk space)
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf ~/.npm
+          rm -rf apps/web/node_modules
       - name: Build bundles
         run: |
           cd apps/desktop
