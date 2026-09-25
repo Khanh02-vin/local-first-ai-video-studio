@@ -80,23 +80,20 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # Disable codesign when no signing identity is available
-          APPLE_CODESIGN_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         run: |
-          # Identity is handed from the previous step through a file (env context is
-          # not allowed in a step env map).
+          # Identity is handed from the previous step through a file.
+          # If no signing cert is available, we pass --no-code-sign to skip codesign.
+          cd apps/desktop
+          npm install
           if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
             APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
             export APPLE_SIGNING_IDENTITY
             echo "Signing identity: $APPLE_SIGNING_IDENTITY"
-            cd apps/desktop
-            npm install
-            npx tauri build --bundles app
+            npx tauri build --bundle app
           else
-            echo "No signing identity available; building unsigned."
-            cd apps/desktop
-            npm install
-            APPLE_CODESIGN_IDENTITY="" npx tauri build --bundles app
+            echo "No signing identity available; building unsigned with --no-code-sign."
+            npx tauri build --bundle app --no-code-sign
+          fi
           fi
       - uses: actions/upload-artifact@v4
         with:
@@ -127,7 +124,7 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-            npx tauri build --bundler nsis
+            npx tauri build --bundle nsis
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
@@ -160,7 +157,7 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-          npx tauri build --bundler appimage
+          npx tauri build --bundle appimage
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
