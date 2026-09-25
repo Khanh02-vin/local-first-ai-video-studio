@@ -1,83 +1,162 @@
 #!/usr/bin/env bash
-# Download the assets that are intentionally excluded from git (size limits), so a CI
-# build can bundle them into the installer:
-#   - Whisper model weights (tiny, base)
-#   - llama.cpp binaries for the host OS
-#   - Qwen2.5-3B GGUF (local-LLM highlight)
+# Fill apps/desktop/src-tauri/resources/* with the binaries/weights that are
+# intentionally excluded from git (size limits), so tauri-build and packaging work
+# on a fresh checkout:
+#   - resources/node/      (Node dist — dir must exist)
+#   - resources/ffmpeg     resources/ffprobe  (static builds or host copies)
+#   - resources/models/*.pt                (Whisper weights)
+#   - resources/models/llama/*.gguf        (Qwen2.5-3B)
+#   - resources/llama/      (llama.cpp — committed; re-fetched if missing)
 #
-# Local devs usually do NOT need this: the app downloads the LLM model on first use and
-# the whisper venv is bootstrapped at runtime. CI needs it because the installer must ship
-# with the weights already inside.
+# Modes:
+#   LIGHTWEIGHT=1  only create the PATHS that tauri-build validates (empty
+#                  placeholders). Enough for `cargo test`, which never executes
+#                  the binaries — keeps CI test jobs fast.
+#   (default)      download real binaries for the host platform; prefers copying
+#                  an ffmpeg already installed on the host.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RES="$ROOT/apps/desktop/src-tauri/resources"
 LLAMA_VERSION="${LLAMA_VERSION:-b11160}"
+NODE_VERSION="${NODE_VERSION:-v24.21.0}"
 MODEL_NAME="${LLM_MODEL_NAME:-qwen2.5-3b-instruct-q4_k_m}"
 WHISPER_MODELS="${WHISPER_MODELS:-tiny base}"
+ARCH="$(uname -m)"
+OS="$(uname -s)"
 
 mkdir -p "$RES/models/llama" "$RES/llama"
 
+# --- lightweight: only satisfy tauri-build's existence checks ------------------
+if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
+  mkdir -p "$RES/node"
+  [[ -e "$RES/ffmpeg" ]]    || : > "$RES/ffmpeg"
+  [[ -e "$RES/ffprobe" ]]   || : > "$RES/ffprobe"
+  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe)"
+  exit 0
+fi
+
+# --- node ---------------------------------------------------------------------
+if [[ -x "$RES/node/bin/node" ]]; then
+  echo "==> node already present"
+else
+  case "$OS-$ARCH" in
+    Linux-x86_64)  NODE_OS=linux NODE_ARCH=x64  NODE_PKG=tar.xz ;;
+    Linux-aarch64) NODE_OS=linux NODE_ARCH=arm64 NODE_PKG=tar.xz ;;
+    Darwin-arm64)  NODE_OS=darwin NODE_ARCH=arm64 NODE_PKG=tar.gz ;;
+    Darwin-x86_64) NODE_OS=darwin NODE_ARCH=x64 NODE_PKG=tar.gz ;;
+    MINGW*|MSYS*|CYGWIN*) NODE_OS=win NODE_ARCH=x64 NODE_PKG=zip ;;
+    *) echo "unsupported platform for node: $OS-$ARCH" >&2; exit 1 ;;
+  esac
+  url="https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-${NODE_OS}-${NODE_ARCH}.${NODE_PKG}"
+  echo "==> node: downloading $url"
+  tmp="$(mktemp -d)"
+  curl -L --fail --retry 3 -o "$tmp/node.pkg" "$url"
+  if [[ "$NODE_PKG" == "zip" ]]; then tar -xf "$tmp/node.pkg" -C "$tmp/x" 2>/dev/null || { mkdir -p "$tmp/x" && python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$tmp/node.pkg" "$tmp/x"; };
+  else mkdir -p "$tmp/x" && tar xf "$tmp/node.pkg" -C "$tmp/x" --strip-components=1; fi
+  mkdir -p "$RES/node"
+  cp -r "$tmp/x"/. "$RES/node/"
+  rm -rf "$tmp"
+fi
+
+# --- ffmpeg / ffprobe ---------------------------------------------------------
+if [[ -e "$RES/ffmpeg" && -e "$RES/ffprobe" ]]; then
+  echo "==> ffmpeg/ffprobe already present"
+elif command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+  echo "==> ffmpeg/ffprobe: copying host binaries ($(ffmpeg -version | head -1))"
+  cp -f "$(command -v ffmpeg)" "$RES/ffmpeg"
+  cp -f "$(command -v ffprobe)" "$RES/ffprobe"
+else
+  case "$OS-$ARCH" in
+    Linux-x86_64)
+      urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz") ;;
+    Linux-aarch64)
+      urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz") ;;
+    Darwin-*)
+      # evermeet.cx ships ffmpeg and ffprobe as separate archives; x64 builds run
+      # under Rosetta on arm64 runners.
+      urls=("https://evermeet.cx/ffmpeg/ffmpeg-7.0.2.zip" "https://evermeet.cx/ffmpeg/ffprobe-7.0.2.zip") ;;
+    MINGW*|MSYS*|CYGWIN*)
+      urls=("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip") ;;
+    *) echo "unsupported platform for ffmpeg: $OS-$ARCH" >&2; exit 1 ;;
+  esac
+  tmp="$(mktemp -d)"
+  mkdir -p "$tmp/x"
+  for url in "${urls[@]}"; do
+    echo "==> ffmpeg: downloading $url"
+    curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url"
+    if [[ "$url" == *.zip ]]; then
+      if command -v unzip >/dev/null; then unzip -q -o "$tmp/ff.pkg" -d "$tmp/x";
+      else tar -xf "$tmp/ff.pkg" -C "$tmp/x"; fi
+    else
+      tar xf "$tmp/ff.pkg" -C "$tmp/x"
+    fi
+  done
+  found_ff="$(find "$tmp/x" -type f -name 'ffmpeg' -o -type f -name 'ffmpeg.exe' | head -1)"
+  found_fp="$(find "$tmp/x" -type f -name 'ffprobe' -o -type f -name 'ffprobe.exe' | head -1)"
+  [[ -n "$found_ff" && -n "$found_fp" ]] || { echo "ffmpeg/ffprobe not found inside archive" >&2; exit 1; }
+  cp -f "$found_ff" "$RES/ffmpeg"
+  cp -f "$found_fp" "$RES/ffprobe"
+  chmod +x "$RES/ffmpeg" "$RES/ffprobe" 2>/dev/null || true
+  rm -rf "$tmp"
+fi
+
+# --- whisper models (official openai-whisper registry: URL + SHA-256) ----------
 echo "==> Whisper models: $WHISPER_MODELS"
 for model in $WHISPER_MODELS; do
   dest="$RES/models/$model.pt"
   if [[ -f "$dest" ]]; then echo "    $model already present"; continue; fi
-  echo "    downloading $model"
-  # URLs + SHA-256 come from the openai-whisper registry (whisper/__init__.py _MODELS).
   case "$model" in
     tiny)  url="https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"; sha="65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9" ;;
     base)  url="https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt"; sha="ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e" ;;
     small) url="https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt"; sha="9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794" ;;
-    *) echo "    unknown whisper model '$model' (add its URL from whisper/__init__.py)" >&2; exit 1 ;;
+    *) echo "    unknown whisper model '$model'" >&2; exit 1 ;;
   esac
   curl -L --fail --retry 3 -o "$dest" "$url"
   actual="$(sha256sum "$dest" | awk '{print $1}')"
   [[ "$actual" == "$sha" ]] || { echo "    checksum mismatch for $model: $actual" >&2; exit 1; }
 done
 
-echo "==> llama.cpp binaries ($LLAMA_VERSION, host OS)"
-case "$(uname -s)" in
-  Linux)  case "$(uname -m)" in
-            x86_64) LLAMA_ASSET="llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz" ;;
-            aarch64) LLAMA_ASSET="llama-${LLAMA_VERSION}-bin-ubuntu-arm64.tar.gz" ;;
-            *) echo "unsupported linux arch $(uname -m)" >&2; exit 1 ;;
-          esac ;;
-  Darwin) case "$(uname -m)" in
-            arm64) LLAMA_ASSET="llama-${LLAMA_VERSION}-bin-macos-arm64.tar.gz" ;;
-            x86_64) LLAMA_ASSET="llama-${LLAMA_VERSION}-bin-macos-x64.tar.gz" ;;
-            *) echo "unsupported mac arch $(uname -m)" >&2; exit 1 ;;
-          esac ;;
-  MINGW*|MSYS*|CYGWIN*) LLAMA_ASSET="llama-${LLAMA_VERSION}-bin-win-cpu-x64.zip" ;;
-  *) echo "unsupported OS $(uname -s)" >&2; exit 1 ;;
-esac
-
-if [[ ! -x "$RES/llama/llama-server" && ! -f "$RES/llama/llama-server.exe" ]]; then
-  tmp="$(mktemp -d)"
-  echo "    fetching $LLAMA_ASSET"
-  curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${LLAMA_ASSET}"
-  case "$LLAMA_ASSET" in
-    *.zip) unzip -q -o "$tmp/llama.pkg" -d "$tmp/x" ;;
-    *)     mkdir -p "$tmp/x" && tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1 ;;
+# --- llama.cpp binaries (committed; fetched only if missing) -------------------
+if [[ -x "$RES/llama/llama-server" || -f "$RES/llama/llama-server.exe" ]]; then
+  echo "==> llama.cpp binaries already present"
+else
+  case "$OS" in
+    Linux)  case "$ARCH" in
+              x86_64) asset="llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz" ;;
+              aarch64) asset="llama-${LLAMA_VERSION}-bin-ubuntu-arm64.tar.gz" ;;
+              *) echo "unsupported linux arch $ARCH" >&2; exit 1 ;;
+            esac ;;
+    Darwin) case "$ARCH" in
+              arm64) asset="llama-${LLAMA_VERSION}-bin-macos-arm64.tar.gz" ;;
+              *) asset="llama-${LLAMA_VERSION}-bin-macos-x64.tar.gz" ;;
+            esac ;;
+    MINGW*|MSYS*|CYGWIN*) asset="llama-${LLAMA_VERSION}-bin-win-cpu-x64.zip" ;;
+    *) echo "unsupported OS $OS" >&2; exit 1 ;;
   esac
-  find "$tmp/x" -maxdepth 2 -type f \( -name 'llama-server*' -o -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/llama/" \;
+  echo "==> llama.cpp: fetching $asset"
+  tmp="$(mktemp -d)"
+  curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}"
+  if [[ "$asset" == *.zip ]]; then mkdir -p "$tmp/x" && tar -xf "$tmp/llama.pkg" -C "$tmp/x";
+  else mkdir -p "$tmp/x" && tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1; fi
+  find "$tmp/x" -maxdepth 3 -type f \( -name 'llama-server*' -o -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/llama/" \;
   chmod +x "$RES/llama/llama-server" 2>/dev/null || true
   rm -rf "$tmp"
-else
-  echo "    llama.cpp binaries already present"
 fi
 
-echo "==> Local LLM model: $MODEL_NAME (~2.1 GB)"
+# --- local-LLM GGUF (2.1 GB) --------------------------------------------------
 dest="$RES/models/llama/${MODEL_NAME}.gguf"
 if [[ -f "$dest" ]]; then
-  echo "    already present"
+  echo "==> Local LLM model already present"
 else
+  echo "==> Local LLM model: $MODEL_NAME (~2.1 GB)"
   curl -L --fail --retry 3 -o "$dest" "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/${MODEL_NAME}.gguf"
 fi
-EXPECTED="626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d"
 if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
+  EXPECTED="626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d"
   ACTUAL="$(sha256sum "$dest" | awk '{print $1}')"
   [[ "$ACTUAL" == "$EXPECTED" ]] || { echo "checksum mismatch: $ACTUAL" >&2; exit 1; }
 fi
 
 echo "==> Assets ready:"
-du -sh "$RES/models" "$RES/llama" 2>/dev/null || true
+du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || true
