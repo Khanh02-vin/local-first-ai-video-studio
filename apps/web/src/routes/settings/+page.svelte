@@ -139,7 +139,7 @@ onMount(() => {
 
 <section class="card">
   <h2>Local LLM model</h2>
-  <p class="hint">Offline highlight strategy needs the Qwen2.5-3B GGUF (~2.1 GB). Downloaded once, checksum-verified, stored on this machine.</p>
+  <p class="hint">Offline highlight strategy needs the Qwen2.5-3B GGUF (~2.1 GB). Downloaded once, checksum-verified, stored on this machine. An interrupted download leaves a partial file — the next "Download" click wipes it and starts clean.</p>
   {#if modelPresent}
     <p class="hint">Model present on disk.</p>
   {:else if modelProgress}

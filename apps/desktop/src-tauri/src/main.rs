@@ -355,6 +355,9 @@ fn download_and_verify(state: &ModelDownloadState, url: &str, expected_sha: &str
     }
     if let Some(parent) = target.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("MODEL_DIR:{e}"))?; }
     let part = PathBuf::from(format!("{}.part", target.display()));
+    // A leftover .part means a previous download was killed mid-flight; start clean so
+    // we never resume into bytes the checksum would then reject.
+    if part.is_file() { let _ = std::fs::remove_file(&part); }
     set_download(state, "download", "Downloading Qwen2.5-3B (~2.1 GB)…", false, None);
     let curl = Command::new("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(url).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
     if !curl.status.success() { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
@@ -706,5 +709,24 @@ mod tests {
         assert!(err.contains("MODEL_CHECKSUM_MISMATCH"), "{err}");
         assert!(!target.exists(), "failed download must not leave a target file");
         assert!(!guard.dir.join("model.gguf.part").exists(), "failed download must clean the partial");
+    }
+
+    #[test]
+    fn download_and_verify_removes_stale_partial_before_starting() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("stale-part");
+        let source = guard.dir.join("weights.bin");
+        std::fs::write(&source, b"local-first-llm-model-bytes").unwrap();
+        let sha_out = Command::new("sha256sum").arg(&source).output().expect("sha256sum");
+        let sha = String::from_utf8_lossy(&sha_out.stdout).split_whitespace().next().unwrap().to_string();
+        let target = guard.dir.join("model.gguf");
+        // Simulate a leftover .part from an interrupted download.
+        let part = PathBuf::from(format!("{}.part", target.display()));
+        std::fs::write(&part, b"stale-bytes").unwrap();
+        let state = ModelDownloadState(Arc::new(Mutex::new(None)));
+        let ok = download_and_verify(&state, &format!("file://{}", source.display()), &sha, &target);
+        assert!(ok.is_ok(), "expected ok, got {ok:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"local-first-llm-model-bytes");
+        assert!(!part.exists(), "stale .part must be cleaned up");
     }
 }
