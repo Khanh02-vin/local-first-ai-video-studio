@@ -155,12 +155,9 @@ jobs:
           cd apps/web
           npm ci
           npm run build
-      - name: Clean cargo cache + npm cache (disk space)
+      - name: Clean cargo cache (disk space)
         if: runner.os == 'Linux'
-        run: |
-          cd apps/desktop && cargo clean
-          rm -rf ~/.npm
-          rm -rf apps/web/node_modules
+        run: cd apps/desktop && cargo clean 2>/dev/null || true
       - name: Build bundles
         run: |
           cd apps/desktop
