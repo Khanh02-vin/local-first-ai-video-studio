@@ -155,7 +155,18 @@ fi
 if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
   EXPECTED="626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d"
   ACTUAL="$(sha256sum "$dest" | awk '{print $1}')"
-  [[ "$ACTUAL" == "$EXPECTED" ]] || { echo "checksum mismatch: $ACTUAL" >&2; exit 1; }
+  if [[ "$ACTUAL" == "$EXPECTED" ]]; then
+    echo "==> Local LLM model checksum OK"
+  else
+    # A Git-LFS placeholder file is expected on a fresh checkout without
+    # `git lfs pull` — the app downloads the real weights on first use.
+    # Only fail hard if the file is neither a placeholder nor the real model.
+    if head -1 "$dest" | grep -q "git-lfs"; then
+      echo "==> Local LLM model is an LFS placeholder — download on first use"
+    else
+      echo "checksum mismatch: $ACTUAL (expected $EXPECTED)" >&2; exit 1
+    fi
+  fi
 fi
 
 echo "==> Assets ready:"

@@ -25,12 +25,10 @@ python3 -m venv "$VENV"
 echo "==> Upgrading pip"
 "$VENV/bin/pip" install --upgrade pip >/dev/null
 
-echo "==> Installing openai-whisper (downloads PyTorch — may take a few minutes)"
-"$VENV/bin/pip" install openai-whisper
-
-echo "==> Verifying whisper CLI"
-[[ -x "$WHISPER_BIN" ]] || { echo "    whisper binary missing after install"; exit 1; }
-"$WHISPER_BIN" --help >/dev/null
+echo "==> Installing openai-whisper (CPU wheels only)"
+# CPU wheels keep the install under ~500 MB instead of ~3 GB of CUDA
+# wheels — enough for the tiny/base whisper models on a clean CPU box.
+"$VENV/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu openai-whisper
 
 echo "==> Writing runtime.env"
 mkdir -p "$STATE"
@@ -44,6 +42,17 @@ GEMINI_API_KEY=
 LOCAL_LLM_BASE_URL=http://127.0.0.1:8080
 LOCAL_LLM_MODEL=qwen2.5-3b-instruct-q4_k_m
 EOF
+
+echo "==> Verifying bundled whisper model was copied to ~/.cache/whisper"
+"$VENV/bin/whisper" --help >/dev/null
+BUNDLED="/repo/apps/desktop/src-tauri/resources/models/$MODEL.pt"
+if [[ -f "$BUNDLED" ]]; then
+  # Mirrors ensure_bundled_whisper_model: the whisper CLI expects weights at
+  # ~/.cache/whisper, and the parent dir does not exist on a clean machine.
+  mkdir -p "$HOME/.cache/whisper"
+  cp -f "$BUNDLED" "$HOME/.cache/whisper/$MODEL.pt"
+  echo "    copied bundled $MODEL.pt to \$HOME/.cache/whisper (mirrors ensure_bundled_whisper_model)"
+fi
 
 echo "==> Bootstrap complete. runtime.env:"
 cat "$STATE/runtime.env"
