@@ -13,12 +13,12 @@ jobs:
       # Repo root IS the project (package.json sits at root on GitHub), so no
       # working-directory prefix — the previous value pointed at a folder that
       # does not exist in the repository and made every CI run fail.
-      - run: npm test
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tauri system deps (needed to compile the desktop crate)
+      - name: Install system deps (ffmpeg for media tests, webkit for cargo test)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: npm test
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
         working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high
