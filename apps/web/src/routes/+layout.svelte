@@ -7,6 +7,10 @@
   let runtimeReady = $state(false);
 
   onMount(() => {
+    // Tauri-only command; the desktop shell injects window.__TAURI__. Outside
+    // Tauri (adapter-node server in a plain browser) the fetch simply fails
+    // and the runtime dot stays "incomplete" — the RAG endpoints do not
+    // depend on any of the Tauri commands.
     invoke<{ ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; modelReady: boolean }>("runtime_status")
       .then((r) => { runtimeReady = r.ffmpeg && r.ffprobe && r.node && r.whisper && r.modelReady; })
       .catch(() => { runtimeReady = false; });
@@ -15,8 +19,7 @@
   const items = [
     { href: "/", id: "studio", label: "Studio" },
     { href: "/editor/demo", id: "editor", label: "Editor" },
-    // YouTube Studio is rail-hidden until a RAG backend exists; the route stays in place for later re-enable.
-    { href: "/youtube", id: "youtube", label: "YouTube Studio", hidden: true },
+    { href: "/youtube", id: "youtube", label: "YouTube Studio" },
     { href: "/settings", id: "settings", label: "Settings" },
   ];
   const current = $derived(page.route?.id ?? "");
@@ -33,7 +36,7 @@
 <div class="app">
   <nav class="rail" aria-label="Primary">
     <span class="rail-mark" title="Local-first AI Video Studio">LF</span>
-    {#each items.filter((item) => !item.hidden) as item}
+    {#each items as item}
       <a class="rail-link" class:on={isOn(item)} href={item.href} title={item.label} aria-label={item.label}>
         <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : "studio"} />
       </a>

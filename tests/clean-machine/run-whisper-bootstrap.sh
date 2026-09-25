@@ -19,16 +19,22 @@ echo "==> Pristine state check"
 [[ ! -e "$WHISPER_BIN" ]] && echo "    whisper absent (fresh)"
 command -v whisper >/dev/null 2>&1 && { echo "    WARNING: whisper on PATH — not a clean machine"; exit 1; }
 
-echo "==> Creating venv at $VENV"
-python3 -m venv "$VENV"
+# Fast path mirroring run_whisper_bootstrap in main.rs: when the venv's
+# whisper already exists, skip venv creation and pip install entirely.
+if [[ -e "$WHISPER_BIN" ]]; then
+  echo "==> Whisper already installed, skipping install (idempotent)"
+else
+  echo "==> Creating venv at $VENV"
+  python3 -m venv "$VENV"
 
-echo "==> Upgrading pip"
-"$VENV/bin/pip" install --upgrade pip >/dev/null
+  echo "==> Upgrading pip"
+  "$VENV/bin/pip" install --upgrade pip >/dev/null
 
-echo "==> Installing openai-whisper (CPU wheels only)"
-# CPU wheels keep the install under ~500 MB instead of ~3 GB of CUDA
-# wheels — enough for the tiny/base whisper models on a clean CPU box.
-"$VENV/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu openai-whisper
+  echo "==> Installing openai-whisper (CPU wheels only)"
+  # CPU wheels keep the install under ~500 MB instead of ~3 GB of CUDA
+  # wheels — enough for the tiny/base whisper models on a clean CPU box.
+  "$VENV/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cpu openai-whisper
+fi
 
 echo "==> Writing runtime.env"
 mkdir -p "$STATE"

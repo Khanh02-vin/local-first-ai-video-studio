@@ -5,11 +5,13 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
+    "build:node": "node build-node.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-dialog": "^2.4.0"
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@tauri-apps/plugin-http": "^2.6.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.5.7",

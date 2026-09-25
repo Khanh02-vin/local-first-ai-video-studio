@@ -197,9 +197,84 @@ fn stop_local_llm(state: tauri::State<'_, LlamaState>) -> Result<(), String> {
 fn nix_kill(pid: u32) -> std::io::Result<()> {
     std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().map(|_| ())
 }
-fn status_script(app: &tauri::AppHandle) -> Result<PathBuf, String> { app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}")).map(|dir| dir.join("scripts/analysis-status.ts")) }
+// Newtype: LlamaState is also Arc<Mutex<Option<u32>>>. Tauri keys managed state
+// by the concrete type, so aliasing both would register the same type twice and
+// panic ("already being managed"). This wrapper keeps them distinct.
+#[derive(Clone, Default)]
+struct RagState(Arc<Mutex<Option<u32>>>); // pid of the detached RAG sidecar, if running
+const RAG_PORT: u16 = 4733;
+/// Where the bundled adapter-node RAG server entry lives (web/build-node/index.js
+/// bundled as the `build-node` resource). Falls back to the dev-tree build so a
+/// `tauri dev` run without a packaged resource still works.
+fn rag_entry(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let candidate = app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}"))?.join("build-node/index.js");
+    if candidate.is_file() { return Ok(candidate); }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/build-node/index.js");
+    if dev.is_file() { return Ok(dev); }
+    Err("RAG_SERVER_MISSING: web/build-node/index.js not found in resources or dev tree (run: npm run build:node)".into())
+}
+/// True when the RAG sidecar is already answering on this port (GET playlists is 200).
+fn rag_healthy(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/api/rag/playlists");
+    Command::new("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &url]).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "200").unwrap_or(false)
+}
+/// Idempotently spawn the RAG sidecar (bundled node + build-node entry) on
+/// 127.0.0.1:RAG_PORT and wait until it answers; reuses an instance already
+/// healthy. Returns the base URL the static webview should call via plugin-http.
+fn ensure_rag_server(state: &RagState, app: &tauri::AppHandle) -> Result<String, String> {
+    let base = format!("http://127.0.0.1:{RAG_PORT}");
+    if rag_healthy(RAG_PORT) { return Ok(base); }
+    let entry = rag_entry(app)?;
+    let mut cmd = Command::new(node_bin(app));
+    cmd.arg(&entry)
+        .env("PORT", RAG_PORT.to_string())
+        .env("HOST", "127.0.0.1")
+        .env("LOCAL_FIRST_STATE_DIR", state_dir().to_string_lossy().into_owned())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let spawned = cmd.spawn().map_err(|e| format!("RAG_SPAWN:{e}"))?;
+    let pid = spawned.id();
+    drop(spawned); // detach: keep only the pid so we can stop it later
+    let mut ready = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if rag_healthy(RAG_PORT) { ready = true; break; }
+    }
+    if !ready {
+        #[cfg(unix)] let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        return Err("RAG_SERVER_TIMEOUT".into());
+    }
+    if let Ok(mut guard) = state.0.lock() { let _ = guard.insert(pid); }
+    Ok(base)
+}
+#[tauri::command]
+fn rag_server_url(app: tauri::AppHandle, state: tauri::State<'_, RagState>) -> Result<String, String> {
+    ensure_rag_server(state.inner(), &app)
+}
+fn status_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // Bundled resources come first: in a dev build the tauri dev runtime wires
+    // the resource dir to src-tauri/resources, which does not contain the
+    // analysis scripts. Installed builds ship scripts/ (bundle.resources), so
+    // the resource-dir hit only succeeds there. Fall back to the dev-tree
+    // scripts/ next to the repo root.
+    let candidate = app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}"))?.join("scripts/analysis-status.ts");
+    if candidate.is_file() { return Ok(candidate); }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join("scripts/analysis-status.ts");
+    if dev.is_file() { return Ok(dev); }
+    Err("STATUS_SCRIPT_MISSING: scripts/analysis-status.ts not found in resources or the dev tree".into())
+}
+/// Resolves a bundled helper script by name with the same resource-dir-first,
+/// dev-tree-fallback strategy as status_script().
+fn helper_script(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+    let candidate = app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}"))?.join(format!("scripts/{name}"));
+    if candidate.is_file() { return Ok(candidate); }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join("scripts").join(name);
+    if dev.is_file() { return Ok(dev); }
+    Err(format!("SCRIPT_MISSING:scripts/{name} not found in resources or the dev tree"))
+}
 const NODE_ARGS: &[&str] = &["--experimental-strip-types"];
-fn run_status_script(app: &tauri::AppHandle, args: &[String]) -> Result<serde_json::Value, String> { let script = status_script(app)?; let mut cmd = Command::new(node_bin(app)); cmd.args(NODE_ARGS).arg(script).arg(jobs_path()).args(args); for (key, value) in helper_env(app, &[]) { cmd.env(key, value); } let output = cmd.output().map_err(|e| format!("STATUS_SPAWN:{e}"))?; if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); } serde_json::from_slice(&output.stdout).map_err(|e| format!("STATUS_JSON:{e}")) }
+fn run_status_script(app: &tauri::AppHandle, args: &[String]) -> Result<serde_json::Value, String> { let script = status_script(app)?; let mut cmd = Command::new(node_bin(app)); cmd.args(NODE_ARGS).arg(&script).arg(jobs_path()).args(args); for (key, value) in helper_env(app, &[]) { cmd.env(key, value); } let output = cmd.output().map_err(|e| format!("STATUS_SPAWN:{e}"))?; if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); } serde_json::from_slice(&output.stdout).map_err(|e| format!("STATUS_JSON:{e}")) }
 fn status_from_json(job: &serde_json::Value) -> AnalysisStatus { AnalysisStatus { status: job["status"].as_str().unwrap_or("failed").into(), phase: job["phase"].as_str().unwrap_or("unknown").into(), progress: job["progress"].as_f64().unwrap_or(0.0), result: job["result"].as_str().map(String::from), error: job["error"].as_str().map(String::from), chunk_completed: job["chunkCompleted"].as_u64().unwrap_or(0), chunk_total: job["chunkTotal"].as_u64().unwrap_or(0), current_chunk: job["currentChunk"].as_u64() } }
 fn read_sqlite_status(app: &tauri::AppHandle, id: &str) -> Result<AnalysisStatus, String> { let value = run_status_script(app, &[id.to_string()])?; if value.is_null() { return Err("JOB_NOT_FOUND".into()); } Ok(status_from_json(&value)) }
 
@@ -444,7 +519,7 @@ fn start_analysis(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>, path: Str
     if !input.is_file() { return Err("INPUT_NOT_FILE".into()); }
     let id = format!("analysis-{}", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "CLOCK_ERROR")?.as_nanos());
     let duration = probe_duration(&app, &input)?;
-    let init_script = app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}"))?.join("scripts/analysis-init.ts");
+    let init_script = helper_script(&app, "analysis-init.ts")?;
     let range_start = start.unwrap_or(0.0); let range_end = end.unwrap_or(duration); if !range_start.is_finite() || !range_end.is_finite() || range_start < 0.0 || range_end <= range_start || range_end > duration { return Err("INVALID_ANALYZE_RANGE".into()); }
     let mut init = Command::new(node_bin(&app)); init.args(NODE_ARGS).arg(init_script).arg(jobs_path()).arg(&id).arg(&input).arg(format!("{duration:.3}")).arg(format!("{range_start:.3}")).arg(format!("{range_end:.3}")); for (key, value) in helper_env(&app, &[]) { init.env(key, value); } let init = init.output().map_err(|e| format!("STORE_INIT:{e}"))?;
     if !init.status.success() { return Err(String::from_utf8_lossy(&init.stderr).trim().to_owned()); }
@@ -458,7 +533,7 @@ fn spawn_analysis_worker(app: tauri::AppHandle, jobs: Jobs, job_id: String, inpu
     { let mut all = match jobs.lock() { Ok(all) => all, Err(_) => return }; if let Some(job) = all.get(&job_id) { if job.status == "running" { return; } } all.insert(job_id.clone(), AnalysisStatus { status: "running".into(), phase: "probe".into(), progress: 0.02, result: None, error: None, chunk_completed: 0, chunk_total: 0, current_chunk: None }); }
     thread::spawn(move || {
         let run = || -> Result<String, String> {
-            let script = app.path().resource_dir().map_err(|e| format!("RESOURCE_DIR:{e}"))?.join("scripts/analyze-video.ts");
+            let script = helper_script(&app, "analyze-video.ts")?;
             let mut cmd = Command::new(node_bin(&app));
             cmd.args(NODE_ARGS).arg(script).arg(&input).arg(input.to_string_lossy().as_ref()).arg(format!("{duration:.3}")).arg(format!("{range_start:.3}")).arg(format!("{range_end:.3}")).arg(&job_id).arg(jobs_path());
             for (key, value) in helper_env(&app, &[]) { cmd.env(key, value); }
@@ -621,23 +696,33 @@ fn main() {
     let jobs: Jobs = Arc::new(Mutex::new(HashMap::new()));
     let supervisor_jobs = jobs.clone();
     let llama_state: LlamaState = Arc::new(Mutex::new(None));
+    let rag_state: RagState = RagState::default();
     let bootstrap_state = BootstrapState(Arc::new(Mutex::new(None)));
     let download_state = ModelDownloadState(Arc::new(Mutex::new(None)));
     let app = tauri::Builder::default()
         .manage(jobs)
         .manage(llama_state.clone())
+        .manage(rag_state.clone())
         .manage(bootstrap_state)
         .manage(download_state)
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();
+    let rag_shutdown = rag_state.clone();
     app.run(move |_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // App is exiting: stop a detached llama-server if it is running.
+            // App is exiting: stop the detached llama-server and RAG sidecar if running.
             if let Ok(mut guard) = llama_shutdown.lock() {
+                if let Some(pid) = guard.take() {
+                    #[cfg(unix)] { let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status(); }
+                    #[cfg(not(unix))] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status(); }
+                }
+            }
+            if let Ok(mut guard) = rag_shutdown.0.lock() {
                 if let Some(pid) = guard.take() {
                     #[cfg(unix)] { let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status(); }
                     #[cfg(not(unix))] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).status(); }

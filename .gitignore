@@ -5,6 +5,7 @@ node_modules/
 target/
 .svelte-kit/
 build/
+build-node/
 dist/
 uploads/
 output/

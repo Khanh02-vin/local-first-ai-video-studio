@@ -11,6 +11,14 @@ import { join, dirname } from "node:path";
  *   <state>/youtube/videos/<id>.json      — per-video transcript segments
  *   <state>/youtube/index.json            — TF-IDF index over all segments
  *
+ * SvelteKit registers one route entry per filesystem path: a +server.ts at
+ * the literal /api/rag path would only dispatch that exact URL, while the
+ * YouTube Studio UI fetches sub-paths (/api/rag/playlists, /ingest, /query,
+ * /index, DELETE /api/rag/playlists/<id>). The rest-parameter sibling at
+ * src/routes/api/[...rest]/+server.ts claims the whole /api/* subtree and
+ * re-exports this module, so under adapter-node those sub-paths reach the
+ * handlers instead of the SPA catch-all.
+ *
  * Every endpoint validates its inputs strictly and fails with a 400 JSON
  * body rather than a stack trace, so the UI can display the error as-is.
  */
@@ -93,13 +101,16 @@ function rebuildIndex(): void {
       for (const token of tokenize(segment.text)) index[key][token] = (index[key][token] ?? 0) + 1;
     }
   }
-  writeFileSync(join(dir, "..", "index.json"), JSON.stringify(index));
+  writeFileSync(join(dataDir(), "index.json"), JSON.stringify(index));
 }
 
 // --- endpoints ---
 
 export const GET: RequestHandler = async ({ url }) => {
-  if (url.pathname.endsWith("/playlists")) {
+  // The [...rest] route (src/routes/api/[...rest]) dispatches any /api/* path
+  // to this module. Match the exact /api/rag/* sub-paths only, so an unrelated
+  // /api/foo request still gets a JSON 404 instead of the SPA HTML fallback.
+  if (url.pathname === "/api/rag/playlists") {
     const dir = dataDir() + "/playlists";
     const playlists = readdirSync(dir)
       .filter((n) => n.endsWith(".json"))
@@ -108,14 +119,14 @@ export const GET: RequestHandler = async ({ url }) => {
     playlists.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return Response.json({ playlists });
   }
-  if (url.pathname.endsWith("/index")) return Response.json(loadIndex());
+  if (url.pathname === "/api/rag/index") return Response.json(loadIndex());
   return jsonError(404, "UNKNOWN_ENDPOINT");
 };
 
 export const POST: RequestHandler = async ({ request }) => {
   const { pathname } = new URL(request.url);
 
-  if (pathname.endsWith("/playlists")) {
+  if (pathname === "/api/rag/playlists") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
     const playlistUrl = (body as { playlistUrl?: string })?.playlistUrl;
@@ -129,7 +140,7 @@ export const POST: RequestHandler = async ({ request }) => {
     return Response.json({ id, status: "queued" }, { status: 202 });
   }
 
-  if (pathname.endsWith("/ingest")) {
+  if (pathname === "/api/rag/ingest") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
     const { videoUrl, title, segments } = body as { videoUrl?: string; title?: string; segments?: Segment[] };
@@ -156,7 +167,7 @@ export const POST: RequestHandler = async ({ request }) => {
     return Response.json({ videoId, segments: segments.length });
   }
 
-  if (pathname.endsWith("/query")) {
+  if (pathname === "/api/rag/query") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
     const { question, topK, videoId, playlistId, topic } = body as {
@@ -223,13 +234,13 @@ export const POST: RequestHandler = async ({ request }) => {
 };
 
 export const DELETE: RequestHandler = async ({ url }) => {
-  const match = url.pathname.match(/playlists\/(pl-[\w-]+)/);
+  const match = url.pathname.match(/^\/api\/rag\/playlists\/(pl-[\w-]+)$/);
   if (!match) return jsonError(404, "UNKNOWN_ENDPOINT");
   const doc = loadPlaylist(match[1]);
   if (!doc) return jsonError(404, "PLAYLIST_NOT_FOUND");
   const dir = dataDir() + "/playlists";
-  writeFileSync(join(dir, `${doc.id}.json`), JSON.stringify({ ...doc, status: "failed" }));
-  return Response.json({ id: doc.id, removed: false });
+  rmSync(join(dir, `${doc.id}.json`), { force: true });
+  return Response.json({ id: doc.id, removed: true });
 };
 
 function jsonError(status: number, message: string): Response {

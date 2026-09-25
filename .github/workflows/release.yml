@@ -40,6 +40,7 @@ jobs:
           cd apps/web
           npm ci
           npm run build
+          npm run build:node
       - run: cargo test
         working-directory: apps/desktop/src-tauri
 
@@ -65,9 +66,23 @@ jobs:
           security import signing.p12 -k build.keychain -P "$APPLE_IDENTITY_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -u build.keychain
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
+      - id: sign_identity
+        run: |
+          if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
+            echo "identity=$(cat "$RUNNER_TEMP/apple_signing_identity")" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
       - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        shell: bash
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
+          npm run build:node
       - name: Build + sign + notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
@@ -77,12 +92,6 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ steps.sign_identity.outputs.identity }}
         run: bash scripts/build-installer.sh
-      - id: sign_identity
-        run: |
-          if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
-            echo "identity=$(cat "$RUNNER_TEMP/apple_signing_identity")" >> "$GITHUB_OUTPUT"
-          fi
-        shell: bash
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
@@ -98,9 +107,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
       - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        shell: bash
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
+          npm run build:node
       - name: Build + sign
         env:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
@@ -129,6 +146,13 @@ jobs:
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        shell: bash
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
+          npm run build:node
       - name: Build bundles
         run: |
           cd apps/desktop

@@ -5,7 +5,7 @@
   "identifier": "com.localfirst.aivideostudio",
   "build": {
     "beforeDevCommand": "cd ../web && npm run dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "cd ../web && npm run build",
+    "beforeBuildCommand": "cd ../web && npm run build && npm run build:node",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/build"
   },
@@ -42,7 +42,9 @@
       "./resources/ffmpeg": "ffmpeg",
       "./resources/ffprobe": "ffprobe",
       "./resources/models": "models",
-      "./resources/models/llama": "models/llama"
+      "./resources/models/llama": "models/llama",
+      "./resources/llama": "llama",
+      "../../web/build-node": "build-node"
     },
     "createUpdaterArtifacts": false
   }

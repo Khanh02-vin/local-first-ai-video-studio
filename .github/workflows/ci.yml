@@ -28,6 +28,7 @@ jobs:
           cd apps/web
           npm ci
           npm run build
+          npm run build:node
       - run: cargo test
         working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimal local desktop capability",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "dialog:default", "http:default"]
 }

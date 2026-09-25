@@ -27,6 +27,17 @@ OS="$(uname -s)"
 
 mkdir -p "$RES/models/llama" "$RES/llama"
 
+# Extract a .zip portably. Git Bash on the Windows runners ships neither
+# `unzip` nor a zip-capable GNU `tar`, so try every available extractor —
+# otherwise node/ffmpeg/llama downloads fail the Windows job at fetch time.
+extract_zip() { # $1 = zip file, $2 = destination dir
+  mkdir -p "$2"
+  if command -v unzip >/dev/null; then unzip -q -o "$1" -d "$2"
+  elif command -v python3 >/dev/null; then python3 -m zipfile -e "$1" "$2"
+  elif command -v python >/dev/null; then python -m zipfile -e "$1" "$2"
+  else tar -xf "$1" -C "$2"; fi
+}
+
 # --- lightweight: only satisfy tauri-build's existence checks ------------------
 if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
   mkdir -p "$RES/node"
@@ -52,7 +63,7 @@ else
   echo "==> node: downloading $url"
   tmp="$(mktemp -d)"
   curl -L --fail --retry 3 -o "$tmp/node.pkg" "$url"
-  if [[ "$NODE_PKG" == "zip" ]]; then tar -xf "$tmp/node.pkg" -C "$tmp/x" 2>/dev/null || { mkdir -p "$tmp/x" && python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$tmp/node.pkg" "$tmp/x"; };
+  if [[ "$NODE_PKG" == "zip" ]]; then extract_zip "$tmp/node.pkg" "$tmp/x";
   else mkdir -p "$tmp/x" && tar xf "$tmp/node.pkg" -C "$tmp/x" --strip-components=1; fi
   mkdir -p "$RES/node"
   cp -r "$tmp/x"/. "$RES/node/"
@@ -86,8 +97,7 @@ else
     echo "==> ffmpeg: downloading $url"
     curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url"
     if [[ "$url" == *.zip ]]; then
-      if command -v unzip >/dev/null; then unzip -q -o "$tmp/ff.pkg" -d "$tmp/x";
-      else tar -xf "$tmp/ff.pkg" -C "$tmp/x"; fi
+      extract_zip "$tmp/ff.pkg" "$tmp/x"
     else
       tar xf "$tmp/ff.pkg" -C "$tmp/x"
     fi
@@ -137,7 +147,7 @@ else
   echo "==> llama.cpp: fetching $asset"
   tmp="$(mktemp -d)"
   curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}"
-  if [[ "$asset" == *.zip ]]; then mkdir -p "$tmp/x" && tar -xf "$tmp/llama.pkg" -C "$tmp/x";
+  if [[ "$asset" == *.zip ]]; then extract_zip "$tmp/llama.pkg" "$tmp/x";
   else mkdir -p "$tmp/x" && tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1; fi
   find "$tmp/x" -maxdepth 3 -type f \( -name 'llama-server*' -o -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/llama/" \;
   chmod +x "$RES/llama/llama-server" 2>/dev/null || true

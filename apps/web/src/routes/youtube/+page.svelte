@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isTauri, invoke } from "@tauri-apps/api/core";
   type Playlist = { id: string; playlistId: string; playlistUrl: string; title: string | null; status: string; createdAt: string; updatedAt: string };
   type Result = { score: number; video_id: string; video_url: string; text: string; start_seconds: number; end_seconds: number; timestampUrl: string; playlist_id?: string; topic?: string };
   let playlistUrl = $state("");
@@ -19,24 +20,48 @@
   let ingestTitle = $state("");
   let ingestText = $state("");
 
+  // In the desktop app the static webview (origin tauri://localhost) cannot
+  // fetch the RAG sidecar directly — webview CSP is default-src 'self'. So we
+  // resolve the sidecar base URL from Tauri and route through tauri-plugin-http,
+  // whose HTTP runs in Rust and bypasses webview CSP/CORS. Standalone (plain
+  // browser served by the adapter-node build) keeps same-origin relative fetch.
+  let ragBase = "";
+  let tauriFetch: typeof globalThis.fetch | null = null;
+
+  async function initRag(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
+      tauriFetch = tFetch as typeof globalThis.fetch;
+      ragBase = await invoke<string>("rag_server_url"); // spawns the sidecar if needed
+    } catch (error) {
+      status = String(error);
+    }
+  }
+
+  async function rag(path: string, init?: RequestInit): Promise<Response> {
+    const doFetch = tauriFetch ?? globalThis.fetch;
+    return doFetch(ragBase + path, init);
+  }
+
   async function loadPlaylists() {
-    try { const response = await fetch("/api/rag/playlists"); if (!response.ok) throw new Error("Playlist service unavailable"); playlists = (await response.json()).playlists ?? []; } catch (error) { status = String(error); }
+    try { const response = await rag("/api/rag/playlists"); if (!response.ok) throw new Error("Playlist service unavailable"); playlists = (await response.json()).playlists ?? []; } catch (error) { status = String(error); }
   }
   async function addPlaylist() {
     if (!playlistUrl.trim()) return;
     adding = true;
-    try { const response = await fetch("/api/rag/playlists", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playlistUrl, title: playlistTitle || undefined }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Could not queue playlist"); playlistUrl = ""; playlistTitle = ""; status = "Playlist queued for indexing."; await loadPlaylists(); } catch (error) { status = String(error); } finally { adding = false; }
+    try { const response = await rag("/api/rag/playlists", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playlistUrl, title: playlistTitle || undefined }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Could not queue playlist"); playlistUrl = ""; playlistTitle = ""; status = "Playlist queued for indexing."; await loadPlaylists(); } catch (error) { status = String(error); } finally { adding = false; }
   }
   async function search() {
     if (!question.trim()) return;
     loading = true; status = "Searching indexed transcripts…"; answer = ""; results = [];
-    try { const response = await fetch("/api/rag/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question, topK, videoId: videoId || undefined, playlistId: playlistId || undefined, topic: topic || undefined, synthesize: true }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Search failed"); const data = await response.json(); answer = data.answer ?? "No synthesis returned."; results = data.results ?? []; status = `${results.length} timestamped excerpts found.`; } catch (error) { status = String(error); } finally { loading = false; }
+    try { const response = await rag("/api/rag/query", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question, topK, videoId: videoId || undefined, playlistId: playlistId || undefined, topic: topic || undefined, synthesize: true }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Search failed"); const data = await response.json(); answer = data.answer ?? "No synthesis returned."; results = data.results ?? []; status = `${results.length} timestamped excerpts found.`; } catch (error) { status = String(error); } finally { loading = false; }
   }
   async function ingest() {
     if (!ingestUrl.trim() || !ingestText.trim()) return;
-    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await fetch("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; showIngest = false; } catch (error) { status = String(error); }
+    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await rag("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; showIngest = false; } catch (error) { status = String(error); }
   }
-  loadPlaylists();
+  initRag().then(loadPlaylists);
 </script>
 
 <svelte:head><title>YouTube Studio · Local-first AI Video Studio</title></svelte:head>

@@ -53,9 +53,14 @@ theo đúng thứ tự nesting trước khi `JSON.parse`.
 
 ## Giới hạn
 
-- Chỉ test trên **linux x64** (binary llama.cpp b11160). mac/win cần binary
-  tương ứng (llama.cpp có release cho từng OS) — thêm vào resources khi build
-  trên runner đúng OS.
+- Binary llama.cpp (b11160) hiện bundle **linux x64 only** và được ship trong
+  installer qua `tauri.conf.json` (`bundle.resources` → `./resources/llama`).
+  mac/win: `scripts/fetch-bundled-assets.sh` đã kéo đúng release llama.cpp cho
+  từng OS (macos-arm64/x64, win-cpu-x64) khi build trên runner đúng OS —
+  workflow `release.yml` chạy bước này cho job `macos`/`windows`. Chạy thử
+  build + code-sign thật vẫn cần runner macOS/Windows và secrets (xem
+  `docs/codesigning-runbook.md`).
+- Test first-run trên máy sạch (Ubuntu 24.04 Docker): xem `tests/clean-machine/README.md`.
 - Tốc độ CPU: ~5 token/s trên máy tải (≈80–120s/cửa sổ 20 phút transcript).
   GPU/CUDA build nhanh hơn nhiều.
 - Prompt/JSON output bằng model nhỏ (3B): chất lượng highlight thấp hơn Gemini,

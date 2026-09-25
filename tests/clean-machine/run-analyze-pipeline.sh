@@ -26,8 +26,21 @@ ffmpeg -y -f lavfi -i "testsrc=duration=12:size=1280x720:rate=30" \
 
 echo "==> Running the same pipeline the Tauri app runs"
 cd /repo
+# Tauri resolves node via the bundled resources (node_bin() in main.rs): a
+# clean machine has no system node, only the one shipped in the installer.
+# Fall back to PATH so the script also works on dev machines that never ran
+# scripts/fetch-bundled-assets.sh.
+NODE_BIN="/repo/apps/desktop/src-tauri/resources/node/bin/node"
+[[ -x "$NODE_BIN" ]] || NODE_BIN="$(command -v node)" || { echo "    node not found (neither bundled nor on PATH)"; exit 1; }
+# FFmpeg/ffprobe: prefer the bundled resources (what the deb ships); on a
+# clean machine the apt install in the Dockerfile is what the app falls back
+# to when the resource is absent.
+FFMPEG_BIN="/repo/apps/desktop/src-tauri/resources/ffmpeg";   [[ -x "$FFMPEG_BIN" ]]  || FFMPEG_BIN="ffmpeg"
+FFPROBE_BIN="/repo/apps/desktop/src-tauri/resources/ffprobe"; [[ -x "$FFPROBE_BIN" ]] || FFPROBE_BIN="ffprobe"
+echo "    node=$NODE_BIN ffmpeg=$FFMPEG_BIN"
 LOCAL_FIRST_STATE_DIR="$STATE" WHISPER_COMMAND="$WHISPER_COMMAND" WHISPER_MODEL="$WHISPER_MODEL" \
-  node --experimental-strip-types scripts/run-local-demo.ts /tmp/talk.mp4 /tmp/short-clean.mp4 0 12
+FFMPEG_PATH="$FFMPEG_BIN" FFPROBE_PATH="$FFPROBE_BIN" \
+  "$NODE_BIN" --experimental-strip-types scripts/run-local-demo.ts /tmp/talk.mp4 /tmp/short-clean.mp4 0 12
 
 echo "==> Verifying output"
 OUT=/tmp/short-clean.mp4

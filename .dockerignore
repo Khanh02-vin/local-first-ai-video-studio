@@ -1,0 +1,21 @@
+# Keep the clean-machine image small and honest: it must mirror a fresh
+# client machine, not this working tree (12 GB of venv/target/node_modules).
+.git
+.venv
+.cache
+node_modules
+apps/web/node_modules
+apps/desktop/src-tauri/target
+apps/web/build
+apps/web/.svelte-kit
+keys/
+*.pem
+# Bundled binaries/weights that are git-ignored: fetched inside the image by
+# scripts/fetch-bundled-assets.sh (node download, apt ffmpeg copy, whisper
+# weights). The Git-LFS placeholder for the 2.1 GB GGUF is deliberately NOT
+# excluded — a fresh client checkout ships the placeholder and downloads the
+# real weights on first use, so the image must mirror that.
+apps/desktop/src-tauri/resources/node/
+apps/desktop/src-tauri/resources/ffmpeg
+apps/desktop/src-tauri/resources/ffprobe
+apps/desktop/src-tauri/resources/models/**/*.pt
