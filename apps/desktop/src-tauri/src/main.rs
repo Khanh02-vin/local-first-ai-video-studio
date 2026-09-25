@@ -417,7 +417,8 @@ fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or_else(|| "tiny".into());
     // Ship the bundled model to the whisper cache so the CLI needs no download.
     let _ = ensure_bundled_whisper_model(&app, &model);
-    let model_ready = std::env::var("WHISPER_MODEL_PATH").map(|p| Path::new(&p).exists()).unwrap_or_else(|_| std::env::var("HOME").ok().map(|p| Path::new(&p).join(".cache/whisper").join(format!("{model}.pt")).exists()).unwrap_or(false));
+    let model_ready = std::env::var("WHISPER_MODEL_PATH").is_ok_and(|p| !p.is_empty() && Path::new(&p).exists())
+        || std::env::var("HOME").map(|h| Path::new(&h).join(".cache/whisper").join(format!("{model}.pt")).exists()).unwrap_or(false);
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let ffmpeg = ffmpeg_bin(&app); let ffprobe = ffprobe_bin(&app); let node = node_bin(&app);
     serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": Path::new(&whisper).exists() || command_ready(&whisper), "model": model, "modelReady": model_ready, "device": device, "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file() } })
@@ -425,7 +426,10 @@ fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
 
 #[tauri::command]
 fn start_analysis(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>, path: String, start: Option<f64>, end: Option<f64>) -> Result<String, String> {
-    guard_pro_features()?;
+    let file = runtime_env();
+    let whisper_model = file.get("WHISPER_MODEL").cloned().unwrap_or_else(|| "tiny".into());
+    let whisper_device = file.get("WHISPER_DEVICE").cloned().unwrap_or_else(|| "cpu".into());
+    guard_pro_features(&whisper_model, &whisper_device)?;
     let input = Path::new(&path).canonicalize().map_err(|e| format!("INPUT_PATH:{e}"))?;
     if !input.is_file() { return Err("INPUT_NOT_FILE".into()); }
     let id = format!("analysis-{}", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "CLOCK_ERROR")?.as_nanos());
@@ -489,7 +493,10 @@ fn list_analysis_jobs(app: tauri::AppHandle) -> Result<serde_json::Value, String
 /// Clears the crash budget and requeues failed chunks, then restarts the worker.
 #[tauri::command]
 fn retry_analysis(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>, id: String) -> Result<serde_json::Value, String> {
-    guard_pro_features()?;
+    let file = runtime_env();
+    let whisper_model = file.get("WHISPER_MODEL").cloned().unwrap_or_else(|| "tiny".into());
+    let whisper_device = file.get("WHISPER_DEVICE").cloned().unwrap_or_else(|| "cpu".into());
+    guard_pro_features(&whisper_model, &whisper_device)?;
     let job = run_status_script(&app, &[id.clone(), "--retry".to_string()])?;
     let (Some(input), Some(duration)) = (job["input"].as_str(), job["duration"].as_f64()) else { return Err("JOB_NOT_FOUND".into()); };
     let path = PathBuf::from(input);
@@ -532,12 +539,31 @@ fn license_tier() -> String {
 }
 
 /// Pro feature gate: larger models and GPU are paid features.
-fn guard_pro_features() -> Result<(), String> {
+fn guard_pro_features(whisper_model: &str, whisper_device: &str) -> Result<(), String> {
     if license_tier() == "pro" { return Ok(()); }
-    let file = runtime_env();
-    let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
-    let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or_else(|| "tiny".into());
-    if device == "cuda" || model != "tiny" { return Err("PRO_REQUIRED: GPU rendering and larger Whisper models need a Pro license. Install license.lic or use CPU + tiny model.".into()); }
+    let model = if whisper_model.is_empty() {
+        std::env::var("WHISPER_MODEL").ok()
+            .or_else(|| {
+                let file = runtime_env();
+                file.get("WHISPER_MODEL").cloned().filter(|c| !c.is_empty())
+            })
+            .unwrap_or_else(|| "tiny".into())
+    } else {
+        whisper_model.to_string()
+    };
+    let device = if whisper_device.is_empty() {
+        std::env::var("WHISPER_DEVICE").ok()
+            .or_else(|| {
+                let file = runtime_env();
+                file.get("WHISPER_DEVICE").cloned().filter(|c| !c.is_empty())
+            })
+            .unwrap_or_else(|| "cpu".into())
+    } else {
+        whisper_device.to_string()
+    };
+    if device == "cuda" || model != "tiny" {
+        return Err("PRO_REQUIRED: GPU rendering and larger Whisper models need a Pro license. Install license.lic or use CPU + tiny model.".into());
+    }
     Ok(())
 }
 
