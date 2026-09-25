@@ -413,7 +413,16 @@ fn preflight_analyze(path: String) -> Result<serde_json::Value, String> { let in
 #[tauri::command]
 fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     let file = runtime_env();
-    let whisper = std::env::var("WHISPER_COMMAND").ok().filter(|c| !c.is_empty()).or_else(|| file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty())).unwrap_or_else(whisper_command);
+    // A clean machine has neither a venv nor a PATH whisper; runtime_status
+    // reports that truthfully so the UI can point the user at the bootstrap
+    // instead of assuming whisper_command() resolved something usable.
+    let whisper_env = std::env::var("WHISPER_COMMAND").ok().filter(|c| !c.is_empty());
+    let whisper_file = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty());
+    let whisper = match (whisper_env, whisper_file) {
+        (Some(e), _) => e,
+        (None, Some(f)) => f,
+        (None, None) => whisper_venv_bin("whisper").to_string_lossy().into_owned(),
+    };
     let model = std::env::var("WHISPER_MODEL").ok().or_else(|| file.get("WHISPER_MODEL").cloned()).unwrap_or_else(|| "tiny".into());
     // Ship the bundled model to the whisper cache so the CLI needs no download.
     let _ = ensure_bundled_whisper_model(&app, &model);
@@ -421,7 +430,8 @@ fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
         || std::env::var("HOME").map(|h| Path::new(&h).join(".cache/whisper").join(format!("{model}.pt")).exists()).unwrap_or(false);
     let device = std::env::var("WHISPER_DEVICE").ok().or_else(|| file.get("WHISPER_DEVICE").cloned()).unwrap_or_else(|| "cpu".into());
     let ffmpeg = ffmpeg_bin(&app); let ffprobe = ffprobe_bin(&app); let node = node_bin(&app);
-    serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": Path::new(&whisper).exists() || command_ready(&whisper), "model": model, "modelReady": model_ready, "device": device, "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file() } })
+    let whisper_present = Path::new(&whisper).exists() || (whisper_venv_bin("whisper").is_file() && whisper == whisper_venv_bin("whisper").to_string_lossy().into_owned()) || command_ready(&whisper);
+    serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": whisper_present, "model": model, "modelReady": model_ready, "device": device, "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file() } })
 }
 
 #[tauri::command]

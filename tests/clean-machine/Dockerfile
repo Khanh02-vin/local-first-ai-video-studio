@@ -1,16 +1,17 @@
+# Clean-machine simulation for the first-run bootstrap path.
+#
+# Mirrors a fresh Ubuntu 24.04 install: no whisper, no .venv, no .cache,
+# no ffmpeg on PATH, no rust. ffmpeg is installed from apt only so the
+# test can make a source video; the real .deb ships its own bundled
+# ffmpeg under resources/ and the pipeline under test is the Python side.
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System packages a client machine would have; deliberately NOT:
-# ffmpeg, whisper, .venv, ~/.cache/local-first-ai-video-studio, rust.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
         ca-certificates curl tar xz-utils unzip \
-        python3 python3-venv python3-pip && \
-    rm -rf /var/lib/apt/lists/*
-
-# ffmpeg is installed here only so the test pipeline can make a source video
-# and verify the output — a real .deb bundles its own ffmpeg under resources/.
-RUN apt-get install -y --no-install-recommends ffmpeg && \
+        python3 python3-venv python3-pip \
+        ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /repo
