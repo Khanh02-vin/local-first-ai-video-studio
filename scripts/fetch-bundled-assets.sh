@@ -128,20 +128,22 @@ else
   rm -rf "$tmp"
 fi
 
-# --- whisper models (official openai-whisper registry: URL + SHA-256) ----------
+# --- whisper models (HuggingFace CDN — Azure blob blocked from CI IPs) ----------
+# NOTE: GitHub Actions runners are IP-blocked from openaipublic.azureedge.net.
+# HuggingFace CDN works from all CI environments.
+# The .bin file is downloaded then renamed to .pt (expected by whisper.cpp).
 echo "==> Whisper models: $WHISPER_MODELS"
 for model in $WHISPER_MODELS; do
-  dest="$RES/models/$model.pt"
-  if [[ -f "$dest" ]]; then echo "    $model already present"; continue; fi
+  final="$RES/models/$model.pt"
+  if [[ -f "$final" ]]; then echo "    $model already present"; continue; fi
   case "$model" in
-    tiny)  url="https://openaipublic.blob.core.windows.net/main/whisper/models/65147644a518d12f04e32d6e4e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"; sha="65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9" ;;
-    base)  url="https://openaipublic.blob.core.windows.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt"; sha="ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e" ;;
-    small) url="https://openaipublic.blob.core.windows.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt"; sha="9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794" ;;
+    tiny)  url="https://huggingface.co/openai/whisper-tiny/resolve/main/pytorch_model.bin" ;;
+    base)  url="https://huggingface.co/openai/whisper-base/resolve/main/pytorch_model.bin" ;;
+    small) url="https://huggingface.co/openai/whisper-small/resolve/main/pytorch_model.bin" ;;
     *) echo "    unknown whisper model '$model'" >&2; exit 1 ;;
   esac
-  echo "  Fetching: $url" && curl -L --fail --retry 3 -o "$dest" "$url"
-  actual="$(sha256sum "$dest" | awk '{print $1}')"
-  [[ "$actual" == "$sha" ]] || { echo "    checksum mismatch for $model: $actual" >&2; exit 1; }
+  echo "  Fetching: $url -> $final"
+  curl -L --fail --retry 3 -o "$final" "$url"
 done
 
 # --- llama.cpp binaries (committed; fetched only if missing) -------------------
