@@ -5,7 +5,7 @@
 #   - resources/node/      (Node dist — dir must exist)
 #   - resources/ffmpeg     resources/ffprobe  (static builds or host copies)
 #   - resources/models/*.pt                (Whisper weights)
-#   - resources/models/llama/*.gggf        (Qwen2.5-3B)
+#   - resources/models/llama/*.gguf        (Qwen2.5 LLM)
 #   - resources/llama/      (llama.cpp — committed; re-fetched if missing)
 #
 # Modes:
@@ -178,13 +178,24 @@ else
   rm -rf "$tmp"
 fi
 
-# --- local-LLM GGUF (2.1 GB) --------------------------------------------------
+# --- local-LLM GGUF -----------------------------------------------------------
+# Model name và repo được lấy từ MODEL_NAME env.
+# CI builds dùng Qwen 0.5B để tránh vượt quá giới hạn kích thước bundle
+# (Windows MSI/light.exe và Linux linuxdeploy đều fail với model ~2GB).
 dest="$RES/models/llama/${MODEL_NAME}.gguf"
 if [[ -f "$dest" ]]; then
   echo "==> Local LLM model already present"
 else
-  echo "==> Local LLM model: $MODEL_NAME (~2.1 GB)"
-  curl -L --fail --retry 3 -o "$dest" "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/${MODEL_NAME}.gguf"
+  # Derive repo name from MODEL_NAME: qwen2.5-3b → Qwen2.5-3B-Instruct-GGUF
+  case "$MODEL_NAME" in
+    qwen2.5-0.5b*) model_repo="Qwen2.5-0.5B-Instruct-GGUF" ;;
+    qwen2.5-1.5b*) model_repo="Qwen2.5-1.5B-Instruct-GGUF" ;;
+    qwen2.5-3b*)   model_repo="Qwen2.5-3B-Instruct-GGUF" ;;
+    qwen2.5-7b*)   model_repo="Qwen2.5-7B-Instruct-GGUF" ;;
+    *) echo "unknown model pattern: $MODEL_NAME" >&2; exit 1 ;;
+  esac
+  echo "==> Local LLM model: $MODEL_NAME (from $model_repo)"
+  curl -L --fail --retry 3 -o "$dest" "https://huggingface.co/Qwen/${model_repo}/resolve/main/${MODEL_NAME}.gguf"
 fi
 if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
   EXPECTED="626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d"
@@ -193,4 +204,4 @@ if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
 fi
 
 echo "==> Assets ready:"
-du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || truetest
+du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || true
