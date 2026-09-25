@@ -68,6 +68,11 @@ jobs:
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
       - name: Build + sign + notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
@@ -102,6 +107,11 @@ jobs:
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
       - name: Build + sign
         env:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
@@ -132,6 +142,11 @@ jobs:
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
       - name: Build bundles
         run: |
           cd apps/desktop
