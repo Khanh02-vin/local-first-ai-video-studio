@@ -191,4 +191,4 @@ if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
 fi
 
 echo "==> Assets ready:"
-du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || true
+du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || truetest
