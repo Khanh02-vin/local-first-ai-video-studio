@@ -87,10 +87,16 @@ jobs:
             APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
             export APPLE_SIGNING_IDENTITY
             echo "Signing identity: $APPLE_SIGNING_IDENTITY"
+          else
+            echo "No signing identity available; building unsigned."
           fi
           cd apps/desktop
           npm install
-          npx tauri build --bundles app
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            npx tauri build --bundles app --target-signed
+          else
+            npx tauri build --bundles app
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
