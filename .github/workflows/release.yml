@@ -65,7 +65,7 @@ jobs:
           security import signing.p12 -k build.keychain -P "$APPLE_IDENTITY_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -u build.keychain
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
-      - name: Fetch model weights (git-ignored) and llama.cpp binaries
+      - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build + sign + notarize
@@ -75,21 +75,20 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.sign_identity.outputs.identity }}
+        run: bash scripts/build-installer.sh
+      - id: sign_identity
         run: |
-          # Identity is handed from the previous step through a file (env context is
-          # not allowed in a step env map).
           if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
-            APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
-            export APPLE_SIGNING_IDENTITY
-            echo "Signing identity: $APPLE_SIGNING_IDENTITY"
+            echo "identity=$(cat "$RUNNER_TEMP/apple_signing_identity")" >> "$GITHUB_OUTPUT"
           fi
-          cd apps/desktop
-          npm install
-          npx tauri build --bundles app
+        shell: bash
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
 
   windows:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
@@ -99,7 +98,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Fetch model weights (git-ignored) and llama.cpp binaries
+      - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
         shell: bash
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build + sign
@@ -107,10 +106,8 @@ jobs:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          cd apps/desktop
-          npm install
-          npx tauri build --bundles msi,nsis
+        shell: bash
+        run: bash scripts/build-installer.sh
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer

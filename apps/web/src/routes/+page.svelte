@@ -49,8 +49,8 @@
       const probe = JSON.parse(await invoke<string>("probe_video", { path }));
       const stream = (probe.streams ?? []).find((s: { codec_type?: string }) => s.codec_type === "video");
       meta = { name: path.split(/[\\/]/).pop() ?? path, duration: Number(probe.format?.duration ?? 0), width: Number(stream?.width ?? 0), height: Number(stream?.height ?? 0) };
-      studioState.sourcePath = path; studioState.sourceDuration = Number(probe.format?.duration ?? 0);
-    } catch { meta = { name: path.split(/[\\/]/).pop() ?? path, duration: 0, width: 0, height: 0 }; studioState.sourcePath = path; }
+      studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; studioState.sourceDuration = Number(probe.format?.duration ?? 0);
+    } catch { meta = { name: path.split(/[\\/]/).pop() ?? path, duration: 0, width: 0, height: 0 }; studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; }
     message = "Video loaded. Set the range and start analysis.";
   }
 
