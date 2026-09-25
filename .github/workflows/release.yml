@@ -81,18 +81,17 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         run: |
-          # Identity is handed from the previous step through a file.
-          # If no signing cert is available, we pass --no-code-sign to skip codesign.
+          # If no signing cert is available, set TAURI_SKIP_CODESIGN=1 to skip codesign
           cd apps/desktop
           npm install
           if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
             APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
             export APPLE_SIGNING_IDENTITY
             echo "Signing identity: $APPLE_SIGNING_IDENTITY"
-            npx tauri build --bundle app
+            npx tauri build -b app
           else
-            echo "No signing identity available; building unsigned with --no-code-sign."
-            npx tauri build --bundle app --no-code-sign
+            echo "No signing identity available; building unsigned."
+            TAURI_SKIP_CODESIGN=1 npx tauri build -b app
           fi
           fi
       - uses: actions/upload-artifact@v4
@@ -124,7 +123,7 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-            npx tauri build --bundle nsis
+          npx tauri build -b nsis
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
@@ -157,11 +156,9 @@ jobs:
         run: |
           cd apps/desktop
           npm install
-          npx tauri build --bundle appimage
+          npx tauri build -b appimage
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
-            apps/desktop/src-tauri/target/release/bundle/deb/*
-            apps/desktop/src-tauri/target/release/bundle/rpm/*
             apps/desktop/src-tauri/target/release/bundle/appimage/*
