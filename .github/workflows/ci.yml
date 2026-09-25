@@ -22,6 +22,12 @@ jobs:
       # tauri-build validates bundle.resources at compile time; the real binaries are
       # git-ignored, so create the paths (placeholders are never executed by tests).
       - run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
+      # tauri::generate_context! embeds frontendDist (../../web/build) at compile time.
+      - name: Build web frontend (generate_context needs frontendDist)
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
       - run: cargo test
         working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high

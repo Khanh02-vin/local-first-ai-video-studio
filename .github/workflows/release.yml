@@ -28,8 +28,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Install system deps (ffmpeg for media tests, webkit for cargo test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: npm test
       - uses: dtolnay/rust-toolchain@stable
+      - run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
       - run: cargo test
         working-directory: apps/desktop/src-tauri
 
