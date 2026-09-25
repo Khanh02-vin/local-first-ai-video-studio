@@ -5,7 +5,7 @@
 #   - resources/node/      (Node dist — dir must exist)
 #   - resources/ffmpeg     resources/ffprobe  (static builds or host copies)
 #   - resources/models/*.pt                (Whisper weights)
-#   - resources/models/llama/*.gguf        (Qwen2.5-3B)
+#   - resources/models/llama/*.gggf        (Qwen2.5-3B)
 #   - resources/llama/      (llama.cpp — committed; re-fetched if missing)
 #
 # Modes:
@@ -26,6 +26,31 @@ ARCH="$(uname -m)"
 OS="$(uname -s)"
 
 mkdir -p "$RES/models/llama" "$RES/llama"
+
+# --- extract_zip: try unzip, then python3, then python, then tar --------------
+extract_zip() {
+  local pkg="$1" dest="$2"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$pkg" -d "$dest"; return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "
+import sys, zipfile, pathlib
+z = zipfile.ZipFile(sys.argv[1])
+z.extractall(sys.argv[2])
+" "$pkg" "$dest"; return 0
+  elif command -v python >/dev/null 2>&1; then
+    python -c "
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+" "$pkg" "$dest"; return 0
+  fi
+  # Last resort: GNU tar 1.36+ can read some zips
+  tar -xf "$pkg" -C "$dest" || {
+    echo "Error: cannot extract zip ($pkg). Install unzip or python3." >&2
+    exit 1
+  }
+}
 
 # --- lightweight: only satisfy tauri-build's existence checks ------------------
 if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
@@ -52,8 +77,13 @@ else
   echo "==> node: downloading $url"
   tmp="$(mktemp -d)"
   curl -L --fail --retry 3 -o "$tmp/node.pkg" "$url"
-  if [[ "$NODE_PKG" == "zip" ]]; then tar -xf "$tmp/node.pkg" -C "$tmp/x" 2>/dev/null || { mkdir -p "$tmp/x" && python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$tmp/node.pkg" "$tmp/x"; };
-  else mkdir -p "$tmp/x" && tar xf "$tmp/node.pkg" -C "$tmp/x" --strip-components=1; fi
+  if [[ "$NODE_PKG" == "zip" ]]; then
+    mkdir -p "$tmp/x"
+    extract_zip "$tmp/node.pkg" "$tmp/x"
+  else
+    mkdir -p "$tmp/x"
+    tar xf "$tmp/node.pkg" -C "$tmp/x" --strip-components=1
+  fi
   mkdir -p "$RES/node"
   cp -r "$tmp/x"/. "$RES/node/"
   rm -rf "$tmp"
@@ -73,8 +103,6 @@ else
     Linux-aarch64)
       urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz") ;;
     Darwin-*)
-      # evermeet.cx ships ffmpeg and ffprobe as separate archives; x64 builds run
-      # under Rosetta on arm64 runners.
       urls=("https://evermeet.cx/ffmpeg/ffmpeg-7.0.2.zip" "https://evermeet.cx/ffmpeg/ffprobe-7.0.2.zip") ;;
     MINGW*|MSYS*|CYGWIN*)
       urls=("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip") ;;
@@ -86,8 +114,7 @@ else
     echo "==> ffmpeg: downloading $url"
     curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url"
     if [[ "$url" == *.zip ]]; then
-      if command -v unzip >/dev/null; then unzip -q -o "$tmp/ff.pkg" -d "$tmp/x";
-      else tar -xf "$tmp/ff.pkg" -C "$tmp/x"; fi
+      extract_zip "$tmp/ff.pkg" "$tmp/x"
     else
       tar xf "$tmp/ff.pkg" -C "$tmp/x"
     fi
@@ -107,7 +134,7 @@ for model in $WHISPER_MODELS; do
   dest="$RES/models/$model.pt"
   if [[ -f "$dest" ]]; then echo "    $model already present"; continue; fi
   case "$model" in
-    tiny)  url="https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"; sha="65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9" ;;
+    tiny)  url="https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6e4e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"; sha="65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9" ;;
     base)  url="https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt"; sha="ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e" ;;
     small) url="https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt"; sha="9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794" ;;
     *) echo "    unknown whisper model '$model'" >&2; exit 1 ;;
@@ -137,8 +164,13 @@ else
   echo "==> llama.cpp: fetching $asset"
   tmp="$(mktemp -d)"
   curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}"
-  if [[ "$asset" == *.zip ]]; then mkdir -p "$tmp/x" && tar -xf "$tmp/llama.pkg" -C "$tmp/x";
-  else mkdir -p "$tmp/x" && tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1; fi
+  if [[ "$asset" == *.zip" ]]; then
+    mkdir -p "$tmp/x"
+    extract_zip "$tmp/llama.pkg" "$tmp/x"
+  else
+    mkdir -p "$tmp/x"
+    tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1
+  fi
   find "$tmp/x" -maxdepth 3 -type f \( -name 'llama-server*' -o -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/llama/" \;
   chmod +x "$RES/llama/llama-server" 2>/dev/null || true
   rm -rf "$tmp"
