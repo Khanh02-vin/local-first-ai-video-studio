@@ -14,8 +14,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "idempotency-gaps-"));
-const ffmpeg = process.env.FFMPEG_PATH ?? "/home/khanh/.local/bin/ffmpeg";
-const ffprobe = process.env.FFPROBE_PATH ?? "/home/khanh/.local/bin/ffprobe";
+const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
 
 function assertFixed(name: string, fact: boolean, description: string): void {
   assert.ok(fact, `${name}: ${description}`);
