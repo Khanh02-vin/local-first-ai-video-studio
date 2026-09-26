@@ -186,6 +186,15 @@ jobs:
       - name: Zip macOS .app bundle (App Store bundles are directories)
         run: |
           cd dist/macos-app
+          # The uploaded artifact holds the .app directory as zip archives
+          # (upload-artifact archives directories); unpack those, then zip each
+          # bundle itself so users get one clean download per platform.
+          for z in *.zip; do
+            [ -f "$z" ] || continue
+            unzip -q -o "$z"
+            rm -f "$z"
+          done
+          rm -rf macos-app/ 2>/dev/null || true   # drop any stale nested dir
           for app in *.app; do
             [ -d "$app" ] && zip -qry "${app%.app}.zip" "$app"
           done
