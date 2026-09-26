@@ -114,25 +114,25 @@ else
   esac
   tmp="$(mktemp -d)"
   mkdir -p "$tmp/x"
-  extracted=0
+  # Download every archive in turn; stop as soon as BOTH binaries are present.
+  # (macOS evermeet ships ffmpeg and ffprobe as two separate zips — breaking
+  # after the first one would leave ffprobe missing.)
   for url in "${urls[@]}"; do
+    found_ff="$(find "$tmp/x" -type f \( -name 'ffmpeg' -o -name 'ffmpeg.exe' \) | head -1)"
+    found_fp="$(find "$tmp/x" -type f \( -name 'ffprobe' -o -name 'ffprobe.exe' \) | head -1)"
+    [[ -n "$found_ff" && -n "$found_fp" ]] && break
     echo "==> ffmpeg: downloading $url"
     curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url" || { echo "    download failed, trying next mirror" >&2; continue; }
-    # Integrity guard: a truncated or HTML error page fails tar here and we
-    # fall through to the next mirror instead of aborting the whole fetch.
+    # Integrity guard: a truncated or HTML error page fails extraction here
+    # and we fall through to the next mirror instead of aborting the fetch.
     if [[ "$url" == *.zip ]]; then
-      if extract_zip "$tmp/ff.pkg" "$tmp/x" 2>/dev/null; then extracted=1; break; fi
-      echo "    archive corrupt or blocked, trying next mirror" >&2
-      continue
+      extract_zip "$tmp/ff.pkg" "$tmp/x" 2>/dev/null || echo "    archive corrupt or blocked, trying next mirror" >&2
     else
-      if tar xJf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null || tar xf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null; then extracted=1; break; fi
-      echo "    archive corrupt or blocked, trying next mirror" >&2
-      continue
+      tar xJf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null || tar xf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null || echo "    archive corrupt or blocked, trying next mirror" >&2
     fi
   done
-  [[ "$extracted" == 1 ]] || { echo "ffmpeg/ffprobe: all mirrors failed" >&2; exit 1; }
-  found_ff="$(find "$tmp/x" -type f -name 'ffmpeg' -o -type f -name 'ffmpeg.exe' | head -1)"
-  found_fp="$(find "$tmp/x" -type f -name 'ffprobe' -o -type f -name 'ffprobe.exe' | head -1)"
+  found_ff="$(find "$tmp/x" -type f \( -name 'ffmpeg' -o -name 'ffmpeg.exe' \) | head -1)"
+  found_fp="$(find "$tmp/x" -type f \( -name 'ffprobe' -o -name 'ffprobe.exe' \) | head -1)"
   [[ -n "$found_ff" && -n "$found_fp" ]] || { echo "ffmpeg/ffprobe not found inside archive" >&2; exit 1; }
   cp -f "$found_ff" "$RES/ffmpeg"
   cp -f "$found_fp" "$RES/ffprobe"
