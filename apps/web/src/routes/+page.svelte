@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Highlight } from "../../../../packages/contracts/highlight.ts";
@@ -38,6 +38,7 @@
   let currentStep = $state<1 | 2 | 3 | 4>(1);
 
   async function choose() {
+    if (!isTauri()) { message = "File dialogs only work in the desktop app — open the installed app to load a video."; return; }
     const path = await open({ multiple: false, directory: false, filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm"] }] });
     if (typeof path === "string") await loadVideo(path);
   }
