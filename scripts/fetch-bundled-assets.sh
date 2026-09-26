@@ -99,7 +99,11 @@ elif command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
 else
   case "$OS-$ARCH" in
     Linux-x86_64)
-      urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz") ;;
+      # johnvansickle intermittently serves an HTML error page instead of the
+      # tarball (CI hit it 2026-09-26); the BtbN GPL release carries both
+      # binaries in one archive, so it is the primary source.
+      urls=("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz") ;;
     Linux-aarch64)
       urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz") ;;
     Darwin-*)
@@ -110,15 +114,23 @@ else
   esac
   tmp="$(mktemp -d)"
   mkdir -p "$tmp/x"
+  extracted=0
   for url in "${urls[@]}"; do
     echo "==> ffmpeg: downloading $url"
-    curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url"
+    curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url" || { echo "    download failed, trying next mirror" >&2; continue; }
+    # Integrity guard: a truncated or HTML error page fails tar here and we
+    # fall through to the next mirror instead of aborting the whole fetch.
     if [[ "$url" == *.zip ]]; then
-      extract_zip "$tmp/ff.pkg" "$tmp/x"
+      if extract_zip "$tmp/ff.pkg" "$tmp/x" 2>/dev/null; then extracted=1; break; fi
+      echo "    archive corrupt or blocked, trying next mirror" >&2
+      continue
     else
-      tar xf "$tmp/ff.pkg" -C "$tmp/x"
+      if tar xJf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null || tar xf "$tmp/ff.pkg" -C "$tmp/x" 2>/dev/null; then extracted=1; break; fi
+      echo "    archive corrupt or blocked, trying next mirror" >&2
+      continue
     fi
   done
+  [[ "$extracted" == 1 ]] || { echo "ffmpeg/ffprobe: all mirrors failed" >&2; exit 1; }
   found_ff="$(find "$tmp/x" -type f -name 'ffmpeg' -o -type f -name 'ffmpeg.exe' | head -1)"
   found_fp="$(find "$tmp/x" -type f -name 'ffprobe' -o -type f -name 'ffprobe.exe' | head -1)"
   [[ -n "$found_ff" && -n "$found_fp" ]] || { echo "ffmpeg/ffprobe not found inside archive" >&2; exit 1; }

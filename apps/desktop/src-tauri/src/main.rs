@@ -368,8 +368,8 @@ fn run_whisper_bootstrap<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &B
     let pip = whisper_venv_bin("pip");
     set_bootstrap(state, "pip", "Upgrading pip…", false, None);
     let _ = Command::new(&pip).args(["install", "--upgrade", "pip"]).output();
-    set_bootstrap(state, "whisper", "Installing openai-whisper (this downloads PyTorch, a few GB)…", false, None);
-    let install = Command::new(&pip).args(["install", "openai-whisper"]).output().map_err(|e| format!("PIP_SPAWN:{e}"))?;
+    set_bootstrap(state, "whisper", "Installing openai-whisper + crawler deps (this downloads PyTorch, a few GB)…", false, None);
+    let install = Command::new(&pip).args(["install", "openai-whisper", "yt-dlp", "youtube-transcript-api"]).output().map_err(|e| format!("PIP_SPAWN:{e}"))?;
     if !install.status.success() { return Err(format!("WHISPER_INSTALL_FAILED:{}", String::from_utf8_lossy(&install.stderr).lines().last().unwrap_or("").trim())); }
     if !whisper.is_file() { return Err("WHISPER_BINARY_MISSING".into()); }
     let model = runtime_env().get("WHISPER_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "tiny".into());
