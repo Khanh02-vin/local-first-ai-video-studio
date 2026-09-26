@@ -20,6 +20,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   lint-test:
     runs-on: ubuntu-latest
@@ -40,7 +43,6 @@ jobs:
           cd apps/web
           npm ci
           npm run build
-          npm run build:node
       - run: cargo test
         working-directory: apps/desktop/src-tauri
 
@@ -66,23 +68,16 @@ jobs:
           security import signing.p12 -k build.keychain -P "$APPLE_IDENTITY_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -u build.keychain
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
-      - id: sign_identity
-        run: |
-          if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
-            echo "identity=$(cat "$RUNNER_TEMP/apple_signing_identity")" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
-        shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
-      - name: Build web frontend (generate_context needs frontendDist)
-        shell: bash
+      - name: Build web frontend
         run: |
           cd apps/web
           npm ci
           npm run build
-          npm run build:node
       - name: Build + sign + notarize
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_IDENTITY }}
@@ -90,14 +85,23 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ steps.sign_identity.outputs.identity }}
-        run: bash scripts/build-installer.sh
+        run: |
+          # If no signing cert is available, use --no-sign to skip codesign
+          cd apps/desktop
+          npm install
+          if [ -f "$RUNNER_TEMP/apple_signing_identity" ]; then
+            APPLE_SIGNING_IDENTITY="$(cat "$RUNNER_TEMP/apple_signing_identity")"
+            export APPLE_SIGNING_IDENTITY
+            echo "Signing identity: $APPLE_SIGNING_IDENTITY"
+            npx tauri build -b app
+          else
+            echo "No signing identity available; building unsigned."
+            npx tauri build -b app --no-sign
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: |
-            apps/desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
-            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          path: apps/desktop/src-tauri/target/release/bundle/macos/*.app
 
   windows:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
@@ -107,30 +111,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch platform resources (llama.cpp, node, ffmpeg, whisper weights)
+      - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
-      - name: Build web frontend (generate_context needs frontendDist)
-        shell: bash
+      - name: Build web frontend
         run: |
           cd apps/web
           npm ci
           npm run build
-          npm run build:node
       - name: Build + sign
         env:
           # Tauri 2 signs when these are set; otherwise it builds unsigned.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        shell: bash
-        run: bash scripts/build-installer.sh
+        run: |
+          cd apps/desktop
+          npm install
+          npx tauri build -b msi
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
             apps/desktop/src-tauri/target/release/bundle/msi/*
-            apps/desktop/src-tauri/target/release/bundle/nsis/*
 
   linux:
     runs-on: ubuntu-latest
@@ -145,23 +149,60 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
+        env:
+          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
-      - name: Build web frontend (generate_context needs frontendDist)
-        shell: bash
+      - name: Build web frontend
         run: |
           cd apps/web
           npm ci
           npm run build
-          npm run build:node
+      - name: Clean cargo cache (disk space)
+        if: runner.os == 'Linux'
+        run: cd apps/desktop && cargo clean 2>/dev/null || true
       - name: Build bundles
         run: |
           cd apps/desktop
           npm install
-          npx tauri build --bundles deb,rpm,appimage
+          npx tauri build -b appimage
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: |
-            apps/desktop/src-tauri/target/release/bundle/deb/*
-            apps/desktop/src-tauri/target/release/bundle/rpm/*
             apps/desktop/src-tauri/target/release/bundle/appimage/*
+
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+      - name: Show collected artifacts
+        run: find dist -type f | head -40
+      - name: Zip macOS .app bundle (App Store bundles are directories)
+        run: |
+          cd dist/macos-app
+          for app in *.app; do
+            [ -d "$app" ] && zip -qry "${app%.app}.zip" "$app"
+          done
+          ls -lh
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: Local-first AI Video Studio v0.1.0
+          body: |
+            Desktop builds (local-first, offline).
+
+            - **Windows:** `windows-installer/*.msi` — signed
+            - **macOS:** `macos-app/*.zip` — unzip → drag `.app` to Applications (unsigned: right-click → Open)
+            - **Linux:** `linux-installer/*.AppImage` — `chmod +x` then run
+          files: |
+            dist/**/*.msi
+            dist/**/*.AppImage
+            dist/macos-app/*.zip
+          draft: false
