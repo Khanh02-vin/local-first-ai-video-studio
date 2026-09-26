@@ -183,6 +183,13 @@ jobs:
           merge-multiple: false
       - name: Show collected artifacts
         run: find dist -type f | head -40
+      - name: Zip macOS .app bundle (App Store bundles are directories)
+        run: |
+          cd dist/macos-app
+          for app in *.app; do
+            [ -d "$app" ] && zip -qry "../${app%.app}.zip" "$app"
+          done
+          ls -lh ../
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -192,9 +199,10 @@ jobs:
             Desktop builds (local-first, offline).
 
             - **Windows:** `windows-installer/*.msi` — signed
-            - **macOS:** `macos-app/*.app` — unsigned (right-click → Open to bypass Gatekeeper)
+            - **macOS:** `macos-app/*.zip` — unzip → drag `.app` to Applications (unsigned: right-click → Open)
             - **Linux:** `linux-installer/*.AppImage` — `chmod +x` then run
           files: |
             dist/**/*.msi
             dist/**/*.AppImage
+            dist/macos-app/*.zip
           draft: false
