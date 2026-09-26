@@ -31,25 +31,21 @@ mkdir -p "$RES/models/llama" "$RES/llama"
 extract_zip() {
   local pkg="$1" dest="$2"
   if command -v unzip >/dev/null 2>&1; then
-    unzip -q -o "$pkg" -d "$dest"; return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
+    unzip -q -o "$pkg" -d "$dest" || return 1
+  elif command -v python3 >/dev/null 2>&1; then
     python3 -c "
-import sys, zipfile, pathlib
-z = zipfile.ZipFile(sys.argv[1])
-z.extractall(sys.argv[2])
-" "$pkg" "$dest"; return 0
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+" "$pkg" "$dest" || return 1
   elif command -v python >/dev/null 2>&1; then
     python -c "
 import sys, zipfile
 zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
-" "$pkg" "$dest"; return 0
+" "$pkg" "$dest" || return 1
+  else
+    # Last resort: GNU tar 1.36+ can read some zips
+    tar -xf "$pkg" -C "$dest" || { echo "Error: cannot extract zip ($pkg). Install unzip or python3." >&2; return 1; }
   fi
-  # Last resort: GNU tar 1.36+ can read some zips
-  tar -xf "$pkg" -C "$dest" || {
-    echo "Error: cannot extract zip ($pkg). Install unzip or python3." >&2
-    exit 1
-  }
 }
 
 # --- lightweight: only satisfy tauri-build's existence checks ------------------
@@ -107,7 +103,10 @@ else
     Linux-aarch64)
       urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz") ;;
     Darwin-*)
-      urls=("https://evermeet.cx/ffmpeg/ffmpeg-7.0.2.zip" "https://evermeet.cx/ffmpeg/ffprobe-7.0.2.zip") ;;
+      # evermeet.cx ships ffmpeg and ffprobe as separate archives; x64 builds
+      # run under Rosetta on arm64 runners. Add static-builds.net as a mirror.
+      urls=("https://evermeet.cx/ffmpeg/ffmpeg-7.0.2.zip" "https://evermeet.cx/ffmpeg/ffprobe-7.0.2.zip"
+            "https://www.static-builds.net/files/ffmpeg-7.1-x86_64-macos-release.zip") ;;
     MINGW*|MSYS*|CYGWIN*)
       urls=("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip") ;;
     *) echo "unsupported platform for ffmpeg: $OS-$ARCH" >&2; exit 1 ;;
