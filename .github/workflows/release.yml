@@ -187,9 +187,9 @@ jobs:
         run: |
           cd dist/macos-app
           for app in *.app; do
-            [ -d "$app" ] && zip -qry "../${app%.app}.zip" "$app"
+            [ -d "$app" ] && zip -qry "${app%.app}.zip" "$app"
           done
-          ls -lh ../
+          ls -lh
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
