@@ -140,6 +140,21 @@ export const POST: RequestHandler = async ({ request }) => {
     return Response.json({ id, status: "queued" }, { status: 202 });
   }
 
+  if (pathname === "/api/rag/playlists/status") {
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
+    const { id: playlistRecordId, status: newStatus } = body as { id?: string; status?: string };
+    if (typeof playlistRecordId !== "string" || typeof newStatus !== "string" || !["indexing", "indexed", "failed"].includes(newStatus)) {
+      return jsonError(400, "INVALID_STATUS_UPDATE");
+    }
+    const doc = loadPlaylist(playlistRecordId);
+    if (!doc) return jsonError(404, "PLAYLIST_NOT_FOUND");
+    doc.status = newStatus as PlaylistDoc["status"];
+    doc.updatedAt = new Date().toISOString();
+    savePlaylist(doc);
+    return Response.json({ id: doc.id, status: doc.status });
+  }
+
   if (pathname === "/api/rag/ingest") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }

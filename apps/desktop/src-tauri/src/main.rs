@@ -692,6 +692,54 @@ fn stop_analysis(app: tauri::AppHandle, id: String) -> Result<serde_json::Value,
     run_status_script(&app, &[id, "--fail".to_string(), "stopped by user".to_string()])
 }
 
+/// Runs the playlist crawler (bundled scripts/yt-crawler.py) on the local
+/// whisper venv, then stores the result via the RAG sidecar ingest endpoint.
+/// Best-effort: a missing crawler/venv yields an explanatory error instead of a panic.
+fn run_yt_crawler(app: &tauri::AppHandle, playlist_url: &str, limit: u32) -> Result<serde_json::Value, String> {
+    // Resolve the Python venv created by the whisper bootstrap (same dir as whisper_venv_bin()).
+    #[cfg(windows)] let venv_python = whisper_venv_dir().join("Scripts").join("python.exe");
+    #[cfg(not(windows))] let venv_python = whisper_venv_dir().join("bin").join("python3");
+    if !venv_python.is_file() { return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into()); }
+
+    let crawler = helper_script(app, "yt-crawler.py")?;
+    let mut cmd = Command::new(&venv_python);
+    cmd.arg(&crawler).arg(playlist_url);
+    if limit > 0 { cmd.arg("--limit").arg(limit.to_string()); }
+    for (key, value) in helper_env(app, &[]) { cmd.env(key, value); }
+    let output = cmd.output().map_err(|e| format!("CRAWLER_SPAWN:{e}"))?;
+    if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); }
+
+    // Crawler writes JSON to stdout: [{videoId,title,segments}]
+    let videos: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("CRAWLER_JSON:{e}"))?;
+
+    // Ingest each result via the running RAG sidecar (bundled curl — no new HTTP dep).
+    let base = ensure_rag_server(&RagState::default(), app)?;
+    let ingest_url = format!("{base}/api/rag/ingest");
+    let mut indexed = 0usize;
+    for video in &videos {
+        let body = serde_json::json!({
+            "videoUrl": format!("https://www.youtube.com/watch?v={}", video["videoId"].as_str().unwrap_or_default()),
+            "title": video.get("title").cloned(),
+            "segments": video.get("segments").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+        });
+        let body_str = body.to_string();
+        let out = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+                   "-H", "content-type: application/json", "-d", &body_str, &ingest_url])
+            .output()
+            .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
+        if !out.status.success() { continue; }
+        if String::from_utf8_lossy(&out.stdout).trim().starts_with('2') { indexed += 1; }
+    }
+    Ok(serde_json::json!({ "videos": videos.len(), "indexed": indexed }))
+}
+
+#[tauri::command]
+fn crawl_playlist(app: tauri::AppHandle, playlist_url: String, limit: u32) -> Result<serde_json::Value, String> {
+    run_yt_crawler(&app, &playlist_url, limit)
+}
+
 fn main() {
     let jobs: Jobs = Arc::new(Mutex::new(HashMap::new()));
     let supervisor_jobs = jobs.clone();
@@ -708,7 +756,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();

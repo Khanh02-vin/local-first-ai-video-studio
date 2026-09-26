@@ -50,7 +50,24 @@
   async function addPlaylist() {
     if (!playlistUrl.trim()) return;
     adding = true;
-    try { const response = await rag("/api/rag/playlists", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playlistUrl, title: playlistTitle || undefined }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Could not queue playlist"); playlistUrl = ""; playlistTitle = ""; status = "Playlist queued for indexing."; await loadPlaylists(); } catch (error) { status = String(error); } finally { adding = false; }
+    try {
+      // Queue the record in the sidecar, then run the local crawler and ingest results.
+      const queued: { id: string; status: string } =
+        await (await rag("/api/rag/playlists", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playlistUrl, title: playlistTitle || undefined }) })).json();
+      if (!queued.id) throw new Error("Playlist not queued");
+      status = "Crawling playlist…";
+      let result: { videos: number; indexed: number };
+      try {
+        result = await invoke("crawl_playlist", { playlistUrl, limit: 0 });
+        status = `Indexed ${result.indexed}/${result.videos} videos from this playlist.`;
+        await rag("/api/rag/playlists/status", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: queued.id, status: result.indexed ? "indexed" : "failed" }) });
+      } catch (error) {
+        status = `Crawl failed: ${String(error)}`;
+        await rag("/api/rag/playlists/status", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: queued.id, status: "failed" }) }).catch(() => {});
+      }
+      playlistUrl = ""; playlistTitle = "";
+      await loadPlaylists();
+    } catch (error) { status = String(error); } finally { adding = false; }
   }
   async function search() {
     if (!question.trim()) return;
