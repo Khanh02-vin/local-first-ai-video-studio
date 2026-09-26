@@ -104,7 +104,8 @@ else
       urls=("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz") ;;
     Darwin-*)
       # evermeet.cx ships ffmpeg and ffprobe as separate archives; x64 builds
-      # run under Rosetta on arm64 runners. Add static-builds.net as a mirror.
+      # run under Rosetta on arm64 runners. static-builds.net serves a single
+      # combined archive as the fallback mirror.
       urls=("https://evermeet.cx/ffmpeg/ffmpeg-7.0.2.zip" "https://evermeet.cx/ffmpeg/ffprobe-7.0.2.zip"
             "https://www.static-builds.net/files/ffmpeg-7.1-x86_64-macos-release.zip") ;;
     MINGW*|MSYS*|CYGWIN*)
