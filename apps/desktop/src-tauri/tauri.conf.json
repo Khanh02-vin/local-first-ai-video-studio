@@ -22,7 +22,8 @@
         "height": 800,
         "dragDropEnabled": true
       }
-    ]
+    ],
+    "enable_gtk_app_id": true
   },
   "bundle": {
     "active": true,
