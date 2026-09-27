@@ -498,6 +498,207 @@ fn whisper_model_download_status(state: tauri::State<'_, WhisperDlState>) -> ser
     let present = whisper_cache_file("small").is_file();
     serde_json::json!({ "progress": progress, "modelPresent": present, "model": "small" })
 }
+
+// --- YouTube "own channel" mode (Option C) -------------------------------------
+// Customer connects their own Google account once (OAuth loopback flow in the
+// system browser); the app then lists their uploads and pulls captions through
+// the official API — legitimate for owned content, no scraping.
+const YT_OAUTH_PORT: u16 = 14871;
+const YT_SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct YtTokens { access_token: String, refresh_token: String, expires_at: u64 }
+fn yt_tokens_file() -> PathBuf { state_dir().join("youtube-tokens.json") }
+fn yt_client_creds() -> Result<(String, String), String> {
+    // Developer ships credentials via build env; a state-dir file overrides for
+    // local testing so customers never see either value.
+    let file = state_dir().join("youtube-client.json");
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            let id = v["clientId"].as_str().unwrap_or("").to_string();
+            let secret = v["clientSecret"].as_str().unwrap_or("").to_string();
+            if !id.is_empty() && !secret.is_empty() { return Ok((id, secret)); }
+        }
+    }
+    let id = option_env!("GOOGLE_CLIENT_ID").unwrap_or("").to_string();
+    let secret = option_env!("GOOGLE_CLIENT_SECRET").unwrap_or("").to_string();
+    if id.is_empty() || secret.is_empty() { return Err("YT_CLIENT_MISSING: create a Google OAuth Desktop client and save {\"clientId\",\"clientSecret\"} to youtube-client.json in the app state dir".into()); }
+    Ok((id, secret))
+}
+fn yt_load_tokens() -> Option<YtTokens> { serde_json::from_str(&std::fs::read_to_string(yt_tokens_file()).ok()?).ok() }
+fn yt_save_tokens(tokens: &YtTokens) { let _ = std::fs::create_dir_all(state_dir()); let _ = std::fs::write(yt_tokens_file(), serde_json::to_string(tokens).unwrap_or_default()); }
+fn b64url_nopad(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32; let b1 = *chunk.get(1).unwrap_or(&0) as u32; let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        if chunk.len() > 1 { out.push(T[(n >> 12) as usize & 63] as char); }
+        if chunk.len() > 2 { out.push(T[(n >> 6) as usize & 63] as char); }
+        if chunk.len() > 2 { out.push(T[n as usize & 63] as char); }
+    }
+    out
+}
+fn yt_token_request(form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-X", "POST", "https://oauth2.googleapis.com/token"]);
+    for (k, v) in form { cmd.arg("--data-urlencode").arg(format!("{k}={v}")); }
+    let out = cmd.output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("TOKEN_JSON:{e}"))?;
+    if value.get("error").is_some() { return Err(format!("TOKEN_ERROR:{}", value["error"].as_str().unwrap_or("?"))); }
+    Ok(value)
+}
+fn yt_refresh_if_needed(tokens: &mut YtTokens) -> Result<(), String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if tokens.expires_at > now + 120 { return Ok(()); }
+    let (client_id, client_secret) = yt_client_creds()?;
+    let value = yt_token_request(&[("client_id", client_id.as_str()), ("client_secret", client_secret.as_str()), ("refresh_token", tokens.refresh_token.as_str()), ("grant_type", "refresh_token")])?;
+    tokens.access_token = value["access_token"].as_str().unwrap_or("").to_string();
+    let expires = value["expires_in"].as_u64().unwrap_or(3600);
+    tokens.expires_at = now + expires.saturating_sub(60);
+    yt_save_tokens(tokens);
+    Ok(())
+}
+fn yt_bearer() -> Result<String, String> {
+    let mut tokens = yt_load_tokens().ok_or("YT_NOT_CONNECTED: connect your YouTube channel first")?;
+    yt_refresh_if_needed(&mut tokens)?;
+    Ok(tokens.access_token)
+}
+fn yt_api_get(path_with_query: &str) -> Result<serde_json::Value, String> {
+    let bearer = yt_bearer()?;
+    let out = Command::new("curl").args(["-s", "-H", &format!("Authorization: Bearer {bearer}")]).arg(format!("https://www.googleapis.com{path_with_query}")).output().map_err(|e| format!("YT_API_SPAWN:{e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("YT_API_JSON:{e} — {}", String::from_utf8_lossy(&out.stdout).chars().take(120).collect::<String>()))?;
+    if let Some(err) = value.get("error") { return Err(format!("YT_API:{}", err["message"].as_str().unwrap_or("?"))); }
+    Ok(value)
+}
+#[tauri::command]
+fn youtube_oauth_status() -> serde_json::Value {
+    match yt_load_tokens() {
+        Some(mut tokens) => {
+            let connected = yt_refresh_if_needed(&mut tokens).is_ok();
+            serde_json::json!({ "connected": connected, "expiresAt": tokens.expires_at })
+        }
+        None => serde_json::json!({ "connected": false }),
+    }
+}
+#[tauri::command]
+fn youtube_oauth_disconnect() -> Result<(), String> { std::fs::remove_file(yt_tokens_file()).unwrap_or(()); Ok(()) }
+#[tauri::command]
+fn youtube_oauth_start() -> Result<String, String> {
+    let (client_id, client_secret) = yt_client_creds()?;
+    // Deterministic PKCE verifier; challenge hashed with the same sha256sum CLI
+    // the rest of this file already shells out to.
+    let verifier = format!("{}{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let digest = Command::new("sha256sum").arg(&verifier).output().map_err(|e| format!("SHA_SPAWN:{e}"))?;
+    let raw = String::from_utf8_lossy(&digest.stdout).split_whitespace().next().unwrap_or("").to_string();
+    let challenge = b64url_nopad(&raw.as_bytes());
+    let redirect = format!("http://127.0.0.1:{YT_OAUTH_PORT}/callback");
+    let scope_enc = YT_SCOPE.replace(':', "%3A").replace('/', "%2F");
+    let consent_url = format!("https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scope_enc}&access_type=offline&prompt=consent&include_granted_scopes=true&code_challenge={challenge}&code_challenge_method=S256");
+    // The loopback listener must exist BEFORE the browser navigates.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", YT_OAUTH_PORT)).map_err(|e| format!("YT_PORT_BUSY:{e} — an OAuth callback is already waiting"))?;
+    let client_secret = client_secret.clone();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = String::new();
+            use std::io::{Read, Write};
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            let _ = stream.read_to_string(&mut request);
+            let code = request.split_whitespace().nth(1)
+                .and_then(|path| path.split("code=").nth(1))
+                .map(|rest| rest.split('&').next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html><body style='font-family:sans-serif;background:#11100e;color:#f4efe4'><h2>&#9989; YouTube connected</h2><p>B&#7841;n c&oacute; th&#7875; &#273;&oacute;ng tab n&agrave;y v&agrave; quay l&#7841;i app.</p></body></html>");
+            let _ = stream.flush();
+            drop(stream);
+            if code.is_empty() { return; }
+            if let Ok((client_id, client_secret)) = yt_client_creds() {
+                if let Ok(value) = yt_token_request(&[
+                    ("client_id", client_id.as_str()), ("client_secret", client_secret.as_str()),
+                    ("code", code.as_str()), ("grant_type", "authorization_code"), ("redirect_uri", redirect.as_str()),
+                    ("code_verifier", verifier.as_str()),
+                ]) {
+                    let access = value["access_token"].as_str().unwrap_or("").to_string();
+                    let refresh = value["refresh_token"].as_str().unwrap_or("").to_string();
+                    let expires = value["expires_in"].as_u64().unwrap_or(3600);
+                    if !access.is_empty() && !refresh.is_empty() {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        yt_save_tokens(&YtTokens { access_token: access, refresh_token: refresh, expires_at: now + expires.saturating_sub(60) });
+                    }
+                }
+            }
+        }
+    });
+    // Open the system browser for the consent screen.
+    let opened = if cfg!(target_os = "linux") { Command::new("xdg-open").arg(&consent_url).spawn().is_ok() }
+        else if cfg!(target_os = "macos") { Command::new("open").arg(&consent_url).spawn().is_ok() }
+        else { Command::new("cmd").args(["/C", "start"]).arg(&consent_url).spawn().is_ok() };
+    if !opened { return Ok(format!("OPEN_MANUALLY:{consent_url}")); }
+    Ok(consent_url)
+}
+#[tauri::command]
+fn youtube_channel_videos() -> Result<serde_json::Value, String> {
+    let channel = yt_api_get("/youtube/v3/channels?part=snippet,contentDetails&mine=true")?;
+    let title = channel["items"][0]["snippet"]["title"].as_str().unwrap_or("Kênh của tôi").to_string();
+    let uploads = channel["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"].as_str().unwrap_or("").to_string();
+    if uploads.is_empty() { return Err("YT_NO_UPLOADS: kênh này chưa có video nào".into()); }
+    let items = yt_api_get(&format!("/youtube/v3/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId={uploads}"))?;
+    let videos: Vec<serde_json::Value> = items["items"].as_array().unwrap_or(&vec![]).iter().map(|item| {
+        serde_json::json!({
+            "videoId": item["contentDetails"]["videoId"],
+            "title": item["snippet"]["title"],
+            "publishedAt": item["contentDetails"]["videoPublishedAt"].as_str().or(item["snippet"]["publishedAt"].as_str()).unwrap_or(""),
+            "thumbnail": item["snippet"]["thumbnails"]["medium"]["url"].as_str().unwrap_or(""),
+        })
+    }).collect();
+    Ok(serde_json::json!({ "channel": title, "videos": videos }))
+}
+/// Parses SRT ("00:00:01,000 --> 00:00:04,000") into {start,end,text} segments.
+fn parse_srt_segments(text: &str) -> Vec<serde_json::Value> {
+    fn secs(stamp: &str) -> f64 {
+        let parts: Vec<f64> = stamp.trim().split(':').filter_map(|p| p.replace(",", ".").parse::<f64>().ok()).collect();
+        match parts.as_slice() { [h, m, s] => h * 3600.0 + m * 60.0 + s, [m, s] => m * 60.0 + s, [s] => *s, _ => 0.0 }
+    }
+    let mut segments = Vec::new();
+    for block in text.split("\n\n") {
+        let lines: Vec<&str> = block.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() < 2 { continue; }
+        if let Some(arrow) = lines.iter().find(|l| l.contains("-->")) {
+            let mut halves = arrow.split("-->");
+            let start = secs(halves.next().unwrap_or(""));
+            let end = secs(halves.next().unwrap_or("0"));
+            let body: String = lines[lines.iter().position(|l| l.contains("-->")).unwrap() + 1..].join(" ").trim().to_string();
+            if !body.is_empty() && end > start { segments.push(serde_json::json!({ "start": (start * 100.0).round() / 100.0, "end": (end * 100.0).round() / 100.0, "text": body })); }
+        }
+    }
+    segments
+}
+/// Downloads captions for an OWN video through the official API and ingests the
+/// transcript into the local RAG store via the sidecar.
+#[tauri::command]
+fn youtube_ingest_captions(app: tauri::AppHandle, video_id: String) -> Result<serde_json::Value, String> {
+    let bearer = yt_bearer()?;
+    let caps = {
+        let out = Command::new("curl").args(["-s", "-H", &format!("Authorization: Bearer {bearer}")]).arg(format!("https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId={video_id}")).output().map_err(|e| format!("YT_API_SPAWN:{e}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("YT_API_JSON:{e}"))?;
+        if let Some(err) = value.get("error") { return Err(format!("YT_CAPTIONS:{}", err["message"].as_str().unwrap_or("?"))); }
+        value["items"].as_array().cloned().unwrap_or_default()
+    };
+    if caps.is_empty() { return Err("YT_NO_CAPTIONS: video này chưa có phụ đề nào trên YouTube (hãy bật phụ đề tự động hoặc tải lên phụ đề trước)".into()); }
+    let cap_id = caps[0]["id"].as_str().unwrap_or("").to_string();
+    let srt = {
+        let out = Command::new("curl").args(["-s", "-L", "-H", &format!("Authorization: Bearer {bearer}")]).arg(format!("https://www.googleapis.com/youtube/v3/captions/{cap_id}?tfmt=srt")).output().map_err(|e| format!("CAP_SPAWN:{e}"))?;
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let segments = parse_srt_segments(&srt);
+    if segments.is_empty() { return Err("CAP_PARSE_EMPTY: phụ đề tải về rỗng hoặc định dạng lạ".into()); }
+    let base = ensure_rag_server(&RagState::default(), &app)?;
+    let body = serde_json::json!({ "videoUrl": format!("https://www.youtube.com/watch?v={video_id}"), "segments": segments });
+    let body_str = body.to_string();
+    let out = Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "content-type: application/json", "-d", &body_str, &format!("{base}/api/rag/ingest")]).output().map_err(|e| format!("INGEST_SPAWN:{e}"))?;
+    if !String::from_utf8_lossy(&out.stdout).trim().starts_with('2') { return Err(format!("INGEST_HTTP:{}", String::from_utf8_lossy(&out.stdout).trim())); }
+    Ok(serde_json::json!({ "videoId": video_id, "segments": segments.len() }))
+}
 fn storage(path: &Path, required: u64) -> serde_json::Value { let output = Command::new("df").args(["-Pk"]).arg(path).output(); let parsed = output.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|text| text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))); let free = parsed.map(|kb| kb * 1024); serde_json::json!({"path": path, "freeBytes": free, "requiredBytes": required, "ready": free.map(|n| n >= required).unwrap_or(false), "quotaKnown": false}) }
 fn io_error(code: &str, message: impl std::fmt::Display) -> String { let text = message.to_string(); if text.contains("ENOSPC") || text.contains("No space left") { format!("STORAGE_FULL:{text}") } else if text.contains("EDQUOT") || text.contains("Disk quota") { format!("QUOTA_EXCEEDED:{text}") } else { format!("{code}:{text}") } }
 
@@ -799,7 +1000,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();
