@@ -1,9 +1,14 @@
 <script lang="ts">
   import "../app.css";
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
   import { page } from "$app/state";
   import Icon from "../lib/icons.svelte";
+
+  // Browser preview (plain tab served by the adapter-node/dev server) has no
+  // Tauri backend — file dialogs, crawl, analysis and every save action need
+  // the desktop shell. Show a persistent banner so dead buttons explain themselves.
+  const browserPreview = typeof window !== "undefined" && !isTauri();
 
   let runtimeReady = $state(false);
 
@@ -34,7 +39,10 @@
 
 <svelte:head><title>Local-first AI Video Studio</title><meta name="description" content="Turn long videos into short clips — 100% on-device." /></svelte:head>
 
-<div class="app">
+{#if browserPreview}
+  <div class="preview-banner" role="note">⚠ Browser preview — crawl, file dialogs, analysis and every <strong>save</strong> action need the desktop app. Open the installed app for full functionality.</div>
+{/if}
+<div class="app" class:with-banner={browserPreview}>
   <nav class="rail" aria-label="Primary">
     <span class="rail-mark" title="Local-first AI Video Studio">LF</span>
     {#each items as item}

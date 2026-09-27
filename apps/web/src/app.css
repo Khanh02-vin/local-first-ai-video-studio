@@ -407,3 +407,12 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .strategy-card.on { border-color: var(--volt-line); background: var(--volt-soft); }
 .strategy-card strong { font-size: .84rem; }
 .strategy-card p { margin: 0; font-size: .74rem; color: var(--muted); }
+
+/* ---------- browser-preview banner (never shows inside the desktop shell) ---------- */
+.preview-banner {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 60;
+  background: var(--warn); color: #201a08;
+  font: 600 12px/1.4 var(--font);
+  padding: .4rem .9rem; text-align: center;
+}
+.app.with-banner { padding-top: 1.9rem; }

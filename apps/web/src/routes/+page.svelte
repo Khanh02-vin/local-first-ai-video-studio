@@ -76,6 +76,7 @@
   }
 
   async function setModel(next: string) {
+    if (!isTauri()) { message = "Model changes apply in the desktop app only."; return; }
     if (modelBusy) return;
     modelBusy = true;
     try { model = await invoke<string>("set_runtime_model", { model: next }); message = `Whisper model: ${model}.`; }
@@ -130,6 +131,7 @@
   }
 
   async function analyze() {
+    if (!isTauri()) { message = "Analysis runs in the desktop app only — this browser preview cannot transcribe."; return; }
     if (!inputPath || !runtimeReady) return;
     const existing = resumableJobs.find((job) => job.input === inputPath && (job.status === "queued" || job.status === "running") && Math.abs((job.rangeStart ?? 0) - analyzeStart) < 0.01 && Math.abs((job.rangeEnd ?? analyzeEnd) - analyzeEnd) < 0.01);
     if (existing && confirm("Continue existing analysis? Cancel = clear this setup and start fresh.")) { await watch(existing.id, true); return; }
@@ -142,6 +144,7 @@
   }
 
   async function render() {
+    if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
     const candidate = highlights.find((item) => item.id === selectedId);
     if (!inputPath || !candidate) return;
     outputPath = await save({ defaultPath: "short.mp4", filters: [{ name: "MP4", extensions: ["mp4"] }] }) ?? "";

@@ -26,6 +26,7 @@ let llmModelBusy = $state(false);
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 async function setupWhisper() {
+  if (!isTauri()) { message = "Whisper setup runs in the desktop app only."; return; }
   whisperBusy = true;
   try { await invoke("bootstrap_whisper"); await pollWhisper(); }
   catch (error) { message = `Whisper setup failed: ${String(error)}`; whisperBusy = false; }
@@ -36,6 +37,7 @@ async function pollWhisper() {
   if (progress?.done) { whisperBusy = false; await refresh(); message = progress.error ? `Whisper setup error: ${progress.error}` : "Whisper is ready."; }
 }
 async function downloadModel() {
+  if (!isTauri()) { message = "Model download runs in the desktop app only."; return; }
   llmModelBusy = true;
   try { await invoke("download_llm_model"); await pollModel(); }
   catch (error) { message = `Model download failed: ${String(error)}`; llmModelBusy = false; }
@@ -70,6 +72,7 @@ async function reloadSetupState() {
   }
 
   async function saveStrategy(next: string, key: string, llamaUrl: string, llamaModel: string) {
+    if (!isTauri()) { message = "Strategy changes apply in the desktop app only."; return; }
     strategyBusy = true;
     try {
       strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key, localLlmBaseUrl: llamaUrl, localLlmModel: llamaModel });
@@ -87,6 +90,7 @@ async function reloadSetupState() {
   }
 
   async function setModel(next: string) {
+    if (!isTauri()) { message = "Model changes apply in the desktop app only."; return; }
     modelBusy = true;
     try { model = await invoke<string>("set_runtime_model", { model: next }); message = `Model set to ${model}.`; }
     catch (error) { message = `Model change failed: ${String(error)}`; }

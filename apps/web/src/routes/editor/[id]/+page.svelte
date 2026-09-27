@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { convertFileSrc } from "@tauri-apps/api/core";
+  import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
   import { studioState } from "../../../lib/studio-state.svelte.ts";
   import { captionsFromTranscript, createEditorState, loadTranscriptCaptions, removeCaption, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../../packages/editor-core/index.ts";
   import type { Highlight } from "../../../../../../packages/contracts/highlight.ts";
@@ -132,7 +132,7 @@
   function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); studioState.plan = state.plan; } catch { /* validation follows the contract */ } }
   function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; studioState.plan = state.plan; }
   function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; studioState.plan = state.plan; }
-  function save() { saved = true; studioState.plan = state.plan; setTimeout(() => saved = false, 1200); }
+  function save() { if (!isTauri()) { saved = false; return; } saved = true; studioState.plan = state.plan; setTimeout(() => saved = false, 1200); }
   function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); studioState.plan = state.plan; } catch { /* keep current valid hook */ } }
 </script>
 
