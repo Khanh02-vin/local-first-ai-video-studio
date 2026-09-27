@@ -416,3 +416,10 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   padding: .4rem .9rem; text-align: center;
 }
 .app.with-banner { padding-top: 1.9rem; }
+
+/* bench-duo (2-column pages): at narrow widths collapse to one column with
+   sources FIRST — the legacy .bench-left { order: 2 } above pushed them right. */
+@media (max-width: 1180px) {
+  .bench-duo { grid-template-columns: minmax(0, 1fr); }
+  .bench-duo .bench-left { order: 0; border-top: 0; border-bottom: 1px solid var(--line-soft); }
+}
