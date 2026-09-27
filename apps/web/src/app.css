@@ -367,3 +367,20 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+
+/* ---------- 2-column workbench (YouTube Studio) + shared modal ---------- */
+.bench-duo { grid-template-columns: 300px minmax(0, 1fr); }
+.query-row { display: flex; gap: .55rem; align-items: stretch; }
+.query-row textarea { flex: 1; resize: none; min-height: 2.6rem; }
+.filters-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: .35rem; font: 500 .72rem/1 var(--font); padding: .3rem .55rem; border-radius: 99px; background: var(--volt-soft); border: 1px solid var(--volt-line); color: var(--volt); }
+.chip button { background: none; border: 0; color: inherit; cursor: pointer; padding: 0; font: inherit; opacity: .7; }
+.chip button:hover { opacity: 1; }
+.drawer { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .55rem; background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: .7rem; }
+.status-inline { display: flex; align-items: center; gap: .5rem; border: 1px solid var(--line); border-left: 2px solid var(--volt); background: var(--bg-2); border-radius: var(--radius-sm); padding: .45rem .65rem; font-size: .76rem; color: var(--ink-2); }
+.stage-foot { display: flex; align-items: center; justify-content: space-between; padding: .55rem .9rem; border-top: 1px solid var(--line-soft); color: var(--faint); font-size: .74rem; }
+.stage-foot a { cursor: pointer; }
+.stage-foot a:hover { color: var(--ink-2); }
+.modal-back { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: none; place-items: center; z-index: 40; }
+.modal-back.open { display: grid; }
+.modal { width: min(480px, 92vw); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.1rem; display: flex; flex-direction: column; gap: .7rem; }
