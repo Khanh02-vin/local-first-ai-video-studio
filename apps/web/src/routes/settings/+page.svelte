@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
 
 let model = $state("tiny");
 let device = $state("cpu");
@@ -54,6 +54,7 @@ async function reloadSetupState() {
 }
 
   async function refresh() {
+    if (!isTauri()) { message = "Settings control the local engine — open the installed desktop app to view and change them."; return; }
     try {
       const runtime = await invoke<{ ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; modelReady: boolean; device?: string; model?: string; bundled?: { node: boolean; ffmpeg: boolean; ffprobe: boolean } }>("runtime_status");
       const storage = await invoke<{ home: { ready: boolean; freeBytes?: number; requiredBytes: number }; temp: { ready: boolean; freeBytes?: number } }>("storage_status");
