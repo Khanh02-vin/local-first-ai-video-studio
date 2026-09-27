@@ -411,22 +411,27 @@ fn whisper_bootstrap_status(state: tauri::State<'_, BootstrapState>) -> Option<B
     state.0.lock().ok().and_then(|guard| guard.clone())
 }
 
+type ProgressCell = Arc<Mutex<Option<BootstrapProgress>>>;
 #[derive(Clone)]
-struct ModelDownloadState(Arc<Mutex<Option<BootstrapProgress>>>);
+struct ModelDownloadState(ProgressCell);
+/// Separate managed state so Whisper-model downloads never collide with the
+/// local-LLM download progress (Tauri manages state by type).
+#[derive(Clone)]
+struct WhisperDlState(ProgressCell);
 const LLM_MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf";
 const LLM_MODEL_SHA256: &str = "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d";
 fn llm_model_file(model: &str) -> PathBuf { state_dir().join("models/llama").join(format!("{model}.gguf")) }
-fn set_download(state: &ModelDownloadState, phase: &str, message: &str, done: bool, error: Option<String>) {
-    if let Ok(mut guard) = state.0.lock() { let _ = guard.insert(BootstrapProgress { phase: phase.into(), message: message.into(), done, error }); }
+fn set_download(cell: &ProgressCell, phase: &str, message: &str, done: bool, error: Option<String>) {
+    if let Ok(mut guard) = cell.lock() { let _ = guard.insert(BootstrapProgress { phase: phase.into(), message: message.into(), done, error }); }
 }
 /// Downloads the local-LLM weights on demand (2.1 GB) and verifies the SHA-256 before use.
 /// Fetch `url` into `target`, verify its SHA-256 against `expected_sha`, then rename the
 /// partial file into place. Leftover partials are removed on any failure so a retry
 /// starts clean. Kept separate from run_model_download so tests can drive it with
 /// file:// URLs instead of a 2.1 GB network download.
-fn download_and_verify(state: &ModelDownloadState, url: &str, expected_sha: &str, target: &Path) -> Result<String, String> {
+fn download_and_verify(cell: &ProgressCell, url: &str, expected_sha: &str, target: &Path) -> Result<String, String> {
     if target.is_file() {
-        set_download(state, "ready", "Model already downloaded.", true, None);
+        set_download(cell, "ready", "Model already downloaded.", true, None);
         return Ok(target.to_string_lossy().into_owned());
     }
     if let Some(parent) = target.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("MODEL_DIR:{e}"))?; }
@@ -434,27 +439,27 @@ fn download_and_verify(state: &ModelDownloadState, url: &str, expected_sha: &str
     // A leftover .part means a previous download was killed mid-flight; start clean so
     // we never resume into bytes the checksum would then reject.
     if part.is_file() { let _ = std::fs::remove_file(&part); }
-    set_download(state, "download", "Downloading Qwen2.5-3B (~2.1 GB)…", false, None);
+    set_download(cell, "download", "Downloading model…", false, None);
     let curl = Command::new("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(url).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
     if !curl.status.success() { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
-    set_download(state, "verify", "Verifying checksum…", false, None);
+    set_download(cell, "verify", "Verifying checksum…", false, None);
     let digest = Command::new("sha256sum").arg(&part).output().map_err(|e| format!("SHA256_SPAWN:{e}"))?;
     let actual = String::from_utf8_lossy(&digest.stdout).split_whitespace().next().unwrap_or("").to_string();
     if actual != expected_sha { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_CHECKSUM_MISMATCH:{actual}")); }
     std::fs::rename(&part, target).map_err(|e| format!("MODEL_RENAME:{e}"))?;
-    set_download(state, "ready", "Model ready.", true, None);
+    set_download(cell, "ready", "Model ready.", true, None);
     Ok(target.to_string_lossy().into_owned())
 }
 fn run_model_download(state: &ModelDownloadState, model: &str) -> Result<String, String> {
-    download_and_verify(state, LLM_MODEL_URL, LLM_MODEL_SHA256, &llm_model_file(model))
+    download_and_verify(&state.0, LLM_MODEL_URL, LLM_MODEL_SHA256, &llm_model_file(model))
 }
 #[tauri::command]
 fn download_llm_model(state: tauri::State<'_, ModelDownloadState>) -> Result<(), String> {
     if let Ok(guard) = state.0.lock() { if let Some(progress) = guard.as_ref() { if !progress.done { return Ok(()); } } }
     let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
-    set_download(&state, "starting", "Preparing download…", false, None);
+    set_download(&state.0, "starting", "Preparing download…", false, None);
     let shared = state.inner().clone();
-    thread::spawn(move || { if let Err(error) = run_model_download(&shared, &model) { set_download(&shared, "failed", "Model download failed.", true, Some(error)); } });
+    thread::spawn(move || { if let Err(error) = run_model_download(&shared, &model) { set_download(&shared.0, "failed", "Model download failed.", true, Some(error)); } });
     Ok(())
 }
 #[tauri::command]
@@ -463,6 +468,35 @@ fn model_download_status(state: tauri::State<'_, ModelDownloadState>, app: tauri
     let progress = state.0.lock().ok().and_then(|guard| guard.clone());
     let present = local_llm_model_path(&app, &model).is_some();
     serde_json::json!({ "progress": progress, "modelPresent": present, "model": model })
+}
+
+// --- Whisper model downloads: tiny/base ship inside the installer; "small"
+// (~460 MB) is fetched on demand into the whisper CLI cache (~/.cache/whisper)
+// using the same URL the openai-whisper CLI itself downloads from, so the file
+// is cache-compatible and later runs need no re-download.
+const WHISPER_SMALL_URL: &str = "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt";
+const WHISPER_SMALL_SHA256: &str = "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794";
+fn whisper_cache_file(model: &str) -> PathBuf {
+    std::env::var("HOME").map(|h| Path::new(&h).join(".cache/whisper").join(format!("{model}.pt"))).unwrap_or_else(|_| std::env::temp_dir().join(format!("{model}.pt")))
+}
+#[tauri::command]
+fn download_whisper_model(state: tauri::State<'_, WhisperDlState>, model: String) -> Result<(), String> {
+    if model != "small" { return Err("WHISPER_DOWNLOAD_UNSUPPORTED: tiny and base ship inside the installer".into()); }
+    if license_tier() != "pro" { return Err("PRO_REQUIRED: larger Whisper models need a Pro license".into()); }
+    if let Ok(guard) = state.0.lock() { if let Some(progress) = guard.as_ref() { if !progress.done { return Ok(()); } } }
+    set_download(&state.0, "starting", "Preparing download…", false, None);
+    let shared = state.inner().0.clone();
+    thread::spawn(move || {
+        let dest = whisper_cache_file("small");
+        if let Err(error) = download_and_verify(&shared, WHISPER_SMALL_URL, WHISPER_SMALL_SHA256, &dest) { set_download(&shared, "failed", "Whisper model download failed.", true, Some(error)); }
+    });
+    Ok(())
+}
+#[tauri::command]
+fn whisper_model_download_status(state: tauri::State<'_, WhisperDlState>) -> serde_json::Value {
+    let progress = state.0.lock().ok().and_then(|guard| guard.clone());
+    let present = whisper_cache_file("small").is_file();
+    serde_json::json!({ "progress": progress, "modelPresent": present, "model": "small" })
 }
 fn storage(path: &Path, required: u64) -> serde_json::Value { let output = Command::new("df").args(["-Pk"]).arg(path).output(); let parsed = output.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|text| text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))); let free = parsed.map(|kb| kb * 1024); serde_json::json!({"path": path, "freeBytes": free, "requiredBytes": required, "ready": free.map(|n| n >= required).unwrap_or(false), "quotaKnown": false}) }
 fn io_error(code: &str, message: impl std::fmt::Display) -> String { let text = message.to_string(); if text.contains("ENOSPC") || text.contains("No space left") { format!("STORAGE_FULL:{text}") } else if text.contains("EDQUOT") || text.contains("Disk quota") { format!("QUOTA_EXCEEDED:{text}") } else { format!("{code}:{text}") } }
@@ -754,16 +788,18 @@ fn main() {
     let rag_state: RagState = RagState::default();
     let bootstrap_state = BootstrapState(Arc::new(Mutex::new(None)));
     let download_state = ModelDownloadState(Arc::new(Mutex::new(None)));
+    let whisper_dl_state = WhisperDlState(Arc::new(Mutex::new(None)));
     let app = tauri::Builder::default()
         .manage(jobs)
         .manage(llama_state.clone())
         .manage(rag_state.clone())
         .manage(bootstrap_state)
         .manage(download_state)
+        .manage(whisper_dl_state.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();
@@ -871,7 +907,7 @@ mod tests {
         let target = guard.dir.join("model.gguf");
         let state = ModelDownloadState(Arc::new(Mutex::new(None)));
 
-        let ok = download_and_verify(&state, &url, &sha, &target);
+        let ok = download_and_verify(&state.0, &url, &sha, &target);
         assert!(ok.is_ok(), "expected ok, got {ok:?}");
         assert_eq!(std::fs::read(&target).unwrap(), b"local-first-llm-model-bytes");
         assert!(!guard.dir.join("model.gguf.part").exists(), "partial file must be gone");
@@ -880,7 +916,7 @@ mod tests {
 
         // Corrupted download: wrong checksum must fail loudly, leave nothing behind.
         std::fs::remove_file(&target).unwrap();
-        let bad = download_and_verify(&state, &url, &"0".repeat(64), &target);
+        let bad = download_and_verify(&state.0, &url, &"0".repeat(64), &target);
         let err = bad.expect_err("checksum mismatch must fail");
         assert!(err.contains("MODEL_CHECKSUM_MISMATCH"), "{err}");
         assert!(!target.exists(), "failed download must not leave a target file");
@@ -900,7 +936,7 @@ mod tests {
         let part = PathBuf::from(format!("{}.part", target.display()));
         std::fs::write(&part, b"stale-bytes").unwrap();
         let state = ModelDownloadState(Arc::new(Mutex::new(None)));
-        let ok = download_and_verify(&state, &format!("file://{}", source.display()), &sha, &target);
+        let ok = download_and_verify(&state.0, &format!("file://{}", source.display()), &sha, &target);
         assert!(ok.is_ok(), "expected ok, got {ok:?}");
         assert_eq!(std::fs::read(&target).unwrap(), b"local-first-llm-model-bytes");
         assert!(!part.exists(), "stale .part must be cleaned up");

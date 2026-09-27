@@ -24,6 +24,9 @@ let modelProgress = $state<Progress | null>(null);
 let modelPresent = $state(false);
 let llmModelBusy = $state(false);
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+let smallBusy = $state(false);
+let smallProgress = $state<Progress | null>(null);
+let smallPresent = $state(false);
 
 async function setupWhisper() {
   if (!isTauri()) { message = "Whisper setup runs in the desktop app only."; return; }
@@ -52,7 +55,20 @@ async function reloadSetupState() {
     whisperProgress = await invoke<Progress>("whisper_bootstrap_status");
     const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("model_download_status");
     modelProgress = status.progress; modelPresent = status.modelPresent;
+    const small = await invoke<{ progress: Progress | null; modelPresent: boolean }>("whisper_model_download_status");
+    smallProgress = small.progress; smallPresent = small.modelPresent;
   } catch { /* browser dev: ignore */ }
+}
+async function downloadSmall() {
+  if (!isTauri()) { message = "Model download runs in the desktop app only."; return; }
+  smallBusy = true;
+  try { await invoke("download_whisper_model", { model: "small" }); await pollSmall(); }
+  catch (error) { message = `Whisper model download failed: ${String(error)}`; smallBusy = false; }
+}
+async function pollSmall() {
+  const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("whisper_model_download_status");
+  smallProgress = status.progress; smallPresent = status.modelPresent;
+  if (status.progress?.done || smallPresent) { smallBusy = false; message = status.progress?.error ? `Whisper model error: ${status.progress.error}` : "Whisper small model ready."; }
 }
 
   async function refresh() {
@@ -114,6 +130,7 @@ onMount(() => {
   pollTimer = setInterval(() => {
     if (whisperBusy) void pollWhisper();
     if (llmModelBusy) void pollModel();
+    if (smallBusy) void pollSmall();
   }, 2000);
   return () => { if (pollTimer) clearInterval(pollTimer); };
 });
@@ -153,6 +170,13 @@ onMount(() => {
             {#each ["tiny", "base", "small"] as m}<button class="seg-item" class:on={model === m} disabled={modelBusy} onclick={() => setModel(m)}>{m}</button>{/each}
           </div>
           <p class="note">tiny = CPU-friendly (free tier) · base/small need a Pro license · GPU makes all faster. Current: {model} on {device === "cuda" ? "GPU" : "CPU"}.</p>
+        {#if model === "small"}
+          <div class="spread" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
+            <span class="note" style="margin:0;">Whisper small — ~460 MB, tải 1 lần rồi dùng offline (không bundle trong installer).</span>
+            <button class="btn btn-sm" disabled={smallBusy || smallPresent} onclick={downloadSmall}>{smallPresent ? "Downloaded ✓" : smallBusy ? "Downloading…" : "Download small (~460 MB)"}</button>
+          </div>
+          {#if smallProgress}<p class="hint" aria-live="polite">{smallProgress.message}{smallProgress.error ? ` — ${smallProgress.error}` : ""}</p>{/if}
+        {/if}
         </div>
 
         <div class="panel">

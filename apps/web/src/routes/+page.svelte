@@ -72,7 +72,7 @@
       runtimeMessage = runtimeReady ? `Engine ready · ${device === "cuda" ? "GPU (CUDA)" : "CPU"}` : "Whisper/model, media runtime, or storage is missing.";
       licenseMessage = license.licensed ? `License ${license.tier}${license.licensee ? ` · ${license.licensee}` : ""}` : (license.error ?? (license.configured === false ? "Unlicensed (free tier)" : "Unlicensed"));
       storageMessage = storageReady ? `${formatBytes(storage.home.freeBytes ?? 0)} free` : `Need ${formatBytes(storage.home.requiredBytes)}`;
-    } catch (error) { runtimeMessage = `Runtime check failed: ${String(error)}`; }
+    } catch (error) { runtimeMessage = isTauri() ? `Runtime check failed: ${String(error)}` : "Local engine controls live in the desktop app — this browser preview cannot run analysis."; }
   }
 
   async function setModel(next: string) {
