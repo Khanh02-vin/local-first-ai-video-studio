@@ -25,7 +25,8 @@ permissions:
 
 jobs:
   lint-test:
-    runs-on: ubuntu-latest
+    # Self-hosted runner (Vostro) — không tốn quota GitHub Actions.
+    runs-on: [self-hosted, self-vostro]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,8 +34,7 @@ jobs:
           node-version: 24
       - name: Install system deps (ffmpeg for media tests, webkit for cargo test)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo -n apt-get update && sudo -n apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev || echo "deps already present on this runner — skipping apt"
       - run: npm test
       - uses: dtolnay/rust-toolchain@stable
       - run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
@@ -137,7 +137,7 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/msi/*
 
   linux:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-vostro]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -161,6 +161,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cd apps/desktop && cargo clean 2>/dev/null || true
       - name: Build bundles
+        env:
+          # linuxdeploy AppImage không chạy được không có FUSE — extract-and-run
+          # là workaround chuẩn cho self-hosted Linux runners.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           cd apps/desktop
           npm install
@@ -174,7 +178,8 @@ jobs:
   publish:
     if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     needs: [macos, windows, linux]
-    runs-on: ubuntu-latest
+    # Chạy trên self-hosted runner — nơi có rclone đã đăng nhập Drive của bạn.
+    runs-on: [self-hosted, self-vostro]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -215,3 +220,15 @@ jobs:
             dist/**/*.AppImage
             dist/macos-app/*.zip
           draft: false
+      - name: Upload installers to Google Drive (customer-facing links)
+        run: |
+          RCLONE=/home/khanh/.local/bin/rclone
+          "$RCLONE" copy dist/macos-app "gdrive:LFaIVS-Releases/" --include "*.zip"
+          "$RCLONE" copy dist/windows-installer "gdrive:LFaIVS-Releases/" --include "*.msi"
+          "$RCLONE" copy dist/linux-installer "gdrive:LFaIVS-Releases/" --include "*.AppImage"
+          echo "=== Customer download links (Google Drive):"
+          for f in "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio.zip" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_amd64.AppImage" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi"; do
+            echo "$("$RCLONE" link "$f")"
+          done | tee drive-links.txt
+          cat drive-links.txt >> "$GITHUB_STEP_SUMMARY"
+
