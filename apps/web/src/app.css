@@ -384,3 +384,12 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .modal-back { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: none; place-items: center; z-index: 40; }
 .modal-back.open { display: grid; }
 .modal { width: min(480px, 92vw); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.1rem; display: flex; flex-direction: column; gap: .7rem; }
+
+/* ---------- interactive workflow stepper (Studio) ---------- */
+.steps li button { display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left; cursor: pointer; background: transparent; border: 0; padding: 0.3rem 0.2rem; font: inherit; color: var(--faint); border-radius: var(--radius-sm); }
+.steps li button:hover { color: var(--ink-2); }
+.steps li.active button { color: var(--ink); }
+.steps li.done button { color: var(--ink-2); }
+.step-no { width: 20px; height: 20px; flex: none; border-radius: 5px; display: grid; place-items: center; font: 600 10px/1 var(--mono); border: 1px solid var(--line); color: var(--faint); }
+.steps li.active .step-no { background: var(--volt); border-color: var(--volt); color: var(--volt-ink); }
+.steps li.done .step-no { color: var(--volt); border-color: var(--volt-line); background: var(--volt-soft); }

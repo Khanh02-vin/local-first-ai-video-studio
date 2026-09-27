@@ -33,8 +33,6 @@
   let meta = $state<Meta | null>(null);
   let dragOver = $state(false);
   let resumableJobs = $state<JobRow[]>([]);
-  let activeTab: "recent" | "specs" = $state("recent");
-  let storageHelp = $state(false);
   let currentStep = $state<1 | 2 | 3 | 4>(1);
 
   async function choose() {
@@ -182,11 +180,10 @@
   });
 </script>
 
-<main class="bench studio-workspace">
+<main class="bench bench-duo studio-workspace">
   <aside class="bench-left">
     <div class="panel"><span class="eyebrow">Local-first</span><h1>Studio</h1><p class="note">Turn long footage into a clean short-form cut without leaving this machine.</p></div>
-    <div class="panel"><span class="panel-title">Workflow</span><ol class="steps"><li class:done={!!inputPath}><span class="step-num">1</span>Source</li><li class:done={currentStep > 1}><span class="step-num">2</span>Configure</li><li class:done={currentStep > 3}><span class="step-num">3</span>Analyze</li><li class:done={highlights.length > 0}><span class="step-num">4</span>Edit</li></ol></div>
-    <div class="panel"><span class="eyebrow">Engine</span><div class="message"><span class="rail-dot" class:ok={runtimeReady}></span> {runtimeReady ? "Ready" : "Checking runtime"}</div><p class="note">{runtimeMessage}</p></div>
+    <div class="panel" style="margin-top:auto;"><span class="eyebrow">Engine</span><div class="spread" style="align-items:center;"><span style="display:flex;align-items:center;gap:.5rem;font-size:.82rem;color:var(--ink-2);"><span class="rail-dot" class:ok={runtimeReady}></span> {runtimeReady ? "100% on-device" : "Checking runtime"}</span><a class="btn btn-sm btn-quiet" href="/settings">Details</a></div><p class="note">{runtimeMessage}</p></div>
   </aside>
 
   <section class="bench-center">
@@ -219,22 +216,6 @@
           <button class="ghost" onclick={() => { inputPath = ""; meta = null; message = "Drop a video to begin."; }}>Remove</button>
         </div>
       {/if}
-    </div>
-
-    <div class="card">
-      <div class="section-title">Engine</div>
-      <div class="engine-cards">
-        <div class="engine-card selected">
-          <span class="engine-icon">🔒</span>
-          <div><strong>Local</strong><span class="tag">100% On-device</span></div>
-          <p>Processes on your own CPU/GPU. Your footage never leaves this machine.</p>
-        </div>
-        <div class="engine-card disabled" title="Cloud processing is not part of this build yet.">
-          <span class="engine-icon">⚡</span>
-          <div><strong>Cloud</strong><span class="tag">Coming soon</span></div>
-          <p>Faster renders on remote GPUs — roadmap, not available yet.</p>
-        </div>
-      </div>
     </div>
     {/if}
 
@@ -310,15 +291,15 @@
     {/if}
 
     <p class="message" aria-live="polite">{message}</p>
-      </div></div>
-  </section>
 
-  <aside class="bench-right">
-    <div class="panel"><div class="panel-head"><span class="panel-title">Session</span><span class="badge">{activeTab}</span></div>
-      {#if activeTab === "recent"}
-        {#if resumableJobs.length}{#each resumableJobs as job}<div class="row"><div class="row-body"><span class="row-title">{job.id.slice(-8)}</span><span class="row-sub">{job.status} · {job.phase}</span></div><div class="row-actions">{#if job.status === "queued" || job.status === "running"}<button class="btn btn-sm" disabled={busy} onclick={() => watch(job.id, true)}>Continue</button>{/if}{#if job.status === "failed"}<button class="btn btn-sm" disabled={busy} onclick={() => retryJob(job.id)}>Retry</button>{/if}</div></div>{/each}{:else}<p class="note">No projects yet — analyze a video to see results here.</p>{/if}
-      {:else}<dl class="kv"><dt>Device</dt><dd>{device === "cuda" ? "GPU (CUDA)" : "CPU"}</dd><dt>Model</dt><dd>{model}</dd><dt>Storage</dt><dd>{storageMessage}</dd><dt>License</dt><dd>{licenseMessage}</dd></dl>{/if}
+    <div class="panel">
+      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Recent jobs</span></span><span class="badge">{resumableJobs.length}</span></div>
+      {#if resumableJobs.length}{#each resumableJobs as job}<div class="row"><div class="row-body"><span class="row-title">{job.id.slice(-8)}</span><span class="row-sub">{job.status} · {job.phase}</span></div><div class="row-actions">{#if job.status === "queued" || job.status === "running"}<button class="btn btn-sm" disabled={busy} onclick={() => watch(job.id, true)}>Continue</button>{/if}{#if job.status === "failed"}<button class="btn btn-sm" disabled={busy} onclick={() => retryJob(job.id)}>Retry</button>{/if}</div></div>{/each}{:else}<p class="note">No projects yet — analyze a video to see results here.</p>{/if}
     </div>
-    <div class="panel"><div class="seg"><button class="seg-item" class:on={activeTab === "recent"} onclick={() => activeTab = "recent"}>Recent</button><button class="seg-item" class:on={activeTab === "specs"} onclick={() => activeTab = "specs"}>Device</button></div><button class="btn btn-quiet btn-wide" onclick={() => storageHelp = !storageHelp}>Storage help</button>{#if storageHelp}<p class="note">Safe cleanup only: inspect caches and old renders before removing anything.</p>{/if}</div>
-  </aside>
+      </div>
+    <div class="stage-foot">
+      <span>Device: {device === "cuda" ? "GPU (CUDA)" : "CPU"} · Model: {model} · License: {licenseMessage}</span>
+      <span title="Safe cleanup only: inspect caches and old renders before removing anything.">Storage: {storageMessage}</span>
+    </div>
+  </section>
 </main>
