@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -741,6 +742,12 @@ fn crawl_playlist(app: tauri::AppHandle, playlist_url: String, limit: u32) -> Re
 }
 
 fn main() {
+    // WebKitGTK on some Linux GPUs (Intel iGPU laptops) fails EGL/DMABUF init
+    // and renders an empty window — force software-safe compositing.
+    if cfg!(target_os = "linux") {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
     let jobs: Jobs = Arc::new(Mutex::new(HashMap::new()));
     let supervisor_jobs = jobs.clone();
     let llama_state: LlamaState = Arc::new(Mutex::new(None));
