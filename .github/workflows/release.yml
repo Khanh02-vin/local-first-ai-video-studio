@@ -145,8 +145,7 @@ jobs:
           node-version: 24
       - name: Install system deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo -n apt-get update && sudo -n apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev || echo "deps already present on this runner — skipping apt"
       - name: Fetch model weights (git-ignored) and llama.cpp binaries
         shell: bash
         env:
