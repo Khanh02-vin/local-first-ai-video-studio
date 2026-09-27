@@ -75,6 +75,17 @@
     } catch (error) { status = String(error); } finally { adding = false; }
   }
   function clearFilters() { videoId = ""; playlistId = ""; topic = ""; }
+  let confirmDeleteId = $state("");
+  async function deletePlaylist(id: string) {
+    // Two-step confirm: first click arms ("Xóa?"), second click within 3s deletes.
+    if (confirmDeleteId !== id) {
+      confirmDeleteId = id;
+      setTimeout(() => { if (confirmDeleteId === id) confirmDeleteId = ""; }, 3000);
+      return;
+    }
+    confirmDeleteId = "";
+    try { const response = await rag(`/api/rag/playlists/${id}`, { method: "DELETE" }); if (!response.ok) throw new Error((await response.json()).message ?? "Delete failed"); if (playlistId === id) playlistId = ""; status = "Playlist removed."; statusKind = "crawl"; await loadPlaylists(); } catch (error) { status = String(error); statusKind = "crawl"; }
+  }
   const filtersActive = $derived(Boolean(videoId.trim() || playlistId.trim() || topic.trim()));
   const filterCount = $derived([videoId.trim(), playlistId.trim(), topic.trim()].filter(Boolean).length);
   async function search() {
@@ -97,7 +108,7 @@
   <aside class="bench-left">
     <div class="panel"><span class="eyebrow">Knowledge source</span><h1>YouTube Studio</h1><p class="note">Index public playlists, then search their transcripts with timestamp citations.</p></div>
     <div class="panel"><div class="panel-title"><span class="eyebrow">Add playlist</span></div><label class="field"><span class="field-label">Playlist URL</span><input aria-label="YouTube playlist URL" placeholder="https://youtube.com/playlist?..." bind:value={playlistUrl} /></label><button class="btn btn-primary btn-wide" disabled={adding || !playlistUrl.trim()} onclick={addPlaylist}>{adding ? "Queueing…" : "Queue crawl"}</button>{#if statusKind === "crawl"}<div class="status-inline" aria-live="polite">{status}</div>{/if}</div>
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<button class="doc-item" class:on={playlist.id === playlistId} onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button>{/each}{/if}</div></div>
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<div class="doc-item playlist-item" class:on={playlist.id === playlistId}><button class="playlist-select" onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button><button class="playlist-delete" class:confirm={confirmDeleteId === playlist.id} aria-label={confirmDeleteId === playlist.id ? `Confirm delete ${playlist.title || playlist.playlistId}` : `Delete ${playlist.title || playlist.playlistId}`} onclick={(event) => { event.stopPropagation(); deletePlaylist(playlist.id); }}>{confirmDeleteId === playlist.id ? "Xóa?" : "✕"}</button></div>{/each}{/if}</div></div>
   </aside>
 
   <!-- Cột 2: search + filters gọn + kết quả -->
@@ -111,7 +122,7 @@
 
       <!-- filters: toggle + chips thay vì panel phơi ra -->
       <div class="filters-row">
-        <button class="btn btn-sm btn-quiet" onclick={() => showFilters = !showFilters}>⚙ Filters{#if filterCount} · {filterCount} active{/if}</button>
+        <button class="btn btn-sm btn-quiet" onclick={() => showFilters = !showFilters}>⚙ Filters{#if filterCount}&nbsp;·&nbsp;{filterCount} active{/if}</button>
         {#if videoId.trim()}<span class="chip">Video: {videoId.trim()}<button aria-label="Clear video filter" onclick={() => videoId = ""}>✕</button></span>{/if}
         {#if playlistId.trim()}<span class="chip">Playlist: {playlistId.trim()}<button aria-label="Clear playlist filter" onclick={() => playlistId = ""}>✕</button></span>{/if}
         {#if topic.trim()}<span class="chip">Topic: {topic.trim()}<button aria-label="Clear topic filter" onclick={() => topic = ""}>✕</button></span>{/if}
@@ -135,7 +146,7 @@
       </div>
     </div>
     <div class="stage-foot">
-      <a onclick={() => showIngest = true}>+ Paste a transcript manually</a>
+      <button class="stage-foot-link" onclick={() => showIngest = true}>+ Paste a transcript manually</button>
       <span title="This workspace indexes public YouTube knowledge only — no channel, analytics, uploads, or private videos.">ⓘ</span>
     </div>
   </div></section>

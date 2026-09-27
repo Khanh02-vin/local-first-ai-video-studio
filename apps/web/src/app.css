@@ -423,3 +423,13 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   .bench-duo { grid-template-columns: minmax(0, 1fr); }
   .bench-duo .bench-left { order: 0; border-top: 0; border-bottom: 1px solid var(--line-soft); }
 }
+
+/* ---------- playlist item with delete (F-06) ---------- */
+.playlist-item { position: relative; padding-right: 2.4rem; }
+.playlist-select { display: flex; flex-direction: column; gap: .3rem; width: 100%; text-align: left; background: none; border: 0; color: inherit; font: inherit; cursor: pointer; padding: 0; }
+.playlist-delete { position: absolute; top: .4rem; right: .4rem; cursor: pointer; font: 600 .72rem/1 var(--font); padding: .25rem .4rem; border-radius: 5px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
+.playlist-delete:hover { color: var(--danger); border-color: rgba(255, 122, 107, .4); }
+.playlist-delete.confirm { color: var(--danger); border-color: rgba(255, 122, 107, .5); background: rgba(255, 122, 107, .1); }
+/* F-01: footer trigger is a real button, styled like the old link */
+.stage-foot a, .stage-foot .stage-foot-link { background: none; border: 0; color: inherit; cursor: pointer; font: inherit; padding: 0; }
+.stage-foot .stage-foot-link:hover { color: var(--ink-2); }
