@@ -393,3 +393,6 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .step-no { width: 20px; height: 20px; flex: none; border-radius: 5px; display: grid; place-items: center; font: 600 10px/1 var(--mono); border: 1px solid var(--line); color: var(--faint); }
 .steps li.active .step-no { background: var(--volt); border-color: var(--volt); color: var(--volt-ink); }
 .steps li.done .step-no { color: var(--volt); border-color: var(--volt-line); background: var(--volt-soft); }
+
+/* candidate middle column stacks title above timecode */
+.cand > span:nth-child(2) { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }

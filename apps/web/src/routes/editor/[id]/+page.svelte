@@ -161,6 +161,7 @@
       <span class="eyebrow">Source</span>
       <dl class="kv"><dt>Duration</dt><dd class="tc">{clock(sourceDuration)}</dd><dt>Selected</dt><dd class="tc">{clock(range.start)}–{clock(range.end)}</dd><dt>Plan</dt><dd class="tc">v{state.plan.version}</dd></dl>
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
+      <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>{#if saved}<span class="badge ok" role="status" style="align-self:center;">Saved locally</span>{/if}
     </div>
   </aside>
 
@@ -194,10 +195,20 @@
   </section>
 
   <aside class="bench-right">
-    <div class="panel"><div class="panel-head"><span class="panel-title">Trim range</span><span class="badge volt">active</span></div><div class="field-row"><label class="field"><span class="field-label">In</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">Out</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div><p class="note">{clock(range.end - range.start)} selected · handles stay inside source duration</p></div>
-    <div class="panel"><div class="panel-head"><span class="panel-title">Format</span></div><div class="seg">{#each ["9:16", "1:1", "16:9"] as ratio}<button class="seg-item" class:on={state.plan.aspectRatio === ratio} onclick={() => setAspect(ratio as "9:16" | "1:1" | "16:9")}>{ratio}</button>{/each}</div><dl class="kv"><dt>Crop</dt><dd>tracked subject</dd><dt>Layout</dt><dd>solo</dd></dl></div>
-    <div class="panel"><div class="panel-head"><span class="panel-title">Caption</span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Add</button></div>{#if activeCaption}<textarea aria-label="Caption text" value={draftCaption} oninput={(event) => setCaptionText(event.currentTarget.value)}></textarea><div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label></div><button class="btn btn-danger btn-wide btn-sm" onclick={deleteCaption}>Remove caption</button>{:else}<p class="note">No caption cue yet. Add one or load transcript cues.</p>{/if}</div>
-    <div class="panel"><div class="panel-head"><span class="panel-title">Hook</span><span class="badge warn">opening</span></div>{#if state.plan.hook}<textarea aria-label="Hook text" value={state.plan.hook.text} oninput={(event) => updateHookText(event.currentTarget.value)}></textarea><p class="note tc">{clock(state.plan.hook.start)}–{clock(state.plan.hook.end)} · first five seconds</p>{:else}<p class="note">No hook attached to this cut.</p>{/if}</div>
-    <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>{#if saved}<span class="badge ok" role="status">Saved locally</span>{/if}
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Clip</span></span><span class="badge volt">active</span></div>
+      <div class="field-row"><label class="field"><span class="field-label">In</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">Out</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div>
+      <div class="seg">{#each ["9:16", "1:1", "16:9"] as ratio}<button class="seg-item" class:on={state.plan.aspectRatio === ratio} onclick={() => setAspect(ratio as "9:16" | "1:1" | "16:9")}>{ratio}</button>{/each}</div>
+      <p class="note">{clock(range.end - range.start)} selected · crop tracked subject · solo layout</p>
+    </div>
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Text &amp; hook</span></span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Caption</button></div>
+      {#if activeCaption}
+        <textarea aria-label="Caption text" value={draftCaption} oninput={(event) => setCaptionText(event.currentTarget.value)}></textarea>
+        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label></div>
+        <button class="btn btn-danger btn-wide btn-sm" onclick={deleteCaption}>Remove caption</button>
+      {:else}<p class="note">No caption cue yet. Add one or load transcript cues.</p>{/if}
+      <div class="panel" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
+        {#if state.plan.hook}<div class="spread"><span class="eyebrow">Hook · first five seconds</span><span class="note tc" style="margin:0;">{clock(state.plan.hook.start)}–{clock(state.plan.hook.end)}</span></div><textarea aria-label="Hook text" value={state.plan.hook.text} oninput={(event) => updateHookText(event.currentTarget.value)}></textarea>{:else}<p class="note" style="margin:0;">No hook attached to this cut.</p>{/if}
+      </div>
+    </div>
   </aside>
 </main>
