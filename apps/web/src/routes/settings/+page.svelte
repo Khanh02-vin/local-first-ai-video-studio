@@ -11,6 +11,7 @@ let licenseMessage = $state("…");
 let modelBusy = $state(false);
 let message = $state("");
 let bundled = $state({ node: false, ffmpeg: false, ffprobe: false });
+let components = $state({ ffmpeg: false, ffprobe: false, node: false, whisper: false, model: false });
 let strategy = $state("heuristic");
 let geminiKey = $state("");
 let localLlmUrl = $state("http://127.0.0.1:8080");
@@ -58,6 +59,7 @@ async function reloadSetupState() {
       const storage = await invoke<{ home: { ready: boolean; freeBytes?: number; requiredBytes: number }; temp: { ready: boolean; freeBytes?: number } }>("storage_status");
       const license = await invoke<{ licensed: boolean; tier?: string; licensee?: string | null; error?: string; configured?: boolean }>("license_status");
       runtimeReady = runtime.ffmpeg && runtime.ffprobe && runtime.node && runtime.whisper && runtime.modelReady && storage.home.ready && storage.temp.ready;
+      components = { ffmpeg: runtime.ffmpeg, ffprobe: runtime.ffprobe, node: runtime.node, whisper: runtime.whisper, model: runtime.modelReady };
       device = runtime.device ?? "cpu"; model = runtime.model ?? "tiny";
       bundled = runtime.bundled ?? bundled;
       runtimeMessage = runtimeReady ? "All local engine components ready." : "Some component missing — see below.";
@@ -113,84 +115,92 @@ onMount(() => {
 </script>
 
 <h1>Settings</h1>
+<main class="settings-page">
+  <section class="stage">
+    <div class="stage-head">
+      <div class="stage-title"><span class="badge volt">settings</span><span class="stage-name">Local engine &amp; preferences</span></div>
+      <span class="badge" class:ok={runtimeReady}>{runtimeReady ? "all systems ready" : "engine incomplete"}</span>
+    </div>
+    <div class="stage-body">
+      <div class="settings-wrap stack">
 
-<section class="card">
-  <h2>Engine</h2>
-  <dl class="specs">
-    <dt>Runtime</dt><dd>{runtimeMessage}</dd>
-    <dt>Device</dt><dd>{device === "cuda" ? "GPU (CUDA)" : "CPU"}</dd>
-    <dt>License</dt><dd>{licenseMessage}</dd>
-  </dl>
-  <p class="hint">Bundled binaries: Node {bundled.node ? "✓" : "—"} · FFmpeg {bundled.ffmpeg ? "✓" : "—"} · ffprobe {bundled.ffprobe ? "✓" : "—"}</p>
-  <button onclick={refresh}>Refresh</button>
-  <button onclick={readStrategy} class="hint-btn">Reload strategy</button>
-</section>
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Runtime</span></div>
+          <div class="runtime-row">
+            <span class="check"><span class="rail-dot" class:ok={components.ffmpeg}></span> ffmpeg</span>
+            <span class="check"><span class="rail-dot" class:ok={components.ffprobe}></span> ffprobe</span>
+            <span class="check"><span class="rail-dot" class:ok={components.node}></span> node</span>
+            <span class="check"><span class="rail-dot" class:ok={components.whisper}></span> whisper</span>
+            <span class="check"><span class="rail-dot" class:ok={components.model}></span> model</span>
+          </div>
+          <p class="note">{runtimeMessage} · Device: {device === "cuda" ? "GPU (CUDA)" : "CPU"} · License: {licenseMessage}</p>
+          <p class="note">Bundled binaries: Node {bundled.node ? "✓" : "—"} · FFmpeg {bundled.ffmpeg ? "✓" : "—"} · ffprobe {bundled.ffprobe ? "✓" : "—"}</p>
+          <div class="filters-row">
+            <button class="btn btn-sm btn-quiet" onclick={refresh}>Refresh</button>
+            <button class="btn btn-sm btn-quiet" onclick={readStrategy}>Reload strategy</button>
+          </div>
+          {#if message}<p class="hint" aria-live="polite">{message}</p>{/if}
+        </div>
 
-<section class="card">
-  <h2>Whisper (transcription)</h2>
-  <p class="hint">First run on a clean machine: the app creates its own Python environment and installs openai-whisper (downloads PyTorch, a few GB, one time).</p>
-  {#if whisperProgress}
-    <p aria-live="polite">{whisperProgress.message}{whisperProgress.error ? ` — ${whisperProgress.error}` : ""}</p>
-  {:else}
-    <p class="hint">Status unknown — press Setup to check.</p>
-  {/if}
-  <button class="chip" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Setup Whisper"}</button>
-</section>
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Transcription model</span></div>
+          <div class="seg">
+            {#each ["tiny", "base", "small"] as m}<button class="seg-item" class:on={model === m} disabled={modelBusy} onclick={() => setModel(m)}>{m}</button>{/each}
+          </div>
+          <p class="note">tiny = CPU-friendly (free tier) · base/small need a Pro license · GPU makes all faster. Current: {model} on {device === "cuda" ? "GPU" : "CPU"}.</p>
+        </div>
 
-<section class="card">
-  <h2>Local LLM model</h2>
-  <p class="hint">Offline highlight strategy needs the Qwen2.5-3B GGUF (~2.1 GB). Downloaded once, checksum-verified, stored on this machine. An interrupted download leaves a partial file — the next "Download" click wipes it and starts clean.</p>
-  {#if modelPresent}
-    <p class="hint">Model present on disk.</p>
-  {:else if modelProgress}
-    <p aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>
-  {:else}
-    <p class="hint">Not downloaded yet.</p>
-  {/if}
-  <button class="chip" disabled={llmModelBusy || modelPresent} onclick={downloadModel}>{modelPresent ? "Downloaded" : llmModelBusy ? "Downloading…" : "Download model (2.1 GB)"}</button>
-</section>
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">First-run setup</span></div>
+          <div class="spread"><span class="note" style="margin:0;">Whisper — installs openai-whisper + PyTorch into the app's own environment (one time, a few GB).</span><button class="btn btn-sm" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Setup Whisper"}</button></div>
+          {#if whisperProgress}<p class="hint" aria-live="polite">{whisperProgress.message}{whisperProgress.error ? ` — ${whisperProgress.error}` : ""}</p>{:else}<p class="note">Status unknown — press Setup to check.</p>{/if}
+          <div class="spread" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
+            <span class="note" style="margin:0;">Local LLM — Qwen2.5-3B GGUF (~2.1 GB), checksum-verified; only needed for the "Local LLM" strategy.</span><button class="btn btn-sm" disabled={llmModelBusy || modelPresent} onclick={downloadModel}>{modelPresent ? "Downloaded ✓" : llmModelBusy ? "Downloading…" : "Download model"}</button>
+          </div>
+          {#if modelPresent}<p class="note">Model present on disk.</p>{:else if modelProgress}<p class="hint" aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>{/if}
+        </div>
 
-<section class="card">
-  <h2>AI model</h2>
-  <p class="hint">tiny = CPU-friendly (free tier) · base/small need a Pro license · GPU makes all faster.</p>
-  <div class="model-row">
-    {#each ["tiny", "base", "small"] as m}<button class="chip" class:sel={model === m} disabled={modelBusy} onclick={() => setModel(m)}>{m}</button>{/each}
-  </div>
-  <p class="hint">Current: {model} on {device === "cuda" ? "GPU" : "CPU"}.</p>
-  {#if message}<p aria-live="polite">{message}</p>{/if}
-</section>
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Highlight strategy</span></div>
+          <div class="stack">
+            <button class="strategy-card" class:on={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "", "", "")}>
+              <span class="spread"><strong>Heuristic (offline)</strong>{#if strategy === "heuristic"}<span class="badge ok">active</span>{/if}</span>
+              <p>Score segments by speech density + keywords. No API key, works offline.</p>
+            </button>
+            <button class="strategy-card" class:on={strategy === "semantic-gemini"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>
+              <span class="spread"><strong>Semantic (Gemini BYOK)</strong>{#if strategy === "semantic-gemini"}<span class="badge ok">active</span>{/if}</span>
+              <p>Use your Gemini API key to rank segments semantically.</p>
+            </button>
+            <button class="strategy-card" class:on={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>
+              <span class="spread"><strong>Local LLM (offline)</strong>{#if strategy === "semantic-local"}<span class="badge ok">active</span>{/if}</span>
+              <p>Rank with the bundled Qwen model via llama.cpp — no key.</p>
+            </button>
+          </div>
+          {#if strategy === "semantic-gemini"}
+            <label class="field"><span class="field-label">Gemini API key</span><input type="password" value={geminiKey} oninput={(e) => geminiKey = e.currentTarget.value} placeholder="AIza..." /></label>
+            <button class="btn btn-sm" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Save key</button>
+          {/if}
+          {#if strategy === "semantic-local"}
+            <label class="field"><span class="field-label">Local LLM URL</span><input type="text" value={localLlmUrl} oninput={(e) => localLlmUrl = e.currentTarget.value} placeholder="http://127.0.0.1:8080" /></label>
+            <label class="field"><span class="field-label">Model</span><input type="text" value={localLlmModel} oninput={(e) => localLlmModel = e.currentTarget.value} placeholder="qwen2.5-3b-instruct" /></label>
+            <button class="btn btn-sm" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Save</button>
+          {/if}
+        </div>
 
-<section class="card">
-  <h2>Highlight strategy</h2>
-  <p class="hint">Heuristic = offline, deterministic, no cost. Semantic = LLM proposes clips by meaning (Gemini needs your API key; Local LLM needs llama.cpp running, no key).</p>
-  <div class="model-row">
-    <button class="chip" class:sel={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "", "", "")}>Heuristic (offline)</button>
-    <button class="chip" class:sel={strategy === "semantic-gemini"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Semantic (Gemini BYOK)</button>
-    <button class="chip" class:sel={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Local LLM (offline)</button>
-  </div>
-  {#if strategy === "semantic-gemini"}
-    <label class="hint">Gemini API key <input type="password" value={geminiKey} oninput={(e) => geminiKey = e.currentTarget.value} placeholder="AIza..." /></label>
-    <button class="chip" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Save key</button>
-  {/if}
-  {#if strategy === "semantic-local"}
-    <label class="hint">Local LLM URL <input type="text" value={localLlmUrl} oninput={(e) => localLlmUrl = e.currentTarget.value} placeholder="http://127.0.0.1:8080" /></label>
-    <label class="hint">Model <input type="text" value={localLlmModel} oninput={(e) => localLlmModel = e.currentTarget.value} placeholder="qwen2.5-3b-instruct" /></label>
-    <button class="chip" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Save</button>
-  {/if}
-  <p class="hint">Current: {strategy}{strategy === "semantic-gemini" ? (geminiKey ? " · key stored" : " · no key yet") : strategy === "semantic-local" ? " · local LLM" : ""}.</p>
-</section>
-
-<section class="card">
-  <h2>Storage</h2>
-  <p>{storageMessage}</p>
-  <details><summary>Safe cleanup guidance</summary><p class="hint">Không tự động xóa dữ liệu. Kiểm tra:</p><pre>df -h $HOME /tmp
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Storage</span></div>
+          <p class="note" style="margin:0;">{storageMessage}</p>
+          <details><summary>Safe cleanup guidance</summary><p class="hint">Không tự động xóa dữ liệu. Kiểm tra:</p><pre>df -h $HOME /tmp
 df -i $HOME /tmp
 du -h --max-depth=1 ~/.cache 2>/dev/null | sort -h
 cargo clean</pre><p class="hint">Chỉ xóa pip cache, Rust build artifacts hoặc output cũ khi bạn xác nhận.</p></details>
-</section>
+        </div>
 
-<section class="card">
-  <h2>About</h2>
-  <p class="hint">Local-first AI Video Studio — Whisper transcription (MIT), FFmpeg encoding, Tauri shell.</p>
-  <a href="/">← Back to Studio</a>
-</section>
+      </div>
+    </div>
+    <div class="stage-foot">
+      <span>Local-first AI Video Studio — Whisper transcription (MIT), FFmpeg encoding, Tauri shell.</span>
+      <a href="/">← Back to Studio</a>
+    </div>
+  </section>
+</main>

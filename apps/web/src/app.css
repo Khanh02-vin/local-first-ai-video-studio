@@ -396,3 +396,14 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 
 /* candidate middle column stacks title above timecode */
 .cand > span:nth-child(2) { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+
+/* ---------- settings page ---------- */
+.settings-page { padding: 1.1rem 1.15rem 1.3rem; height: 100vh; overflow-y: auto; }
+.settings-page .stage { margin: 0; min-height: calc(100vh - 2.4rem); }
+.runtime-row { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+.check { display: inline-flex; align-items: center; gap: .45rem; font-size: .85rem; color: var(--ink-2); }
+.strategy-card { cursor: pointer; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: .7rem .8rem; color: var(--ink); font: inherit; display: flex; flex-direction: column; gap: .3rem; }
+.strategy-card:hover { border-color: var(--volt-line); }
+.strategy-card.on { border-color: var(--volt-line); background: var(--volt-soft); }
+.strategy-card strong { font-size: .84rem; }
+.strategy-card p { margin: 0; font-size: .74rem; color: var(--muted); }
