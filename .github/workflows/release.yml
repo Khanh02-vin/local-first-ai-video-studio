@@ -130,11 +130,31 @@ jobs:
           cd apps/desktop
           npm install
           npx tauri build -b msi
+      - name: Assemble Windows portable zip (exe + resources, no installer)
+        run: |
+          cd apps/desktop/src-tauri/target/release
+          mkdir -p portable
+          for exe in *.exe; do cp "$exe" portable/; done
+          cp *.dll portable/ 2>/dev/null || true
+          RES=../../resources
+          cp -r "$RES/node" portable/node
+          cp "$RES/ffmpeg" "$RES/ffprobe" portable/
+          cp -r "$RES/models" portable/models
+          cd ../../../..
+          cp -r scripts adapters packages services portable/
+          cd apps/desktop/src-tauri/target/release
+          printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
+          tar -a -cf portable-windows.zip -C portable .
+          ls -lh portable-windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
             apps/desktop/src-tauri/target/release/bundle/msi/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: apps/desktop/src-tauri/target/release/portable-windows.zip
 
   linux:
     runs-on: [self-hosted, self-vostro]
@@ -230,8 +250,9 @@ jobs:
           "$RCLONE" copy dist/macos-app "gdrive:LFaIVS-Releases/" --include "*.zip"
           "$RCLONE" copy dist/windows-installer "gdrive:LFaIVS-Releases/" --include "*.msi"
           "$RCLONE" copy dist/linux-installer "gdrive:LFaIVS-Releases/" --include "*.AppImage"
+          "$RCLONE" copy dist/windows-portable "gdrive:LFaIVS-Releases/" --include "*.zip"
           echo "=== Customer download links (Google Drive):"
-          for f in "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio.zip" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_amd64.AppImage" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi"; do
+          for f in "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio.zip" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_amd64.AppImage" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi" "gdrive:LFaIVS-Releases/portable-windows.zip"; do
             echo "$("$RCLONE" link "$f")"
           done | tee drive-links.txt
           cat drive-links.txt >> "$GITHUB_STEP_SUMMARY"
