@@ -168,11 +168,11 @@ jobs:
           cd apps/desktop
           npm install
           npx tauri build -b appimage
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-installer
-          path: |
-            apps/desktop/src-tauri/target/release/bundle/appimage/*
+      - name: Stage linux installer for publish (same machine — skip GitHub round-trip)
+        run: |
+          mkdir -p ~/lfavis-dist/linux
+          cp apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage ~/lfavis-dist/linux/
+          ls -lh ~/lfavis-dist/linux/
 
   publish:
     if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
@@ -185,6 +185,11 @@ jobs:
         with:
           path: dist
           merge-multiple: false
+      - name: Pick up linux AppImage from the shared staging dir
+        run: |
+          mkdir -p dist/linux-installer
+          cp ~/lfavis-dist/linux/*.AppImage dist/linux-installer/
+          ls -lh dist/linux-installer/
       - name: Show collected artifacts
         run: find dist -type f | head -40
       - name: Zip macOS .app bundle (App Store bundles are directories)
