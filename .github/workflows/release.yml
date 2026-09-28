@@ -140,9 +140,8 @@ jobs:
           cp -r "$RES/node" portable/node
           cp "$RES/ffmpeg" "$RES/ffprobe" portable/
           cp -r "$RES/models" portable/models
-          cd ../../../..
-          cp -r scripts adapters packages services portable/
-          cd apps/desktop/src-tauri/target/release
+          ROOT=../../../../..
+          cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
           printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
           tar -a -cf portable-windows.zip -C portable .
           ls -lh portable-windows.zip
