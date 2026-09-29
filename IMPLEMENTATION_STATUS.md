@@ -128,8 +128,39 @@ RAG backend (adapter-node server, LOCAL_FIRST_STATE_DIR=/tmp/rag-test-state):
 - YouTube preview embed: the production webview origin `tauri://localhost` carries no HTTP(S) `Referer`, which YouTube rejects with `EMBEDDER_IDENTITY_MISSING_REFERRER` (on-screen "Error 153"). Fixed by `preview_origin`: an in-process loopback server on `127.0.0.1:14872` (same pattern as `YT_OAUTH_PORT=14871`) whose page embeds the clip with a `http://localhost:14872` Referer; the iframe CSP stays tight (`frame-src` = YouTube hosts + the shim only), and `/preview` validates video id (`[A-Za-z0-9_-]{11}`) plus `start < end`. Windows/Android (`http://tauri.localhost`) would work natively; dev mode (`http://localhost:5173`) also works.
 - `resources/ffmpeg` (gitignored, populated by `fetch-bundled-assets.sh` or a host copy) wins over PATH via `bundled_bin`. The johnvansickle static 7.0.2 Linux build that was sitting there segfaults (SIGSEGV) on **any** HTTPS input on this machine, so render died with `FFMPEG_EXIT:signal: 11`; replaced locally with the system ffmpeg 8.0.1 (`cp /usr/bin/ffmpeg resources/ffmpeg`) and the GUI export then succeeded. If a render fails with `FFMPEG_EXIT:signal: 11` on a fresh Linux install, check that binary first — Windows CI downloads its own `ffmpeg.exe` from BtbN and is unaffected.
 - Tauri desktop shell loads the static UI from `frontendDist`; the RAG sidecar (`build-node`, spawned on demand by `rag_server_url`, stopped on exit) serves `/api/rag/*` on `127.0.0.1:4733` and the webview reaches it through `tauri-plugin-http`. Verified: full `.deb` release build, app boots, sidecar health `200` with the exact spawn env — but the click-through (load YouTube Studio → plugin fetch returns data) has not been exercised end-to-end in a real GUI session.
-- macOS/Windows installers: `release.yml` builds the Windows portable zip + MSI on `windows-latest` (verified — the customer portable on Google Drive came from that job); the macOS job is configured (rust toolchain, per-OS llama.cpp fetch, web build, signing secrets) but needs the `APPLE_*` / `TAURI_SIGNING_*` secrets and a green run before shipping.
+- macOS/Windows installers: `release.yml` builds the Windows portable zip + MSI on `windows-latest` and the macOS `.app` bundle on `macos-latest`. GitHub-hosted runners for both are currently billing-gated (see "GitHub Actions billing block" below) — the Windows job has failed identically on every dispatch since 2026-09-27, so a fresh portable cannot be produced locally. The Linux AppImage is built on the self-hosted `[self-hosted, self-vostro]` runner (unaffected) and uploaded to its own Drive file; see "Release artifacts" below. macOS additionally needs the `APPLE_*` / `TAURI_SIGNING_*` secrets and a green run before shipping.
 - Collection contract is defined and validated but not yet wired into persistence, API, or UI (scope is P2).
 - Editor uses native HTML video/timeline controls; add CE.SDK only if this editor fails real-user requirements.
 - Tauri 2 installers (deb/rpm/AppImage) are produced but not yet code-signed; shipping to a store requires signing + notarization (see docs/codesigning-runbook.md).
 - Cloud, OAuth and publishing remain deliberately disabled.
+
+## Release artifacts (customer-facing links)
+
+All installers ship as GitHub Release `v0.1.0` assets and are mirrored to the `gdrive:LFaIVS-Releases/` folder.
+
+- **Linux:** `Local-first AI Video Studio_0.1.0_amd64.AppImage` (built at `da15097` on the self-hosted runner; the bundled `ffmpeg` in the AppDir was the static johnvansickle 7.0.2 build that segfaults on HTTPS, so it was overwritten with the host `/usr/bin/ffmpeg` 8.0.1 before packaging with `appimagetool`, then re-uploaded by name to Drive). md5 `7ea2890fb1cda683c51c831e740fd6e4`.
+- **macOS:** `Local-first.AI.Video.Studio_0.1.0_amd64.zip` (`.app` bundle, unsigned — right-click → Open on first launch).
+- **Windows:** `Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi` (signed) and `Local-first AI Video Studio Portable.zip` (unzip; double-click `local-first-ai-video-studio.exe` to run).
+
+Google Drive direct links:
+
+| File (in `gdrive:LFaIVS-Releases/`) | Drive id |
+|---|---|
+| `Local-first AI Video Studio_0.1.0_amd64.AppImage` | `1C6caeoH5fV_-CGARWDzStg2KIDygfjDV` |
+| `Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi` | `10i00IPnu1EZrtk0ZoxhvtX5I47I9Ct31` |
+| `Local-first.AI.Video.Studio.zip` (portable Windows sources / legacy) | `1dFDcfVoJ-nQnhXrLn4DpLP51t4iEVyzN` |
+| `Local-first AI Video Studio Portable.zip` (stale) | `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm` |
+
+> **Stale-portable notice.** `Local-first AI Video Studio Portable.zip` (Drive id `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm`, md5 `1dc16a0c7c1fdc990642b9470b923130`) was produced at `c5f8dbb` — the commit *before* `da15097`. It does **not** contain the YouTube URL → highlight → MP4 feature and is kept here only because the replacement requires a green `windows-latest` job (billing-blocked; see below). The Linux AppImage linked from the same release **does** contain the feature end-to-end.
+
+## GitHub Actions billing block (self-inflicted, not a code defect)
+
+The public `ci.yml` test job and the `release.yml` `windows`/`macos` jobs run on GitHub-hosted runners (`ubuntu-latest`, `windows-latest`, `macos-latest`). Since **2026-09-27 15:56**, every one of those jobs fails immediately with zero steps and the annotation:
+
+> The job was not started because recent account payments have failed or your spending limit needs to be increased.
+
+The repository is private under a free (`plan: null`) account, so the `gh` token cannot reach `/user/settings/billing/actions` (returns `404 Not Found`). Only the account owner can lift this by resolving the failed payment / raising the Actions spending limit.
+
+What keeps working: the self-hosted `[self-hosted, self-vostro]` jobs (`lint-test`, `linux`, `publish`) — they report directly against the linux host and are how the Linux AppImage above was produced. This is also why `release.yml` was split so the `linux` job stages its AppImage to `~/lfavis-dist/linux/` and the `publish` job reads it from that shared dir instead of round-tripping through the GitHub artifact store.
+
+The Windows `fetch-bundled-assets.sh` step downloads a fresh BtbN `ffmpeg.exe` on the runner, so a future green `windows` job will ship the correct ffmpeg without any local intervention.
