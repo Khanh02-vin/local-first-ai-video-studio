@@ -120,7 +120,7 @@
   }
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   function pct(seconds: number) { return `${Math.max(0, Math.min(100, (seconds / Math.max(sourceDuration, 1)) * 100))}%`; }
-  function syncTime() { if (video) { currentTime = video.currentTime; playing = !video.paused; } }
+  function syncTime() { if (video) { currentTime = video.currentTime; playing = !video.paused; if (video.currentTime >= range.end) video.pause(); } }
   function togglePlay() { if (!video) return; if (video.paused) void video.play(); else video.pause(); }
   function seek(seconds: number) { const next = Math.max(0, Math.min(sourceDuration, seconds)); currentTime = next; if (video) video.currentTime = next; }
   function seekTimeline(event: MouseEvent) { const rect = (event.currentTarget as HTMLElement).getBoundingClientRect(); seek(((event.clientX - rect.left) / rect.width) * sourceDuration); }

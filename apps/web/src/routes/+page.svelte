@@ -23,6 +23,13 @@
   let timer: ReturnType<typeof setInterval> | undefined;
   let highlights = $state<Highlight[]>([]);
   let selectedId = $state("");
+  let youtubeUrl = $state("");
+  let youtubeVideoId = $state("");
+  // Loopback base for the preview iframe: the packaged webview's tauri:// origin
+  // carries no Referer, which YouTube rejects (error 153). Empty in the browser,
+  // where the plain embed already works.
+  let previewBase = $state("");
+  let selectedCandidate = $derived(highlights.find((item) => item.id === selectedId) ?? null);
   let runtimeReady = $state(false);
   let runtimeMessage = $state("Checking local runtime…");
   let storageMessage = $state("Checking storage…");
@@ -42,7 +49,7 @@
   }
 
   async function loadVideo(path: string) {
-    inputPath = path; highlights = []; selectedId = ""; jobId = ""; busy = false; meta = null;
+    inputPath = path; highlights = []; selectedId = ""; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
     await reconnectJobs(false);
     try {
       const probe = JSON.parse(await invoke<string>("probe_video", { path }));
@@ -119,6 +126,7 @@
         progress = job.progress;
         if (job.status === "completed") {
           const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? "";
+          if (result.videoId) youtubeVideoId = result.videoId;
           studioState.highlights = highlights; studioState.selectedId = selectedId;
           message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
           currentStep = 4; busy = false; stopTimer(); break;
@@ -141,6 +149,26 @@
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
       await watch(id, false);
     } catch (error) { message = `Analyze failed: ${String(error)}`; busy = false; stopTimer(); }
+  }
+
+  /// YouTube: one metadata call → transcript-based analysis (no Whisper, no download).
+  async function analyzeYoutube() {
+    if (!isTauri()) { message = "YouTube analysis runs in the desktop app only."; return; }
+    const url = youtubeUrl.trim();
+    if (!url || busy) return;
+    highlights = []; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
+    busy = true; message = "Fetching YouTube transcript…"; startTimer();
+    try {
+      const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
+      inputPath = url;
+      meta = { name: info.title, duration: info.duration, width: 0, height: 0 };
+      studioState.sourcePath = url; studioState.sourceName = info.title; studioState.sourceDuration = info.duration;
+      youtubeUrl = "";
+      await watch(info.id, false);
+    } catch (error) {
+      message = `YouTube analyze failed: ${String(error)}`;
+      busy = false; stopTimer();
+    }
   }
 
   async function render() {
@@ -169,6 +197,7 @@
   onMount(() => {
     stopBrowserDrop();
     checkRuntime(); void reconnectJobs();
+    if (isTauri()) invoke<string>("preview_origin").then((base) => previewBase = base).catch(() => {});
     const unlisten = getCurrentWindow().onDragDropEvent((event) => {
       const payload = event.payload;
       dragOver = payload.type === "over" || payload.type === "enter";
@@ -207,6 +236,11 @@
           <p>Drag & drop here, or</p>
           <button class="browse" onclick={choose} disabled={busy}>Browse files</button>
           <p class="hint">MP4 · MOV · MKV — processed 100% on your device</p>
+          <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap;justify-content:center;">
+            <input type="url" placeholder="…or paste a YouTube URL" aria-label="YouTube URL" bind:value={youtubeUrl} disabled={busy} style="flex:1;min-width:220px;" />
+            <button class="browse" onclick={analyzeYoutube} disabled={busy || !youtubeUrl.trim()}>{#if busy}<span class="spinner"></span>{:else}Analyze link{/if}</button>
+          </div>
+          <p class="hint">YouTube: reads the transcript in seconds — no download, no Whisper.</p>
         </div>
       {:else if meta}
         <div class="preview-card">
@@ -216,7 +250,7 @@
             <span>{clock(meta.duration)} · {meta.width && meta.height ? `${meta.width}×${meta.height}` : ""}</span>
           </div>
           <button class="cta small" onclick={() => currentStep = 2}>Continue to config →</button>
-          <button class="ghost" onclick={() => { inputPath = ""; meta = null; message = "Drop a video to begin."; }}>Remove</button>
+          <button class="ghost" onclick={() => { inputPath = ""; meta = null; youtubeVideoId = ""; message = "Drop a video to begin."; }}>Remove</button>
         </div>
       {/if}
     </div>
@@ -288,6 +322,21 @@
         </button>
         {#if outputPath}<p class="hint">Saved: {outputPath}</p>{/if}
       </div>
+      {#if inputPath.startsWith("http") && youtubeVideoId && selectedCandidate}
+        <div class="card">
+          <div class="section-title">Preview (YouTube)</div>
+          <iframe
+            title="YouTube clip preview"
+            style="width:100%;aspect-ratio:16/9;border:0;border-radius:12px;background:#000;"
+            src={previewBase
+              ? `${previewBase}/preview?id=${youtubeVideoId}&start=${Math.floor(selectedCandidate.start)}&end=${Math.ceil(selectedCandidate.end)}`
+              : `https://www.youtube.com/embed/${youtubeVideoId}?start=${Math.floor(selectedCandidate.start)}&end=${Math.ceil(selectedCandidate.end)}&rel=0`}
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowfullscreen
+          ></iframe>
+          <p class="hint">Seek preview streams from YouTube — nothing is rendered until you export.</p>
+        </div>
+      {/if}
     {:else}
       <div class="card"><p class="hint">No highlights yet. Run an analysis first.</p><button class="ghost wide" onclick={() => currentStep = 2}>← Back to config</button></div>
     {/if}

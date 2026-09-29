@@ -17,3 +17,4 @@ apps/desktop/src-tauri/resources/ffprobe
 apps/desktop/src-tauri/resources/models/**/*.pt
 apps/desktop/src-tauri/resources/models/**/*.gguf
 .cache/
+apps/desktop/src-tauri/*.mp4

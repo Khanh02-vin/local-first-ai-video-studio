@@ -37,6 +37,8 @@ fn helper_env(app: &tauri::AppHandle, extra: &[(&str, &str)]) -> Vec<(String, St
     for (key, value) in extra { env.push((key.to_string(), value.to_string())); }
     env
 }
+/// True for remote inputs (YouTube URLs) that must skip local file checks.
+fn is_remote_input(input: &str) -> bool { input.starts_with("http://") || input.starts_with("https://") }
 
 /// Persists the chosen Whisper model into runtime.env so init/worker agree on cache keys.
 #[tauri::command]
@@ -319,6 +321,11 @@ fn whisper_venv_dir() -> PathBuf { state_dir().join(".venv") }
 fn whisper_venv_bin(name: &str) -> PathBuf {
     #[cfg(windows)] { whisper_venv_dir().join("Scripts").join(format!("{name}.exe")) }
     #[cfg(not(windows))] { whisper_venv_dir().join("bin").join(name) }
+}
+/// Python interpreter inside the app venv (yt-dlp + youtube-transcript-api live there).
+fn venv_python() -> PathBuf {
+    #[cfg(windows)] { whisper_venv_dir().join("Scripts").join("python.exe") }
+    #[cfg(not(windows))] { whisper_venv_dir().join("bin").join("python3") }
 }
 
 #[derive(Clone)]
@@ -769,9 +776,18 @@ fn spawn_analysis_worker(app: tauri::AppHandle, jobs: Jobs, job_id: String, inpu
     { let mut all = match jobs.lock() { Ok(all) => all, Err(_) => return }; if let Some(job) = all.get(&job_id) { if job.status == "running" { return; } } all.insert(job_id.clone(), AnalysisStatus { status: "running".into(), phase: "probe".into(), progress: 0.02, result: None, error: None, chunk_completed: 0, chunk_total: 0, current_chunk: None }); }
     thread::spawn(move || {
         let run = || -> Result<String, String> {
-            let script = helper_script(&app, "analyze-video.ts")?;
             let mut cmd = Command::new(node_bin(&app));
-            cmd.args(NODE_ARGS).arg(script).arg(&input).arg(input.to_string_lossy().as_ref()).arg(format!("{duration:.3}")).arg(format!("{range_start:.3}")).arg(format!("{range_end:.3}")).arg(&job_id).arg(jobs_path());
+            if is_remote_input(&input.to_string_lossy()) {
+                // YouTube URL: text-only pipeline (captions via crawler), no Whisper chunks.
+                let python = venv_python();
+                if !python.is_file() { return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into()); }
+                cmd.args(NODE_ARGS).arg(helper_script(&app, "analyze-youtube.ts")?)
+                    .arg(&input).arg(format!("{duration:.3}")).arg(&job_id).arg(jobs_path())
+                    .env("YT_PYTHON", &python).env("YT_CRAWLER", helper_script(&app, "yt-crawler.py")?);
+            } else {
+                let script = helper_script(&app, "analyze-video.ts")?;
+                cmd.args(NODE_ARGS).arg(script).arg(&input).arg(input.to_string_lossy().as_ref()).arg(format!("{duration:.3}")).arg(format!("{range_start:.3}")).arg(format!("{range_end:.3}")).arg(&job_id).arg(jobs_path());
+            }
             for (key, value) in helper_env(&app, &[]) { cmd.env(key, value); }
             let output = cmd.output().map_err(|e| io_error("NODE_SPAWN", e))?;
             if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); }
@@ -795,7 +811,7 @@ fn resume_queued_jobs(app: tauri::AppHandle, jobs: Jobs) {
         let duration = entry["duration"].as_f64().unwrap_or(0.0);
         if duration <= 0.0 { continue; }
         let path = PathBuf::from(input);
-        if !path.is_file() {
+        if !is_remote_input(input) && !path.is_file() {
             let _ = run_status_script(&app, &[id.to_string(), "--fail".to_string(), "input file missing".to_string()]);
             continue;
         }
@@ -821,7 +837,7 @@ fn retry_analysis(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>, id: Strin
     let job = run_status_script(&app, &[id.clone(), "--retry".to_string()])?;
     let (Some(input), Some(duration)) = (job["input"].as_str(), job["duration"].as_f64()) else { return Err("JOB_NOT_FOUND".into()); };
     let path = PathBuf::from(input);
-    if !path.is_file() { let _ = run_status_script(&app, &[id.clone(), "--fail".to_string(), "input file missing".to_string()]); return Err("INPUT_NOT_FILE".into()); }
+    if !is_remote_input(input) && !path.is_file() { let _ = run_status_script(&app, &[id.clone(), "--fail".to_string(), "input file missing".to_string()]); return Err("INPUT_NOT_FILE".into()); }
     let range_start = job["rangeStart"].as_f64().unwrap_or(0.0);
     let range_end = job["rangeEnd"].as_f64().unwrap_or(duration);
     spawn_analysis_worker(app.clone(), jobs.inner().clone(), id, path, duration, range_start, range_end);
@@ -907,16 +923,190 @@ fn probe_video(app: tauri::AppHandle, path: String) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("FFPROBE_OUTPUT:{e}"))
 }
 
+/// Extracts a video id from a youtube.com/youtu.be link for validation only —
+/// the original (case-preserved) URL is what reaches yt-dlp afterwards.
+fn youtube_video_id(url: &str) -> Option<String> {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://"))?;
+    let (host, tail) = rest.split_once(|c| c == '/' || c == '?')?;
+    let id = if host == "youtu.be" {
+        tail.split(['/', '?']).next().unwrap_or("")
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") {
+        let (path, query) = match tail.split_once('?') { Some((p, q)) => (p, q), None => (tail, "") };
+        if let Some(v) = query.split('&').find_map(|p| p.strip_prefix("v=")) { v }
+        else if let Some(rest) = path.strip_prefix("embed/").or_else(|| path.strip_prefix("shorts/")) { rest.split('/').next().unwrap_or("") }
+        else { "" }
+    } else { return None; };
+    if id.len() >= 6 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { Some(id.to_string()) } else { None }
+}
+
+/// Fetches (title, duration) for a YouTube URL — one metadata-only yt-dlp call (~1s).
+fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String, f64), String> {
+    let python = venv_python();
+    if !python.is_file() { return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into()); }
+    let mut cmd = Command::new(&python);
+    cmd.args(["-m", "yt_dlp", "--skip-download", "--no-playlist", "--print", "%(title)s\t%(duration)s"]).arg(url);
+    for (key, value) in helper_env(app, &[]) { cmd.env(key, value); }
+    let output = cmd.output().map_err(|e| format!("YT_META_SPAWN:{e}"))?;
+    if !output.status.success() { return Err(format!("YT_META:{}", String::from_utf8_lossy(&output.stderr).trim())); }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("");
+    let (title, duration_text) = line.rsplit_once('\t').ok_or("YT_META_PARSE")?;
+    let duration: f64 = duration_text.trim().parse().map_err(|_| "YT_NO_DURATION".to_string())?;
+    if !duration.is_finite() || duration <= 0.0 { return Err("YT_NO_DURATION".into()); }
+    Ok((title.to_string(), duration))
+}
+
+/// Resolves fresh CDN stream URLs at export time: YouTube URLs expire (~6h), so
+/// they must never be cached between analysis and render. YouTube is DASH-only
+/// nowadays, so this usually returns [videoUrl, audioUrl] for ffmpeg's two inputs.
+fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Vec<String>, String> {
+    let python = venv_python();
+    if !python.is_file() { return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into()); }
+    let mut cmd = Command::new(&python);
+    cmd.args(["-m", "yt_dlp", "--no-playlist", "-g", "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b"]).arg(url);
+    for (key, value) in helper_env(app, &[]) { cmd.env(key, value); }
+    let output = cmd.output().map_err(|e| format!("YT_STREAM_SPAWN:{e}"))?;
+    if !output.status.success() { return Err(format!("YT_STREAM_RESOLVE:{}", String::from_utf8_lossy(&output.stderr).trim())); }
+    let urls: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect();
+    if urls.is_empty() { return Err("YT_STREAM_EMPTY: yt-dlp returned no stream URL for this video".into()); }
+    Ok(urls)
+}
+
+/// Starts a text-only analysis job from a YouTube URL: metadata (~1s) → init →
+/// analyze-youtube.ts worker (captions, no Whisper, no download).
+#[tauri::command]
+fn start_youtube_analysis(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>, url: String) -> Result<serde_json::Value, String> {
+    let url = url.trim().to_string();
+    if youtube_video_id(&url).is_none() { return Err("INVALID_YOUTUBE_URL".into()); }
+    let (title, duration) = yt_video_meta(&app, &url)?;
+    let id = format!("analysis-{}", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "CLOCK_ERROR")?.as_nanos());
+    let init_script = helper_script(&app, "analysis-init.ts")?;
+    let mut init = Command::new(node_bin(&app));
+    init.args(NODE_ARGS).arg(init_script).arg(jobs_path()).arg(&id).arg(&url).arg(format!("{duration:.3}")).arg("0").arg(format!("{duration:.3}"));
+    for (key, value) in helper_env(&app, &[]) { init.env(key, value); }
+    let init = init.output().map_err(|e| format!("STORE_INIT:{e}"))?;
+    if !init.status.success() { return Err(String::from_utf8_lossy(&init.stderr).trim().to_owned()); }
+    spawn_analysis_worker(app.clone(), jobs.inner().clone(), id.clone(), PathBuf::from(&url), duration, 0.0, duration);
+    Ok(serde_json::json!({ "id": id, "duration": duration, "title": title }))
+}
+
+// --- YouTube preview shim -------------------------------------------------------
+// The packaged webview origin is tauri://localhost; WebKitGTK sends no Referer
+// for that scheme and YouTube rejects such embeds with error 153
+// (EMBEDDER_IDENTITY_MISSING_REFERRER). A loopback page around the player
+// gives it a normal http://localhost Referer, which YouTube accepts.
+const YT_PREVIEW_PORT: u16 = 14872;
+
+/// Parses the shim's query into (videoId, start, end); anything else is rejected
+/// so the served page is only ever built from validated pieces.
+fn preview_query(query: &str) -> Option<(String, u32, u32)> {
+    let mut id = String::new();
+    let mut start: Option<u32> = None;
+    let mut end: Option<u32> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match key {
+            "id" => id = value.to_string(),
+            "start" => start = value.parse().ok(),
+            "end" => end = value.parse().ok(),
+            _ => {}
+        }
+    }
+    if id.len() != 11 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { return None; }
+    let (start, end) = (start?, end?);
+    if start >= end { return None; }
+    Some((id, start, end))
+}
+
+fn preview_page(video_id: &str, start: u32, end: u32) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;height:100%;background:#000}}iframe{{display:block;width:100%;height:100%;border:0}}</style></head><body>\
+         <iframe src=\"https://www.youtube.com/embed/{video_id}?start={start}&end={end}&rel=0\" allow=\"accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture\" allowfullscreen></iframe>\
+         </body></html>"
+    )
+}
+
+fn preview_serve(listener: std::net::TcpListener) {
+    use std::io::{Read, Write};
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut request: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&chunk[..n]);
+                        if request.len() > 8192 || request.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            let target = text.split_whitespace().nth(1).unwrap_or("");
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let (status, body) = match path {
+                "/health" => ("200 OK", "yt-preview".to_string()),
+                "/preview" => match preview_query(query) {
+                    Some((id, start, end)) => ("200 OK", preview_page(&id, start, end)),
+                    None => ("400 Bad Request", "bad preview request".to_string()),
+                },
+                _ => ("404 Not Found", "not found".to_string()),
+            };
+            let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            let _ = stream.flush();
+        });
+    }
+}
+
+/// Returns the loopback base URL for the YouTube preview iframe, starting the
+/// shim on first use (reuses an instance already serving after a reload).
+#[tauri::command]
+fn preview_origin() -> Result<String, String> {
+    let base = format!("http://localhost:{YT_PREVIEW_PORT}");
+    if let Ok(mut probe) = std::net::TcpStream::connect(("localhost", YT_PREVIEW_PORT)) {
+        use std::io::{Read, Write};
+        let _ = probe.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let _ = probe.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut reply = String::new();
+        let _ = probe.read_to_string(&mut reply);
+        if reply.starts_with("HTTP/1.1 200") && reply.contains("yt-preview") { return Ok(base); }
+        return Err(format!("PREVIEW_PORT_BUSY:{YT_PREVIEW_PORT}"));
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", YT_PREVIEW_PORT)).map_err(|e| format!("PREVIEW_PORT_BUSY:{e}"))?;
+    thread::spawn(move || preview_serve(listener));
+    Ok(base)
+}
+
 #[tauri::command]
 fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>) -> Result<String, String> {
-    let input_path = Path::new(&input).canonicalize().map_err(|e| format!("INPUT_PATH:{e}"))?;
+    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
     let output_path = Path::new(&output).canonicalize().unwrap_or_else(|_| Path::new(&output).to_path_buf());
-    if input_path == output_path { return Err("OUTPUT_MUST_DIFFER_FROM_INPUT".into()); }
-    if !input_path.is_file() || !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
+    // YouTube inputs skip the local file checks and resolve fresh CDN URLs;
+    // -ss/-t before each -i on HTTP becomes a range request (only the section
+    // is fetched), and a DASH pair needs the same seek on both inputs.
+    let media: Vec<String> = if is_remote_input(&input) {
+        resolve_stream_url(&app, &input)?
+    } else {
+        let input_path = Path::new(&input).canonicalize().map_err(|e| format!("INPUT_PATH:{e}"))?;
+        if input_path == output_path { return Err("OUTPUT_MUST_DIFFER_FROM_INPUT".into()); }
+        if !input_path.is_file() { return Err("INPUT_NOT_FILE".into()); }
+        vec![input_path.to_string_lossy().into_owned()]
+    };
     let ratio = aspect_ratio.unwrap_or_else(|| "9:16".into());
     let vf = match ratio.as_str() { "1:1" => "crop=ih:ih:(iw-ih)/2:0,scale=1080:1080", "16:9" => "crop=ih*16/9:ih:(iw-ih*16/9)/2:0,scale=1920:1080", _ => "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" };
     let parent = output_path.parent().ok_or("OUTPUT_PARENT_MISSING")?; std::fs::create_dir_all(parent).map_err(|e| format!("OUTPUT_DIR:{e}"))?;
-    let status = Command::new(ffmpeg_bin(&app)).args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss"]).arg(format!("{start:.3}")).args(["-t"]).arg(format!("{duration:.3}")).args(["-i"]).arg(&input_path).args(["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]).arg(&output_path).status().map_err(|e| format!("FFMPEG_SPAWN:{e}"))?;
+    let mut cmd = Command::new(ffmpeg_bin(&app));
+    cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"]);
+    for source in &media {
+        cmd.args(["-ss"]).arg(format!("{start:.3}")).args(["-t"]).arg(format!("{duration:.3}")).args(["-i"]).arg(source);
+    }
+    cmd.args(["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]);
+    if media.len() > 1 { cmd.args(["-map", "0:v:0", "-map", "1:a:0"]); }
+    let status = cmd.arg(&output_path).status().map_err(|e| format!("FFMPEG_SPAWN:{e}"))?;
     if !status.success() { return Err(format!("FFMPEG_EXIT:{status}")); } Ok(output_path.to_string_lossy().into_owned())
 }
 
@@ -932,9 +1122,7 @@ fn stop_analysis(app: tauri::AppHandle, id: String) -> Result<serde_json::Value,
 /// whisper venv, then stores the result via the RAG sidecar ingest endpoint.
 /// Best-effort: a missing crawler/venv yields an explanatory error instead of a panic.
 fn run_yt_crawler(app: &tauri::AppHandle, playlist_url: &str, limit: u32) -> Result<serde_json::Value, String> {
-    // Resolve the Python venv created by the whisper bootstrap (same dir as whisper_venv_bin()).
-    #[cfg(windows)] let venv_python = whisper_venv_dir().join("Scripts").join("python.exe");
-    #[cfg(not(windows))] let venv_python = whisper_venv_dir().join("bin").join("python3");
+    let venv_python = venv_python();
     if !venv_python.is_file() { return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into()); }
 
     let crawler = helper_script(app, "yt-crawler.py")?;
@@ -1000,7 +1188,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
+        .invoke_handler(tauri::generate_handler![app_info, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, start_youtube_analysis, preview_origin, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let llama_shutdown = llama_state.clone();
@@ -1122,6 +1310,20 @@ mod tests {
         assert!(err.contains("MODEL_CHECKSUM_MISMATCH"), "{err}");
         assert!(!target.exists(), "failed download must not leave a target file");
         assert!(!guard.dir.join("model.gguf.part").exists(), "failed download must clean the partial");
+    }
+
+    #[test]
+    fn preview_query_accepts_valid_and_rejects_bad_requests() {
+        // The shim builds an HTML page from this query — malformed or hostile
+        // input must never reach the page.
+        assert_eq!(preview_query("id=9bZkp7q19f0&start=9&end=26"), Some(("9bZkp7q19f0".to_string(), 9, 26)));
+        assert_eq!(preview_query("id=short&start=9&end=26"), None, "video id must be 11 chars");
+        assert_eq!(preview_query("id=<script>x&start=9&end=26"), None, "id charset is whitelisted");
+        assert_eq!(preview_query("id=9bZkp7q19f0&start=26&end=9"), None, "start must precede end");
+        assert_eq!(preview_query("id=9bZkp7q19f0&start=9"), None, "end is required");
+        assert_eq!(preview_query(""), None);
+        let page = preview_page("9bZkp7q19f0", 9, 26);
+        assert!(page.contains("youtube.com/embed/9bZkp7q19f0?start=9&end=26"), "{page}");
     }
 
     #[test]

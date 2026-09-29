@@ -14,9 +14,10 @@
     "test:security": "node --experimental-strip-types tests/security/platform-boundaries.test.ts",
     "test:semantic": "node --experimental-strip-types tests/ai-pipeline/semantic.test.ts",
     "test:idempotency": "node --experimental-strip-types tests/local/idempotency-gaps.test.ts",
-    "test": "npm run test:contracts && npm run test:engine-parity && npm run test:local && npm run test:pipeline && npm run test:local-mvp && npm run test:security && npm run test:semantic && npm run test:idempotency && npm run test:long-video && npm run test:json-repair && npm run test:wiring",
+    "test": "npm run test:contracts && npm run test:engine-parity && npm run test:local && npm run test:pipeline && npm run test:local-mvp && npm run test:security && npm run test:semantic && npm run test:idempotency && npm run test:long-video && npm run test:json-repair && npm run test:youtube && npm run test:wiring",
     "test:long-video": "node --experimental-strip-types tests/ai-pipeline/long-video.test.ts",
     "test:json-repair": "node --experimental-strip-types tests/ai-pipeline/json-repair.test.ts",
+    "test:youtube": "node --experimental-strip-types tests/ai-pipeline/youtube-transcript.test.ts",
     "test:wiring": "node --experimental-strip-types tests/wiring/commands.test.ts"
   }
 }
