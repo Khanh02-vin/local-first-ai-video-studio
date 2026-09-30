@@ -18,6 +18,8 @@
     caption: "M3 5h18v14H3V5zm2 3h8v3H5V8zm0 5h6v2H5v-2z",
     refresh: "M20 12a8 8 0 1 1-2.3-5.7M20 3v4h-4",
     bolt: "M13 2 4 14h6l-1 8 9-12h-6l1-8z",
+    min: "M5 12h14",
+    max: "M6 6h12v12H6z",
   };
   export let name: string;
   export let size = 18;

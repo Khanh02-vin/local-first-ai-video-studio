@@ -20,7 +20,8 @@
         "title": "Local-first AI Video Studio",
         "width": 1280,
         "height": 800,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "decorations": false
       }
     ],
     "enableGTKAppId": true
@@ -42,8 +43,8 @@
       "../../../packages": "packages",
       "../../../services": "services",
       "./resources/node": "node",
-      "./resources/ffmpeg": "ffmpeg",
-      "./resources/ffprobe": "ffprobe",
+      "./resources/ffmpeg*": "",
+      "./resources/ffprobe*": "",
       "./resources/models": "models",
       "./resources/models/llama": "models/llama"
     },

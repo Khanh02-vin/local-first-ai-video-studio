@@ -61,8 +61,36 @@ h2 { font-size: 1rem; }
 .muted { color: var(--muted); }
 .note { font-size: 0.78rem; color: var(--muted); margin: 0.5rem 0 0; }
 
-/* ---------- app shell: rail + frame ---------- */
-.app { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); height: 100vh; }
+/* ---------- app shell: titlebar + rail + frame ---------- */
+.shell { display: flex; flex-direction: column; height: 100vh; }
+.titlebar {
+  flex: none; height: 36px; display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-2); border-bottom: 1px solid var(--line-soft);
+  -webkit-user-select: none; user-select: none;
+}
+.titlebar-title { font: 600 11px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding-left: 14px; }
+.titlebar-controls { display: flex; height: 100%; }
+.titlebar-btn {
+  width: 42px; height: 100%; display: grid; place-items: center;
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+}
+.titlebar-btn:hover { background: var(--surface-2); color: var(--ink); }
+.titlebar-close:hover { background: #c42b1c; color: #fff; }
+
+/* crash report from the previous run (written by the Rust panic hook) */
+.crash-banner {
+  flex: none; display: flex; align-items: flex-start; gap: 1rem; justify-content: space-between;
+  background: #3a1d1a; border-bottom: 1px solid #6b3a33; color: var(--ink);
+  padding: 0.7rem 1rem;
+}
+.crash-body { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+.crash-log {
+  margin: 0.3rem 0 0; padding: 0.5rem 0.6rem; overflow: auto; max-height: 9rem;
+  background: #241210; border: 1px solid #6b3a33; border-radius: var(--radius-sm);
+  font: 11px/1.45 var(--mono); color: #f0c8c2; white-space: pre-wrap; word-break: break-word;
+}
+
+.app { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); flex: 1; min-height: 0; }
 .rail {
   display: flex; flex-direction: column; align-items: center; gap: 0.35rem;
   padding: 0.85rem 0;
@@ -93,7 +121,11 @@ h2 { font-size: 1rem; }
 .rail-dot.ok { background: var(--ok); box-shadow: 0 0 8px rgba(125, 220, 154, 0.6); }
 .rail-tip { font: 500 9px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
 
-.frame { min-width: 0; height: 100vh; overflow: hidden; }
+.frame { min-width: 0; min-height: 0; position: relative; overflow: hidden; }
+/* Keep-alive pages: each visited page fills the frame; the inactive one is
+   hidden with display:none so switching never unmounts (instant nav). */
+.page { position: absolute; inset: 0; }
+.page.off { display: none; }
 
 /* ---------- workbench: context | canvas | inspector ---------- */
 .bench {

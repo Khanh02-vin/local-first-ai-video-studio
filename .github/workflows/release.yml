@@ -116,6 +116,17 @@ jobs:
         env:
           LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Verify bundled helper names (Windows)
+        shell: bash
+        run: |
+          # Guards the customer build: bundled_bin probes node/bin/node.exe,
+          # ffmpeg.exe and ffprobe.exe on Windows — a layout drift here shipped
+          # a portable whose analysis/RAG helpers silently fell back to PATH.
+          RES=apps/desktop/src-tauri/resources
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe; do
+            if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
+          done
+          echo "all bundled helpers present"
       - name: Build web frontend
         run: |
           cd apps/web
@@ -139,11 +150,16 @@ jobs:
           cp *.dll portable/ 2>/dev/null || true
           RES=../../resources
           cp -r "$RES/node" portable/node
-          cp "$RES/ffmpeg" "$RES/ffprobe" portable/
+          # ffmpeg/ffprobe ship with .exe names on Windows
+          for bin in ffmpeg ffprobe; do
+            for cand in "$RES/$bin" "$RES/$bin.exe"; do
+              [[ -f "$cand" ]] && cp "$cand" portable/
+            done
+          done
           cp -r "$RES/models" portable/models
           ROOT=../../../../..
           cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
-          printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
+          printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nAll engine helpers (node, ffmpeg, whisper models) are bundled — no Node.js required.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
           tar -a -cf portable-windows.zip -C portable .
           ls -lh portable-windows.zip
       - uses: actions/upload-artifact@v4
@@ -171,6 +187,14 @@ jobs:
         env:
           LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Verify bundled helper names (Linux)
+        shell: bash
+        run: |
+          RES=apps/desktop/src-tauri/resources
+          for f in node/bin/node ffmpeg ffprobe; do
+            if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
+          done
+          echo "all bundled helpers present"
       - name: Build web frontend
         run: |
           cd apps/web

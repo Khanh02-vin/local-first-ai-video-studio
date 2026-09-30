@@ -58,7 +58,7 @@ if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
 fi
 
 # --- node ---------------------------------------------------------------------
-if [[ -x "$RES/node/bin/node" ]]; then
+if [[ -x "$RES/node/bin/node" || -f "$RES/node/bin/node.exe" ]]; then
   echo "==> node already present"
 else
   case "$OS-$ARCH" in
@@ -82,16 +82,27 @@ else
   fi
   mkdir -p "$RES/node"
   cp -r "$tmp/x"/. "$RES/node/"
+  # Windows zips put node.exe at the archive root; normalize to the Unix bin/
+  # layout so bundled_bin("node/bin/node") resolves on every platform.
+  if [[ -f "$RES/node/node.exe" && ! -f "$RES/node/bin/node.exe" ]]; then
+    mkdir -p "$RES/node/bin"
+    mv "$RES/node/node.exe" "$RES/node/bin/node.exe"
+  fi
   rm -rf "$tmp"
 fi
 
 # --- ffmpeg / ffprobe ---------------------------------------------------------
-if [[ -e "$RES/ffmpeg" && -e "$RES/ffprobe" ]]; then
+# Windows CreateProcess resolves `.exe`; the extensionless Unix name is not an
+# executable there, so ship platform-native names (Rust bundled_bin probes both).
+ff_target() {
+  if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then echo "$RES/$1.exe"; else echo "$RES/$1"; fi
+}
+if [[ ( -e "$RES/ffmpeg" || -e "$RES/ffmpeg.exe" ) && ( -e "$RES/ffprobe" || -e "$RES/ffprobe.exe" ) ]]; then
   echo "==> ffmpeg/ffprobe already present"
 elif command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
   echo "==> ffmpeg/ffprobe: copying host binaries ($(ffmpeg -version | head -1))"
-  cp -f "$(command -v ffmpeg)" "$RES/ffmpeg"
-  cp -f "$(command -v ffprobe)" "$RES/ffprobe"
+  cp -f "$(command -v ffmpeg)" "$(ff_target ffmpeg)"
+  cp -f "$(command -v ffprobe)" "$(ff_target ffprobe)"
 else
   case "$OS-$ARCH" in
     Linux-x86_64)
@@ -134,9 +145,9 @@ else
   found_ff="$(find "$tmp/x" -type f \( -name 'ffmpeg' -o -name 'ffmpeg.exe' \) | head -1)"
   found_fp="$(find "$tmp/x" -type f \( -name 'ffprobe' -o -name 'ffprobe.exe' \) | head -1)"
   [[ -n "$found_ff" && -n "$found_fp" ]] || { echo "ffmpeg/ffprobe not found inside archive" >&2; exit 1; }
-  cp -f "$found_ff" "$RES/ffmpeg"
-  cp -f "$found_fp" "$RES/ffprobe"
-  chmod +x "$RES/ffmpeg" "$RES/ffprobe" 2>/dev/null || true
+  cp -f "$found_ff" "$(ff_target ffmpeg)"
+  cp -f "$found_fp" "$(ff_target ffprobe)"
+  chmod +x "$RES/ffmpeg" "$RES/ffprobe" "$RES/ffmpeg.exe" "$RES/ffprobe.exe" 2>/dev/null || true
   rm -rf "$tmp"
 fi
 
