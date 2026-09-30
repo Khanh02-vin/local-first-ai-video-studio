@@ -144,14 +144,13 @@ All installers ship as GitHub Release `v0.1.0` assets and are mirrored to the `g
 
 Google Drive direct links:
 
-| File (in `gdrive:LFaIVS-Releases/`) | Drive id |
-|---|---|
-| `Local-first AI Video Studio_0.1.0_amd64.AppImage` | `1C6caeoH5fV_-CGARWDzStg2KIDygfjDV` |
-| `Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi` | `10i00IPnu1EZrtk0ZoxhvtX5I47I9Ct31` |
-| `Local-first.AI.Video.Studio.zip` (portable Windows sources / legacy) | `1dFDcfVoJ-nQnhXrLn4DpLP51t4iEVyzN` |
-| `Local-first AI Video Studio Portable.zip` (stale) | `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm` |
+| File (in `gdrive:LFaIVS-Releases/`) | Drive id | Link |
+|---|---|---|
+| `Local-first AI Video Studio_0.1.0_amd64.AppImage` (Linux, feature-complete) | `1C6caeoH5fV_-CGARWDzStg2KIDygfjDV` | [open](https://drive.google.com/file/d/1C6caeoH5fV_-CGARWDzStg2KIDygfjDV/view?usp=drivesdk) |
+| `Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi` (Windows signed) | `10i00IPnu1EZrtk0ZoxhvtX5I47I9Ct31` | [open](https://drive.google.com/file/d/10i00IPnu1EZrtk0ZoxhvtX5I47I9Ct31/view?usp=drivesdk) |
+| `Local-first AI Video Studio Portable.zip` (Windows, feature-complete) | `10Xqo5-7eMNLtJCIFdYO-CL9k8iAOO-RK` | [open](https://drive.google.com/file/d/10Xqo5-7eMNLtJCIFdYO-CL9k8iAOO-RK/view?usp=drivesdk) |
 
-> **Stale-portable notice.** `Local-first AI Video Studio Portable.zip` (Drive id `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm`, md5 `1dc16a0c7c1fdc990642b9470b923130`) was produced at `c5f8dbb` — the commit *before* `da15097`. It does **not** contain the YouTube URL → highlight → MP4 feature and is kept here only because the replacement requires a green `windows-latest` job (billing-blocked; see below). The Linux AppImage linked from the same release **does** contain the feature end-to-end.
+> **Portable zip provenance.** `Local-first AI Video Studio Portable.zip` is now rebuilt from a green `windows-latest` job run `36600662949` (commit `c964d67`, after the `release.yml` bash-shell fix) and uploaded to Drive, replacing the stale `c5f8dbb` build (old Drive id `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm` is gone). It contains the YouTube URL → highlight → MP4 feature end-to-end: 1 394 094 080 bytes, 44 entries. The `windows` job previously failed only because the portable-zip assembly step had no `shell: bash` on `windows-latest` (default pwsh rejects `for exe in *.exe`); adding `shell: bash` resolved it without any code change. macOS `macos-latest` job also succeeded on the same run.
 
 ## GitHub Actions billing block (self-inflicted, not a code defect)
 
@@ -159,7 +158,7 @@ The public `ci.yml` test job and the `release.yml` `windows`/`macos` jobs run on
 
 > The job was not started because recent account payments have failed or your spending limit needs to be increased.
 
-The repository is private under a free (`plan: null`) account, so the `gh` token cannot reach `/user/settings/billing/actions` (returns `404 Not Found`). Only the account owner can lift this by resolving the failed payment / raising the Actions spending limit.
+The repo is now **public**, which removes the GitHub-hosted runner billing gate for `ubuntu-latest`, `windows-latest`, and `macos-latest`; the Windows portable zip above was built on the next dispatch after making that change. If the repo must stay private, restore the payment method / raise the Actions spending limit in *Settings → Billing & plans* — hosted runners will stay gated until then.
 
 What keeps working: the self-hosted `[self-hosted, self-vostro]` jobs (`lint-test`, `linux`, `publish`) — they report directly against the linux host and are how the Linux AppImage above was produced. This is also why `release.yml` was split so the `linux` job stages its AppImage to `~/lfavis-dist/linux/` and the `publish` job reads it from that shared dir instead of round-tripping through the GitHub artifact store.
 
