@@ -141,9 +141,11 @@ RAG backend (adapter-node server, LOCAL_FIRST_STATE_DIR=/tmp/rag-test-state):
 
 All installers ship as GitHub Release `v0.1.0` assets and are mirrored to the `gdrive:LFaIVS-Releases/` folder.
 
-- **Linux:** `Local-first AI Video Studio_0.1.0_amd64.AppImage` — 936 147 448 bytes, built by the `linux` job of run `36600662949` (`60b3ead`). The host `~/.local/bin/ffmpeg` that `fetch-bundled-assets.sh`'s host-copy branch picks up was replaced with system ffmpeg 8.0.1 (the johnvansickle static 7.0.2 there segfaults on HTTPS), so the image ships a working ffmpeg.
-- **macOS:** `Local-first AI Video Studio.zip` — 848 658 767 bytes, `.app` bundle from the same run (unsigned: right-click → Open on first launch).
-- **Windows:** `Local-first AI Video Studio_0.1.0_x64_en-US.msi` — 906 625 204 bytes (signed), and `Local-first AI Video Studio Portable.zip` — 1 394 094 080 bytes (unzip; double-click `local-first-ai-video-studio.exe` to run).
+- **Linux:** `Local-first AI Video Studio_0.1.0_amd64.AppImage` — 936 151 544 bytes, built by the `linux` job of run `36803798016` (`cc842ac`, 2026-10-01 — ships the customer stability/perf fixes). The host `~/.local/bin/ffmpeg` that `fetch-bundled-assets.sh`'s host-copy branch picks up was replaced with system ffmpeg 8.0.1 (the johnvansickle static 7.0.2 there segfaults on HTTPS), so the image ships a working ffmpeg.
+- **macOS:** `Local-first AI Video Studio.zip` — 848 659 888 bytes, `.app` bundle from the same run (unsigned: right-click → Open on first launch).
+- **Windows:** `Local-first AI Video Studio_0.1.0_x64_en-US.msi` — 906 649 780 bytes (signed), and `Local-first AI Video Studio Portable.zip` — 1 393 930 240 bytes (unzip; double-click `local-first-ai-video-studio.exe` to run).
+
+Run `36803798016` (`cc842ac`, 2026-10-01) built all four from green jobs (`lint-test`, `windows`, `macos`, `linux`); its `publish` job re-downloaded ~4.6 GB of artifacts and its `softprops/action-gh-release` step flaked mid-upload after deleting the previous assets, so the release refresh + Drive upload were completed manually from the same run's artifacts (Drive verified via API: same 4 ids, new content, `anyone:reader` intact; the portable was content-patched in place onto its existing id so previously sent links keep working). The CI `Verify bundled helper names (Windows)` step caught a real regression on the first dispatch (`cc842ac`'s predecessor `652a3f2` shipped a Windows node zip whose top-level dir was never stripped, so `node/bin/node.exe` was missing); fixed in `cc842ac`.
 
 Google Drive direct links (folder `gdrive:LFaIVS-Releases/`, all `anyone-with-link: reader`):
 
