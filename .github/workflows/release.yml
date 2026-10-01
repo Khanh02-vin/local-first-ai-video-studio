@@ -160,7 +160,14 @@ jobs:
           ROOT=../../../../..
           cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
           printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nAll engine helpers (node, ffmpeg, whisper models) are bundled — no Node.js required.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
-          tar -a -cf portable-windows.zip -C portable .
+          # windows-latest's Git Bash ships GNU tar: its `-a` only infers
+          # *compression* from the suffix, so `tar -a -cf x.zip` wrote an
+          # uncompressed TAR named .zip — unopenable by Windows Explorer.
+          # 7-Zip is preinstalled on the runner; -tzip makes a real zip.
+          cd portable
+          7z a -tzip -mx=3 ../portable-windows.zip . > /dev/null
+          cd ..
+          7z t portable-windows.zip > /dev/null   # fail the job on a corrupt archive
           ls -lh portable-windows.zip
       - uses: actions/upload-artifact@v4
         with:
