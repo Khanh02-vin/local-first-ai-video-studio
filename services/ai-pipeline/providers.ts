@@ -4,7 +4,9 @@ import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 
 export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript>; }
-export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]>; }
+/** choose() may receive window bounds (seconds) so callers control how a long transcript
+ *  is sliced per LLM call; omit them for the shared defaults. */
+export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; }
 
 export class OpenAITranscriptionProvider implements TranscriptionProvider {
   private readonly apiKey: string;
@@ -22,17 +24,74 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
   }
 }
 
-type LlmHighlightProposal = { start: number; end: number; wordIds: string[]; title: string; hook?: string; score: number; reason?: string };
+/** Shared output shape for both LLM providers: a wrapper object around the proposal
+ *  array so llama.cpp's json_object constrained decoding (object root required) and
+ *  Gemini's responseSchema can enforce the same structure. */
+export const HIGHLIGHT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    highlights: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          start: { type: "number" },
+          end: { type: "number" },
+          wordIds: { type: "array", items: { type: "string" } },
+          title: { type: "string" },
+          hook: { type: "string" },
+          score: { type: "number" },
+          reason: { type: "string" },
+        },
+        required: ["start", "end", "wordIds", "title", "score"],
+      },
+    },
+  },
+  required: ["highlights"],
+} as const;
+
+/** Gemini's responseSchema dialect uses uppercase OpenAPI-style type names. */
+const GEMINI_HIGHLIGHT_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    highlights: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          start: { type: "NUMBER" },
+          end: { type: "NUMBER" },
+          wordIds: { type: "ARRAY", items: { type: "STRING" } },
+          title: { type: "STRING" },
+          hook: { type: "STRING" },
+          score: { type: "NUMBER" },
+          reason: { type: "STRING" },
+        },
+        required: ["start", "end", "wordIds", "title", "score"],
+      },
+    },
+  },
+  required: ["highlights"],
+} as const;
+
+/** Unwrap the {"highlights":[...]} envelope (accepting a bare array for robustness). */
+export function extractHighlightProposals(value: unknown): Array<Omit<Highlight, "version" | "sourceArtifactId">> {
+  if (Array.isArray(value)) return value as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+  if (value && typeof value === "object" && Array.isArray((value as { highlights?: unknown }).highlights)) {
+    return (value as { highlights: Array<Omit<Highlight, "version" | "sourceArtifactId">> }).highlights;
+  }
+  throw new Error("LLM_HIGHLIGHT_SHAPE");
+}
 
 export class GeminiHighlightProvider implements HighlightProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly endpoint: string;
   constructor(apiKey: string, model = "gemini-2.0-flash", endpoint = "https://generativelanguage.googleapis.com/v1beta/models") { this.apiKey = apiKey; this.model = model; this.endpoint = endpoint; }
-  async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
+  async choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> {
     // Long videos exceed a single comfortable LLM context, so split the transcript into
     // windows, get per-window proposals, then merge and de-overlap into the final 3-5.
-    const windows = highlightWindows(input.transcript, 20 * 60, 5 * 60);
+    const windows = highlightWindows(input.transcript, input.windowSeconds ?? 180, input.overlapSeconds ?? 30);
     const perWindow: Highlight[][] = [];
     for (let i = 0; i < windows.length; i++) {
       const { from, to, window } = windows[i];
@@ -44,12 +103,14 @@ export class GeminiHighlightProvider implements HighlightProvider {
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
-    const prompt = `Return JSON array only. Choose up to 5 complete short-video highlights from this transcript window. Each item has start,end,title,hook,score,reason,wordIds, with times relative to the window start. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(transcript)}`;
-    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }), signal });
+    const prompt = `Return a JSON object {"highlights":[...]}. Choose up to 5 complete short-video highlights from this transcript window. Each item has start,end,title,hook,score,reason,wordIds, with times relative to the window start. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(transcript)}`;
+    // Structured output: the API guarantees a valid JSON body matching the schema,
+    // so no fence-stripping or truncation repair is needed on this path.
+    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal });
     if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
     const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
-    const parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")) as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+    const parsed = extractHighlightProposals(JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")));
     const highlights = parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end }));
     for (const item of highlights) if (item.end - item.start > transcript.duration) { item.end = item.start + Math.min(transcript.duration, Math.max(5, item.end - item.start)); }
     return highlights;
@@ -60,7 +121,7 @@ export class GeminiHighlightProvider implements HighlightProvider {
  *  exceeds a single LLM call. Windows are offset in seconds; each carries the original
  *  transcript-relative time so proposals can be shifted back to absolute timestamps.
  */
-export function highlightWindows(transcript: Transcript, windowSeconds = 20 * 60, overlapSeconds = 5 * 60): Array<{ from: number; to: number; window: Transcript }> {
+export function highlightWindows(transcript: Transcript, windowSeconds = 180, overlapSeconds = 30): Array<{ from: number; to: number; window: Transcript }> {
   const duration = transcript.duration;
   const windows: Array<{ from: number; to: number; window: Transcript }> = [];
   const step = Math.max(1, windowSeconds - overlapSeconds);
@@ -113,8 +174,8 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     if (!id) throw new Error("LLAMA_CPP_NO_MODEL_LOADED");
     this.modelId = id; return id;
   }
-  async choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> {
-    const windows = highlightWindows(input.transcript, 20 * 60, 5 * 60);
+  async choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> {
+    const windows = highlightWindows(input.transcript, input.windowSeconds ?? 180, input.overlapSeconds ?? 30);
     const perWindow: Highlight[][] = [];
     for (let i = 0; i < windows.length; i++) {
       const { from, window } = windows[i];
@@ -126,29 +187,30 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     const modelId = await this.resolvedModelId(signal);
-    const prompt = `Return a JSON array only. Choose up to 5 complete short-video highlights from this transcript window. Each item: {"start":number,"end":number,"wordIds":string[],"title":string,"hook":string,"score":0-100,"reason":string}. Times are relative to window start. Use only the supplied word IDs. Transcript: ${JSON.stringify(transcript)}`;
+    const prompt = `Return a JSON object with a "highlights" array. Choose up to 5 complete short-video highlights from this transcript window. Each item: {"start":number,"end":number,"wordIds":string[],"title":string,"hook":string,"score":0-100,"reason":string}. Times are relative to window start. Use only the supplied word IDs. Transcript: ${JSON.stringify(transcript)}`;
     // Local CPU inference can take minutes per window; give it room without letting a
     // hung server block forever.
     const timeout = AbortSignal.timeout(15 * 60_000);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, messages: [{ role: "user", content: prompt }] }), signal: combined });
+    // Constrained decoding: llama-server enforces the JSON schema, so the reply parses.
+    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object", schema: HIGHLIGHT_OUTPUT_SCHEMA }, messages: [{ role: "user", content: prompt }] }), signal: combined });
     if (!response.ok) {
       const body = await response.text().catch(() => "");
       throw new Error(`LLAMA_CPP_PROVIDER_${response.status}:${body.slice(0, 200)}`);
     }
     const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
     const text = raw.choices?.[0]?.message?.content ?? "";
-    // Local models may wrap the array in a code fence or truncate mid-generation
-    // (max_tokens); repair both cases instead of failing the whole analysis.
+    // Schema-constrained replies parse directly; the repair path stays as a safety net
+    // for older llama-server builds without response_format support.
     let parsed: Array<Omit<Highlight, "version" | "sourceArtifactId">>;
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
-    const start = fenced.indexOf("[");
+    const start = fenced.search(/[[{]/);
     if (start === -1) throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`);
     let candidate = fenced.slice(start);
-    try { parsed = JSON.parse(candidate); }
+    try { parsed = extractHighlightProposals(JSON.parse(candidate)); }
     catch {
       const repaired = repairTruncatedJsonArray(candidate.trimEnd());
-      try { parsed = JSON.parse(repaired); }
+      try { parsed = extractHighlightProposals(JSON.parse(repaired)); }
       catch { throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`); }
     }
     // Small local models sometimes emit probability-style scores (0.95) or >100;

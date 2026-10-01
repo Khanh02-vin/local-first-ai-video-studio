@@ -23,8 +23,10 @@ export type SemanticHighlightOptions = {
   limit?: number;
   minDuration?: number;
   maxDuration?: number;
-  minWindowDuration?: number;
-  maxWindowDuration?: number;
+  /** Transcript window length (seconds) handed to the LLM per call. */
+  windowSeconds?: number;
+  /** Overlap between consecutive windows (seconds). */
+  windowOverlapSeconds?: number;
 };
 
 export interface SemanticHighlightProvider {
@@ -110,8 +112,8 @@ export async function generateSemanticHighlights(
     limit: options.limit ?? 5,
     minDuration: options.minDuration ?? 10,
     maxDuration: options.maxDuration ?? 90,
-    minWindowDuration: options.minWindowDuration ?? 60,
-    maxWindowDuration: options.maxWindowDuration ?? 180,
+    windowSeconds: options.windowSeconds ?? 180,
+    windowOverlapSeconds: options.windowOverlapSeconds ?? 30,
   };
 
   const result = await provider.generate({ transcript, options: mergedOptions });
@@ -162,12 +164,12 @@ export function createMockSemanticProvider(
  * SemanticHighlightProvider shape expected by the local-first pipeline.
  */
 export class SemanticProviderAdapter implements SemanticHighlightProvider {
-  private readonly inner: { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> };
+  private readonly inner: { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> };
   private readonly name: string;
-  constructor(inner: { choose(input: { transcript: Transcript; signal?: AbortSignal }): Promise<Highlight[]> }, name = "semantic-llm") { this.inner = inner; this.name = name; }
+  constructor(inner: { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> }, name = "semantic-llm") { this.inner = inner; this.name = name; }
 
   async generate(input: { transcript: Transcript; options?: SemanticHighlightOptions; signal?: AbortSignal }): Promise<SemanticHighlightResult> {
-    const highlights = await this.inner.choose({ transcript: input.transcript, signal: input.signal });
+    const highlights = await this.inner.choose({ transcript: input.transcript, signal: input.signal, windowSeconds: input.options?.windowSeconds, overlapSeconds: input.options?.windowOverlapSeconds });
     return { highlights, provider: this.name, rawProposals: highlights.map((h) => ({ start: h.start, end: h.end, wordIds: h.wordIds, title: h.title, hook: h.hook, score: h.score, reason: h.reason })) };
   }
 }

@@ -46,7 +46,8 @@ Deferred until measured demand:
 - `Collection` canonical contract v1 (`packages/contracts/collection.ts`): items reference highlights/renderPlans/artifacts, contiguous positions starting at 0, no duplicate references, state ∈ {proposed, approved, rejected}, exported from barrel.
 - Tauri 2 installer bundles: `.deb`, `.rpm`, and `.AppImage` in `apps/desktop/src-tauri/target/release/bundle/` (Node, ffmpeg, ffprobe, and all TS contracts/adapters/services bundled as app resources).
 - `scripts/run-local-demo.ts`: one-command local pipeline (probe → extract audio → Whisper → highlights → 9:16 MP4).
-- Local LLM highlight strategy (`HIGHLIGHT_STRATEGY=semantic-local`): `llama-server` (bundled linux x64 binary) + Qwen2.5-3B Q4 GGUF downloaded on demand with SHA-256 verification; Tauri spawns/stops the server (`start_local_llm`/`stop_local_llm`), `LlamaCppHighlightProvider` calls its OpenAI-compatible API per 20-minute transcript window (map-reduce). No API key, no network egress. See `docs/local-llm.md`.
+- Local LLM highlight strategy (`HIGHLIGHT_STRATEGY=semantic-local`): `llama-server` (bundled linux x64 binary) + Qwen2.5-3B Q4 GGUF downloaded on demand with SHA-256 verification; Tauri spawns/stops the server (`start_local_llm`/`stop_local_llm`), `LlamaCppHighlightProvider` calls its OpenAI-compatible API per transcript window (map-reduce). No API key, no network egress. See `docs/local-llm.md`.
+- Real LLM windowing + structured output (AI pipeline hardening): both `GeminiHighlightProvider` and `LlamaCppHighlightProvider` slice transcripts into 180s windows with 30s overlap (configurable via `windowSeconds`/`windowOverlapSeconds`, forwarded from `generateSemanticHighlights` through `SemanticProviderAdapter`) — long videos no longer overflow a single small-model prompt; per-window proposals merge and de-overlap via `mergeWindowHighlights`. Both providers now request schema-enforced JSON (`response_format: {type:"json_object", schema}` on llama-server, `responseMimeType:"application/json"` + `responseSchema` on Gemini), so replies parse without fence-stripping; `repairTruncatedJsonArray` remains as the fallback for llama-server builds without constrained decoding.
 - Whisper models `tiny`/`base` bundled in Tauri resources and copied to `~/.cache/whisper` on startup (`ensure_bundled_whisper_model`) — no model download required on a fresh machine.
 - Draggable timeline editor (in/out trim handles, range drag, keyboard slider) — replaces the HTML5 placeholder; edits still flow through `editor-core` `updateRange()` so contract validation stays the single source of truth.
 - YouTube Studio RAG backend (`apps/web/src/routes/api/rag/+server.ts`, dispatching rest-route `apps/web/src/routes/api/[...rest]/+server.ts`): playlist queue, manual segment ingest, TF-IDF timestamp search with deterministic synthesis — JSON files under `<state>/youtube`, strict validation, no network. YouTube Studio rail entry un-hidden; web app builds `adapter-static` for the desktop UI and `adapter-node` (`build-node`) for the RAG sidecar.
@@ -69,7 +70,7 @@ idempotency gap tests: ok (all 6 gaps fixed)
 long-video map-reduce tests: ok
 json repair tests: ok
 youtube transcript tests: ok
-command wiring tests: ok (29 UI invocations all registered)
+command wiring tests: ok (30 UI invocations all registered)
 
 cd apps/desktop/src-tauri && cargo check
 Finished `dev` profile

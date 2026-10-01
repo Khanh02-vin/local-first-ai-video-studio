@@ -111,3 +111,27 @@ const limitedHighlights = await generateSemanticHighlights(transcript, limitProv
 assert.equal(limitedHighlights.length, 3);
 
 console.log("semantic highlight tests: ok");
+// Adapter forwards window options to the inner HighlightProvider (real windowing wiring).
+import { SemanticProviderAdapter as Adapter } from "../../services/ai-pipeline/semantic.ts";
+let received: { windowSeconds?: number; overlapSeconds?: number } | null = null;
+const spyProvider = {
+  async choose(input: { transcript: Transcript; windowSeconds?: number; overlapSeconds?: number }) {
+    received = { windowSeconds: input.windowSeconds, overlapSeconds: input.overlapSeconds };
+    return [];
+  },
+};
+const adapter = new Adapter(spyProvider, "spy");
+await adapter.generate({ transcript, options: { windowSeconds: 120, windowOverlapSeconds: 15 } });
+assert.deepEqual(received, { windowSeconds: 120, overlapSeconds: 15 });
+// Omitted options are forwarded as undefined; the 180/30 defaults live in the providers.
+received = null;
+await adapter.generate({ transcript });
+assert.deepEqual(received, { windowSeconds: undefined, overlapSeconds: undefined });
+
+// Provider-side defaults: highlightWindows slices a long transcript at 180s/30s.
+import { highlightWindows } from "../../services/ai-pipeline/providers.ts";
+const defaultWindows = highlightWindows(makeTranscript(600));
+assert.ok(defaultWindows.length >= 4, `expected ≥4 windows for 600s at 180s/30s, got ${defaultWindows.length}`);
+assert.ok(defaultWindows.every((w) => w.to - w.from <= 180), "windows never exceed 180s");
+
+console.log("semantic tests: ok");
