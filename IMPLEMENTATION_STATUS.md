@@ -51,6 +51,7 @@ Deferred until measured demand:
 - Whisper models `tiny`/`base` bundled in Tauri resources and copied to `~/.cache/whisper` on startup (`ensure_bundled_whisper_model`) — no model download required on a fresh machine.
 - Draggable timeline editor (in/out trim handles, range drag, keyboard slider) — replaces the HTML5 placeholder; edits still flow through `editor-core` `updateRange()` so contract validation stays the single source of truth.
 - YouTube Studio RAG backend (`apps/web/src/routes/api/rag/+server.ts`, dispatching rest-route `apps/web/src/routes/api/[...rest]/+server.ts`): playlist queue, manual segment ingest, TF-IDF timestamp search with deterministic synthesis — JSON files under `<state>/youtube`, strict validation, no network. YouTube Studio rail entry un-hidden; web app builds `adapter-static` for the desktop UI and `adapter-node` (`build-node`) for the RAG sidecar.
+- Hybrid RAG retrieval + local-LLM answers (YouTube Studio): ingest embeds each transcript segment via the bundled llama-server `/v1/embeddings` (vectors stored in `<state>/youtube/embeddings.json`); query ranks by cosine top-k when the LLM is reachable and falls back to the existing TF-IDF path otherwise (dims mismatch from a model swap also forces the fallback). Answer synthesis feeds the top excerpts to the local Qwen (`/v1/chat/completions`) and falls back to the deterministic excerpt string on any error/timeout; `synthesize:false` skips the LLM. The sidecar learns the LLM URL from `LOCAL_LLM_BASE_URL` (set by `ensure_rag_server`, default `127.0.0.1:8080`). `ensure_llama_server` now spawns with `--embeddings --pooling mean` — Qwen chat GGUFs default to pooling `none`, which the embeddings endpoint rejects; forcing mean pooling lets one server both embed and chat (verified against llama.cpp b11160: embeddings 896-dim, chat unaffected, related/unrelated cosine margin ~0.11 — no extra embedding model needed).
 - RAG sidecar inside the desktop app: dual-adapter build (`WEB_ADAPTER=node` → `build-node`, bundled as a resource) + Tauri command `rag_server_url` spawns the sidecar on `127.0.0.1:4733` (bundled node, stopped on exit) + `tauri-plugin-http` so the static webview reaches it despite webview CSP. Fixed a runtime panic where `LlamaState` and `RagState` were the same underlying managed type (`Arc<Mutex<Option<u32>>>`) — `RagState` is now a distinct newtype.
 - Fast YouTube clipping (URL → highlight → preview → export): paste a YouTube URL on the Studio home → `start_youtube_analysis` validates the host and reads duration metadata via `yt-dlp --skip-download` (~1s) → `scripts/analyze-youtube.ts` builds the transcript contract from captions (`scripts/yt-crawler.py --video`, no Whisper, no download) → existing heuristic/semantic selector emits highlights → the step-4 iframe seeks the clip (`start`/`end`) → export resolves fresh CDN URLs at render time (`resolve_stream_url`) and range-requests only the selected section before the usual 9:16 re-encode.
 
@@ -69,6 +70,7 @@ semantic highlight tests: ok
 idempotency gap tests: ok (all 6 gaps fixed)
 long-video map-reduce tests: ok
 json repair tests: ok
+rag hybrid tests: ok
 youtube transcript tests: ok
 command wiring tests: ok (30 UI invocations all registered)
 
@@ -79,7 +81,7 @@ test result: ok. 5 passed; 0 failed
 
 cd apps/web
 npm run check
-svelte-check found 0 errors and 1 warning (pre-existing slot deprecation in layout)
+svelte-check found 0 errors and 3 warnings (pre-existing: slot deprecation in layout, implicit-close + a11y in Studio/Youtube pages)
 npm run build
 built successfully
 

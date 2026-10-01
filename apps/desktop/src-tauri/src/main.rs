@@ -206,6 +206,11 @@ fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHa
         .arg("--host").arg("127.0.0.1")
         .arg("--ctx-size").arg("4096")
         .arg("--parallel").arg("2")
+        // --pooling mean: Qwen chat GGUFs default to pooling "none", which the
+        // OpenAI-compatible /v1/embeddings endpoint rejects (400/501). Forcing
+        // mean pooling lets the same server embed RAG segments and still chat.
+        .arg("--embeddings")
+        .arg("--pooling").arg("mean")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let spawned = cmd.spawn().map_err(|e| format!("LLAMA_SPAWN:{e}"))?;
@@ -279,11 +284,15 @@ fn ensure_rag_server(state: &RagState, app: &tauri::AppHandle) -> Result<String,
     let base = format!("http://127.0.0.1:{RAG_PORT}");
     if rag_healthy(RAG_PORT) { return Ok(base); }
     let entry = rag_entry(app)?;
+    // Point the sidecar at the local LLM so ingest/query can use embeddings +
+    // answer synthesis; the sidecar falls back to TF-IDF when it is not running.
+    let llama_url = runtime_env().get("LOCAL_LLM_BASE_URL").cloned().filter(|u| !u.is_empty()).unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let mut cmd = tool(node_bin(app));
     cmd.arg(&entry)
         .env("PORT", RAG_PORT.to_string())
         .env("HOST", "127.0.0.1")
         .env("LOCAL_FIRST_STATE_DIR", state_dir().to_string_lossy().into_owned())
+        .env("LOCAL_LLM_BASE_URL", llama_url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let spawned = cmd.spawn().map_err(|e| format!("RAG_SPAWN:{e}"))?;
