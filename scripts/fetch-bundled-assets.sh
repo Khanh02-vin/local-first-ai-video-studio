@@ -76,6 +76,12 @@ else
   if [[ "$NODE_PKG" == "zip" ]]; then
     mkdir -p "$tmp/x"
     extract_zip "$tmp/node.pkg" "$tmp/x"
+    # Node zips nest everything under node-vX.Y.Z-win-x64/ — strip that level
+    # (the tarball branch does the same via --strip-components=1) or
+    # resources/node/node.exe never exists and the bin/ normalization below
+    # silently does nothing (CI verify caught this on 2026-10-01).
+    inner="$(find "$tmp/x" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    if [[ -n "$inner" ]]; then cp -r "$inner"/. "$tmp/x/"; rm -rf "$inner"; fi
   else
     mkdir -p "$tmp/x"
     tar xf "$tmp/node.pkg" -C "$tmp/x" --strip-components=1
