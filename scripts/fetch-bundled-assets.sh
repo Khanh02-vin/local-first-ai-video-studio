@@ -175,8 +175,13 @@ for model in $WHISPER_MODELS; do
   curl -L --fail --retry 3 -o "$final" "$url"
 done
 
-# --- llama.cpp binaries (committed; fetched only if missing) -------------------
-if [[ -x "$RES/llama/llama-server" || -f "$RES/llama/llama-server.exe" ]]; then
+# --- llama.cpp binaries (Linux binaries committed to git; fetched elsewhere) ---
+# Skip only on Linux, where the committed llama-server IS the right binary. On
+# macOS the -x test on that committed Linux ELF would wrongly skip and ship a
+# non-runnable binary; on Windows the exec bit is not preserved (core.filemode)
+# so the old check only passed by accident. Non-Linux therefore always fetches
+# (hosted runners are fresh checkouts anyway).
+if [[ "$OS" == "Linux" && -x "$RES/llama/llama-server" ]]; then
   echo "==> llama.cpp binaries already present"
 else
   case "$OS" in

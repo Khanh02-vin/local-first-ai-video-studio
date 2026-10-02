@@ -122,8 +122,10 @@ jobs:
           # Guards the customer build: bundled_bin probes node/bin/node.exe,
           # ffmpeg.exe and ffprobe.exe on Windows — a layout drift here shipped
           # a portable whose analysis/RAG helpers silently fell back to PATH.
+          # llama-server.exe guards the portable/MSI semantic-local LLM (the
+          # committed llama-server is a Linux ELF; only fetch produces .exe).
           RES=apps/desktop/src-tauri/resources
-          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe; do
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe llama/llama-server.exe; do
             if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
           done
           echo "all bundled helpers present"
@@ -157,9 +159,15 @@ jobs:
             done
           done
           cp -r "$RES/models" portable/models
-          # llama-server binaries (fetched by fetch-bundled-assets) + RAG sidecar;
-          # without these the portable has no semantic-local LLM / YouTube Studio RAG.
-          cp -r "$RES/llama" portable/llama
+          # llama-server for Windows: resources/llama also holds the committed
+          # Linux ELF + .so symlinks, which `cp -r` cannot materialize on
+          # Windows (symlink creation fails) — copy only the runnable files.
+          [[ -f "$RES/llama/llama-server.exe" ]] || { echo "missing bundled helper: resources/llama/llama-server.exe" >&2; exit 1; }
+          mkdir -p portable/llama
+          cp "$RES/llama/"*.exe portable/llama/
+          for dll in "$RES/llama/"*.dll; do [[ -f "$dll" ]] && cp "$dll" portable/llama/; done
+          # RAG sidecar (build-node is gitignored; beforeBuildCommand built it
+          # during the MSI build above) — without it YouTube Studio RAG is dead.
           ROOT=../../../../..
           cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
           cp -r "$ROOT/apps/web/build-node" portable/build-node

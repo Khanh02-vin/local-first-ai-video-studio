@@ -171,9 +171,13 @@ fn whisper_command() -> String {
     "whisper".into()
 }
 type LlamaState = Arc<Mutex<Option<u32>>>; // pid of the detached llama-server, if running
-/// Finds `llama-server[.exe]` inside `dir` (state llama/, bundled resources, …).
+/// Finds the platform's llama-server inside `dir` (state llama/, bundled resources, …).
+/// Windows must probe only `.exe`: the git-committed `llama-server` is a Linux ELF
+/// and picking it would spawn an unrunnable binary.
 fn existing_llama(dir: PathBuf) -> Option<PathBuf> {
-    ["llama-server", "llama-server.exe"].iter().find_map(|name| { let candidate = dir.join(name); if candidate.is_file() { Some(candidate) } else { None } })
+    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    let candidate = dir.join(name);
+    if candidate.is_file() { Some(candidate) } else { None }
 }
 fn llama_binary(resource_dir: Option<PathBuf>) -> PathBuf {
     if let Ok(path) = std::env::var("LOCAL_LLM_BINARY") { if Path::new(&path).is_file() { return PathBuf::from(path); } }
