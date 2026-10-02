@@ -171,14 +171,22 @@ fn whisper_command() -> String {
     "whisper".into()
 }
 type LlamaState = Arc<Mutex<Option<u32>>>; // pid of the detached llama-server, if running
-fn llama_binary() -> PathBuf {
+/// Finds `llama-server[.exe]` inside `dir` (state llama/, bundled resources, …).
+fn existing_llama(dir: PathBuf) -> Option<PathBuf> {
+    ["llama-server", "llama-server.exe"].iter().find_map(|name| { let candidate = dir.join(name); if candidate.is_file() { Some(candidate) } else { None } })
+}
+fn llama_binary(resource_dir: Option<PathBuf>) -> PathBuf {
     if let Ok(path) = std::env::var("LOCAL_LLM_BINARY") { if Path::new(&path).is_file() { return PathBuf::from(path); } }
     if let Ok(state) = std::env::var("LOCAL_FIRST_STATE_DIR") {
-        let candidate = Path::new(&state).join("llama/llama-server");
-        if candidate.is_file() { return candidate; }
+        if let Some(candidate) = existing_llama(Path::new(&state).join("llama")) { return candidate; }
     }
-    let project_resource = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/llama/llama-server");
-    if project_resource.is_file() { return project_resource; }
+    // Packaged builds (deb/AppImage/MSI/portable) ship llama-server under
+    // <resources>/llama via tauri bundle.resources; probe it BEFORE the baked
+    // dev-tree path, which is meaningless on a customer machine.
+    if let Some(dir) = resource_dir {
+        if let Some(candidate) = existing_llama(dir.join("llama")) { return candidate; }
+    }
+    if let Some(candidate) = existing_llama(Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/llama")) { return candidate; }
     PathBuf::from("llama-server")
 }
 fn local_llm_model_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>, model: &str) -> Option<PathBuf> {
@@ -197,7 +205,7 @@ fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHa
     if tool("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &health_url]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200").unwrap_or(false) {
         return Ok(());
     }
-    let binary = llama_binary();
+    let binary = llama_binary(app.path().resource_dir().ok());
     let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
     let model_path = local_llm_model_path(app, &model).ok_or_else(|| format!("LLAMA_MODEL_MISSING:{model}"))?;
     let mut cmd = tool(&binary);

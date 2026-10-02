@@ -5,7 +5,7 @@
   "identifier": "com.localfirst.aivideostudio",
   "build": {
     "beforeDevCommand": "cd ../web && npm run dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "cd ../web && npm ci && npm run build",
+    "beforeBuildCommand": "cd ../web && npm ci && npm run build && npm run build:node",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/build"
   },
@@ -42,9 +42,11 @@
       "../../../adapters": "adapters",
       "../../../packages": "packages",
       "../../../services": "services",
+      "../../web/build-node": "build-node",
       "./resources/node": "node",
       "./resources/ffmpeg*": "",
       "./resources/ffprobe*": "",
+      "./resources/llama": "llama",
       "./resources/models": "models",
       "./resources/models/llama": "models/llama"
     },

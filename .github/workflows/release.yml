@@ -157,8 +157,12 @@ jobs:
             done
           done
           cp -r "$RES/models" portable/models
+          # llama-server binaries (fetched by fetch-bundled-assets) + RAG sidecar;
+          # without these the portable has no semantic-local LLM / YouTube Studio RAG.
+          cp -r "$RES/llama" portable/llama
           ROOT=../../../../..
           cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
+          cp -r "$ROOT/apps/web/build-node" portable/build-node
           printf "Local-first AI Video Studio - Portable\r\n\r\nDouble-click local-first-ai-video-studio.exe to run. No install needed.\r\nAll engine helpers (node, ffmpeg, whisper models) are bundled — no Node.js required.\r\nFirst run: open Settings -> Setup Whisper (one time).\r\n" > portable/README.txt
           # windows-latest's Git Bash ships GNU tar: its `-a` only infers
           # *compression* from the suffix, so `tar -a -cf x.zip` wrote an
