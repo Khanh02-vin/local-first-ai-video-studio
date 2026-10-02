@@ -26,7 +26,9 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
 
 /** Shared output shape for both LLM providers: a wrapper object around the proposal
  *  array so llama.cpp's json_object constrained decoding (object root required) and
- *  Gemini's responseSchema can enforce the same structure. */
+ *  Gemini's responseSchema can enforce the same structure. Proposals reference
+ *  inclusive word indices (from/to), never word ids or timestamps — the server
+ *  re-derives both, keeping prompts and completions small. */
 export const HIGHLIGHT_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -35,15 +37,13 @@ export const HIGHLIGHT_OUTPUT_SCHEMA = {
       items: {
         type: "object",
         properties: {
-          start: { type: "number" },
-          end: { type: "number" },
-          wordIds: { type: "array", items: { type: "string" } },
+          from: { type: "integer" },
+          to: { type: "integer" },
           title: { type: "string" },
-          hook: { type: "string" },
           score: { type: "number" },
           reason: { type: "string" },
         },
-        required: ["start", "end", "wordIds", "title", "score"],
+        required: ["from", "to", "title", "score"],
       },
     },
   },
@@ -59,15 +59,13 @@ const GEMINI_HIGHLIGHT_SCHEMA = {
       items: {
         type: "OBJECT",
         properties: {
-          start: { type: "NUMBER" },
-          end: { type: "NUMBER" },
-          wordIds: { type: "ARRAY", items: { type: "STRING" } },
+          from: { type: "INTEGER" },
+          to: { type: "INTEGER" },
           title: { type: "STRING" },
-          hook: { type: "STRING" },
           score: { type: "NUMBER" },
           reason: { type: "STRING" },
         },
-        required: ["start", "end", "wordIds", "title", "score"],
+        required: ["from", "to", "title", "score"],
       },
     },
   },
@@ -75,12 +73,44 @@ const GEMINI_HIGHLIGHT_SCHEMA = {
 } as const;
 
 /** Unwrap the {"highlights":[...]} envelope (accepting a bare array for robustness). */
-export function extractHighlightProposals(value: unknown): Array<Omit<Highlight, "version" | "sourceArtifactId">> {
-  if (Array.isArray(value)) return value as Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+export function extractHighlightProposals(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) return value as Array<Record<string, unknown>>;
   if (value && typeof value === "object" && Array.isArray((value as { highlights?: unknown }).highlights)) {
-    return (value as { highlights: Array<Omit<Highlight, "version" | "sourceArtifactId">> }).highlights;
+    return (value as { highlights: Array<Record<string, unknown>> }).highlights;
   }
   throw new Error("LLM_HIGHLIGHT_SHAPE");
+}
+
+/** Compact transcript rendering: one "wordIndex [start-end] text" line per word.
+ *  A full word-object JSON prompt costs ~4k tokens for a 96s clip; these lines
+ *  cost ~6x less, which is what lets small local models (and the production
+ *  llama-server context) handle a 180s window at all. */
+export function highlightPrompt(transcript: Transcript): string {
+  const lines = transcript.words.map((word, index) => `${index} [${word.start.toFixed(1)}-${word.end.toFixed(1)}] ${word.text}`);
+  return `Choose up to 5 complete short-video highlights from this transcript. Lines are "wordIndex [starts-end] text". Reply with JSON {"highlights":[{"from":int,"to":int,"title":string,"score":0-100,"reason":string}]} where from/to are inclusive word indices spanning each highlight. Pick self-contained, interesting moments — not greetings or filler. Transcript:\n${lines.join("\n")}`;
+}
+
+/** Maps word-index proposals back to contract highlights: times and wordIds are
+ *  re-derived from the transcript, out-of-range indices are dropped, and scores
+ *  that arrive as probabilities (0..1) are rescaled to 0..100. */
+export function mapWordRangeProposals(transcript: Transcript, parsed: Array<Record<string, unknown>>): Highlight[] {
+  const out: Highlight[] = [];
+  for (const item of parsed) {
+    const from = Math.trunc(Number(item.from));
+    const to = Math.trunc(Number(item.to));
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to < from || to >= transcript.words.length) continue;
+    const slice = transcript.words.slice(from, to + 1);
+    const rawScore = Number(item.score);
+    const score = Number.isFinite(rawScore) ? (rawScore <= 1 ? Math.round(rawScore * 100) : Math.round(rawScore)) : 0;
+    out.push({
+      version: 1, id: `h-${out.length}`, sourceArtifactId: transcript.sourceArtifactId,
+      start: slice[0].start, end: slice.at(-1)!.end, wordIds: slice.map((word) => word.id),
+      title: (typeof item.title === "string" ? item.title : "").trim().slice(0, 120) || "Highlight",
+      score: Math.max(0, Math.min(100, score)),
+      reason: typeof item.reason === "string" ? item.reason.trim().slice(0, 500) : undefined,
+    });
+  }
+  return out;
 }
 
 export class GeminiHighlightProvider implements HighlightProvider {
@@ -94,7 +124,7 @@ export class GeminiHighlightProvider implements HighlightProvider {
     const windows = highlightWindows(input.transcript, input.windowSeconds ?? 180, input.overlapSeconds ?? 30);
     const perWindow: Highlight[][] = [];
     for (let i = 0; i < windows.length; i++) {
-      const { from, to, window } = windows[i];
+      const { from, window } = windows[i];
       const local = await this.chooseTranscript(window, input.signal);
       const shifted = local.map((item, index) => ({ ...item, id: `h-${i}-${index}`, start: from + item.start, end: from + item.end }));
       perWindow.push(shifted);
@@ -103,17 +133,14 @@ export class GeminiHighlightProvider implements HighlightProvider {
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
-    const prompt = `Return a JSON object {"highlights":[...]}. Choose up to 5 complete short-video highlights from this transcript window. Each item has start,end,title,hook,score,reason,wordIds, with times relative to the window start. Use only the supplied word IDs and timestamps. Transcript: ${JSON.stringify(transcript)}`;
+    const prompt = highlightPrompt(transcript);
     // Structured output: the API guarantees a valid JSON body matching the schema,
     // so no fence-stripping or truncation repair is needed on this path.
     const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal });
     if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
     const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
-    const parsed = extractHighlightProposals(JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")));
-    const highlights = parsed.map((item, index) => ({ ...item, version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end }));
-    for (const item of highlights) if (item.end - item.start > transcript.duration) { item.end = item.start + Math.min(transcript.duration, Math.max(5, item.end - item.start)); }
-    return highlights;
+    return mapWordRangeProposals(transcript, extractHighlightProposals(JSON.parse(text.replace(/^```json\s*|\s*```$/g, ""))));
   }
 }
 
@@ -169,8 +196,9 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     if (this.modelId) return this.modelId;
     const response = await fetch(`${this.baseUrl}/v1/models`, { signal });
     if (!response.ok) throw new Error(`LLAMA_CPP_MODELS_${response.status}`);
-    const raw = await response.json() as { data?: Array<{ id?: string }> };
-    const id = raw.data?.[0]?.id;
+    // OpenAI shape is data[0].id; llama-server also serves models[0].name.
+    const raw = await response.json() as { data?: Array<{ id?: string }>; models?: Array<{ name?: string }> };
+    const id = raw.data?.[0]?.id ?? raw.models?.[0]?.name;
     if (!id) throw new Error("LLAMA_CPP_NO_MODEL_LOADED");
     this.modelId = id; return id;
   }
@@ -187,7 +215,7 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     const modelId = await this.resolvedModelId(signal);
-    const prompt = `Return a JSON object with a "highlights" array. Choose up to 5 complete short-video highlights from this transcript window. Each item: {"start":number,"end":number,"wordIds":string[],"title":string,"hook":string,"score":0-100,"reason":string}. Times are relative to window start. Use only the supplied word IDs. Transcript: ${JSON.stringify(transcript)}`;
+    const prompt = highlightPrompt(transcript);
     // Local CPU inference can take minutes per window; give it room without letting a
     // hung server block forever.
     const timeout = AbortSignal.timeout(15 * 60_000);
@@ -202,7 +230,7 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     const text = raw.choices?.[0]?.message?.content ?? "";
     // Schema-constrained replies parse directly; the repair path stays as a safety net
     // for older llama-server builds without response_format support.
-    let parsed: Array<Omit<Highlight, "version" | "sourceArtifactId">>;
+    let parsed: Array<Record<string, unknown>>;
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
     const start = fenced.search(/[[{]/);
     if (start === -1) throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`);
@@ -213,15 +241,7 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
       try { parsed = extractHighlightProposals(JSON.parse(repaired)); }
       catch { throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`); }
     }
-    // Small local models sometimes emit probability-style scores (0.95) or >100;
-    // normalize so the shared contract (0..100) always holds.
-    return parsed
-      .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.end > item.start)
-      .map((item, index) => {
-        const rawScore = Number(item.score);
-        const score = Number.isFinite(rawScore) ? (rawScore <= 1 ? Math.round(rawScore * 100) : Math.round(rawScore)) : 0;
-        return { ...item, score: Math.max(0, Math.min(100, score)), title: (item.title || "").trim().slice(0, 120) || "Highlight", version: 1 as const, id: `h-${index}`, sourceArtifactId: transcript.sourceArtifactId, start: item.start, end: item.end };
-      });
+    return mapWordRangeProposals(transcript, parsed);
   }
 }
 

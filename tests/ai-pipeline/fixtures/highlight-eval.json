@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "note": "Curated highlight-eval fixtures. Segments are the transcript source of truth; the harness expands each into contract-valid words. Expected ranges are human picks. Cases are designed to discriminate: some align hook keywords with the true highlight (heuristic-friendly), others carry the key insight without any hook word (LLM-friendly). Real transcripts can be dropped in later using the same schema.",
+  "iouThreshold": 0.3,
+  "cases": [
+    {
+      "id": "tutorial-export",
+      "note": "Hook keywords sit in the true highlight — heuristic-friendly.",
+      "segments": [
+        { "start": 0, "end": 8, "text": "Welcome back to the channel. Today we are editing a short clip." },
+        { "start": 8, "end": 18, "text": "First, open your project and find the sequence you want to share." },
+        { "start": 18, "end": 28, "text": "Then choose the in and out points on the timeline." },
+        { "start": 28, "end": 40, "text": "The most common mistake is exporting before you check the audio levels." },
+        { "start": 40, "end": 50, "text": "Always listen through with headphones at least once." },
+        { "start": 50, "end": 62, "text": "Next, open the export dialog and pick the social preset." },
+        { "start": 62, "end": 74, "text": "The best preset for shorts is 1080 by 1920 at a reasonable bitrate." },
+        { "start": 74, "end": 86, "text": "If the file is too big, lower the bitrate before anything else." },
+        { "start": 86, "end": 96, "text": "That is it. Go export your clip and post it." }
+      ],
+      "expected": [
+        { "start": 28, "end": 40, "title": "Check audio before exporting" }
+      ]
+    },
+    {
+      "id": "podcast-revenue",
+      "note": "Key insight has no hook word; 'how'/'key' segments are distractors — LLM-friendly.",
+      "segments": [
+        { "start": 0, "end": 10, "text": "So I was talking to a founder last week about their launch." },
+        { "start": 10, "end": 22, "text": "They had this beautiful product and zero attention on it." },
+        { "start": 22, "end": 34, "text": "How do you even start building an audience from nothing?" },
+        { "start": 34, "end": 48, "text": "I told him something he did not want to hear that day." },
+        { "start": 48, "end": 64, "text": "Revenue follows attention, not the other way around." },
+        { "start": 64, "end": 76, "text": "So he started posting his build in public every morning." },
+        { "start": 76, "end": 88, "text": "The key is showing up every single day for a whole year." }
+      ],
+      "expected": [
+        { "start": 48, "end": 64, "title": "Revenue follows attention" }
+      ]
+    },
+    {
+      "id": "cooking-pasta",
+      "note": "Two true highlights; one carries no hook word — tests multi-highlight recall.",
+      "segments": [
+        { "start": 0, "end": 9, "text": "Today we are making the simplest pasta of your life." },
+        { "start": 9, "end": 20, "text": "Boil more water than you think you need. That is the first rule." },
+        { "start": 20, "end": 32, "text": "Salt the water until it tastes like a mild broth, not the sea." },
+        { "start": 32, "end": 44, "text": "Save a cup of the pasta water before you drain anything." },
+        { "start": 44, "end": 56, "text": "Why does that starchy water matter so much?" },
+        { "start": 56, "end": 68, "text": "It emulsifies the sauce and makes it cling to every strand." },
+        { "start": 68, "end": 80, "text": "The best time to add the sauce is right off the heat." },
+        { "start": 80, "end": 92, "text": "Finish with olive oil, pepper, and a ridiculous amount of cheese." }
+      ],
+      "expected": [
+        { "start": 32, "end": 44, "title": "Reserve pasta water" },
+        { "start": 68, "end": 80, "title": "Sauce off the heat" }
+      ]
+    },
+    {
+      "id": "gaming-review",
+      "note": "Expected range spans two segments — tests boundary-tolerant matching.",
+      "segments": [
+        { "start": 0, "end": 10, "text": "Alright, let us break down that last team fight." },
+        { "start": 10, "end": 22, "text": "He peaked the same angle three times. Never do that." },
+        { "start": 22, "end": 34, "text": "The important thing here is the timing on the ultimate." },
+        { "start": 34, "end": 46, "text": "He used it one second too early and the whole play died." },
+        { "start": 46, "end": 58, "text": "How do you practice that timing? Go into the training range." },
+        { "start": 58, "end": 70, "text": "Spend ten minutes a day on cooldown tracking and it compounds." },
+        { "start": 70, "end": 82, "text": "The best players are not the fastest, they are the most patient." },
+        { "start": 82, "end": 92, "text": "That is the review. Go fix your peaks." }
+      ],
+      "expected": [
+        { "start": 22, "end": 46, "title": "Ultimate timing analysis" }
+      ]
+    },
+    {
+      "id": "lecture-memory",
+      "note": "Retention insight without hook words; 'how'/'key' distractors — LLM-friendly.",
+      "segments": [
+        { "start": 0, "end": 11, "text": "In 1885 a German psychologist wrote about the forgetting curve." },
+        { "start": 11, "end": 24, "text": "He found that memory drops off steeply within the first hour." },
+        { "start": 24, "end": 38, "text": "How do students usually fight this? They reread their notes." },
+        { "start": 38, "end": 52, "text": "Rereading feels productive but it barely moves the retention line." },
+        { "start": 52, "end": 68, "text": "Testing yourself on the material is what actually rebuilds the trace." },
+        { "start": 68, "end": 80, "text": "The key is spacing those tests out over days, not hours." },
+        { "start": 80, "end": 92, "text": "So close the book and write everything you remember from it." }
+      ],
+      "expected": [
+        { "start": 52, "end": 68, "title": "Self-testing rebuilds memory" }
+      ]
+    },
+    {
+      "id": "interview-founder",
+      "note": "Pivotal moment phrased plainly; hook words live in the wrong segments.",
+      "segments": [
+        { "start": 0, "end": 10, "text": "What was the moment you knew it would work?" },
+        { "start": 10, "end": 24, "text": "Honestly it was a complaint email from a customer in Ohio." },
+        { "start": 24, "end": 38, "text": "She said the app saved her two hours every single morning." },
+        { "start": 38, "end": 52, "text": "We had three hundred users at the time and I felt like a failure." },
+        { "start": 52, "end": 66, "text": "That email is still pinned above my desk three years later." },
+        { "start": 66, "end": 78, "text": "Why? Because it told me the problem was real and painful." },
+        { "start": 78, "end": 90, "text": "Everything after that was just execution and patience." }
+      ],
+      "expected": [
+        { "start": 10, "end": 24, "title": "The customer email" },
+        { "start": 52, "end": 66, "title": "Pinned above the desk" }
+      ]
+    }
+  ]
+}

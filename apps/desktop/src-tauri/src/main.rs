@@ -204,8 +204,12 @@ fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHa
     cmd.arg("-m").arg(&model_path)
         .arg("--port").arg(port.to_string())
         .arg("--host").arg("127.0.0.1")
-        .arg("--ctx-size").arg("4096")
-        .arg("--parallel").arg("2")
+        // One slot, 8192 tokens: highlight prompts render a 180s window as compact
+        // word lines (~4-5k tokens); the old 4096/parallel-2 split left 2048 per
+        // slot, so every real window overflowed and semantic-local silently fell
+        // back to the heuristic. Analysis is sequential — a second slot buys nothing.
+        .arg("--ctx-size").arg("8192")
+        .arg("--parallel").arg("1")
         // --pooling mean: Qwen chat GGUFs default to pooling "none", which the
         // OpenAI-compatible /v1/embeddings endpoint rejects (400/501). Forcing
         // mean pooling lets the same server embed RAG segments and still chat.
