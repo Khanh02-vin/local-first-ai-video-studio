@@ -149,7 +149,7 @@ async function main(): Promise<void> {
 
   console.log(`== highlight eval: ${cases.length} cases, ${expectedCount} expected, IoU threshold ${THRESHOLD} ==`);
   if (!geminiKey) console.log("   (semantic-gemini skipped: GEMINI_API_KEY not set)");
-  if (!llamaUp) console.log(`   (semantic-local skipped: no llama-server at ${llamaBase}/health)`);
+  if (!llamaUp) console.log(`   (semantic-local skipped: no llama-server at ${llamaBase}/v1/models)`);
 
   const aggregates = new Map<string, { meanIou: number; hitAt: Record<number, number>; failures: number; worst: { id: string; iou: number } }>();
 
@@ -181,6 +181,27 @@ async function main(): Promise<void> {
     const hits = ks.map((k) => `${((agg.hitAt[k] ?? 0) * 100).toFixed(0)}%`.padStart(5)).join("  ");
     console.log(`${row.name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@1/3/5:${hits}   worst case ${worst.id} (${worst.iou.toFixed(2)})${failures ? `   failures ${failures}` : ""}`);
   }
+
+  // Pause-boundary signal: fixtures are contiguous, so verify directly that a
+  // ≥0.7s internal gap (Whisper word-timing derived) lifts a segment's score.
+  // A gap marks the boundary BETWEEN two segments, so both sides earn the bonus;
+  // compare against segments in a contiguous run (no bonus) and a sub-threshold gap.
+  const mkPauseCase = (gapAfterC: number): Transcript => ({
+    version: 1, sourceArtifactId: "gap-probe", language: "en", duration: 40, provider: "test",
+    words: [],
+    segments: [
+      { id: "a", text: "We talked about the roadmap for a while.", start: 0, end: 6, wordIds: [] },
+      { id: "b", text: "We talked about the roadmap for a while.", start: 6, end: 12, wordIds: [] },   // fully contiguous
+      { id: "c", text: "We talked about the roadmap for a while.", start: 12, end: 18, wordIds: [] },  // gap after → pause
+      { id: "d", text: "We talked about the roadmap for a while.", start: 18 + gapAfterC, end: 24 + gapAfterC, wordIds: [] },
+    ],
+  });
+  const scoreOf = (t: Transcript, start: number) => chooseHeuristicHighlights(t, 5).find((h) => h.start === start)!.score;
+  const gapped = mkPauseCase(3);      // 3s pause between c and d
+  assert.ok(scoreOf(gapped, 12) > scoreOf(gapped, 6), `pause boundary must lift score (c adjacent to 3s gap vs contiguous b)`);
+  assert.equal(scoreOf(gapped, 6), scoreOf(gapped, 0), "contiguous segments must not earn the pause bonus");
+  const tight = mkPauseCase(0.2);     // 0.2s gap — below threshold
+  assert.equal(scoreOf(tight, 12), scoreOf(tight, 6), "sub-threshold gap must not lift score");
 
   // --- CI assertions (offline rows only) ------------------------------------
   // Prompt shape: compact word lines, never full word-object JSON — this is
