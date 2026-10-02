@@ -81,6 +81,11 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
   throw new Error("LLM_HIGHLIGHT_SHAPE");
 }
 
+/** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
+ *  every cache key, so editing the prompt or schema below only requires a bump
+ *  here — stored LLM results from the old prompt stop being served. */
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v1";
+
 /** Compact transcript rendering: one "wordIndex [start-end] text" line per word.
  *  A full word-object JSON prompt costs ~4k tokens for a 96s clip; these lines
  *  cost ~6x less, which is what lets small local models (and the production

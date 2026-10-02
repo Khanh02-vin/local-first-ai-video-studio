@@ -2,6 +2,7 @@ import { chooseContentHighlights } from "../services/ai-pipeline/content-highlig
 import { chooseHeuristicHighlights } from "../services/ai-pipeline/heuristic.ts";
 import { generateSemanticHighlights, SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/semantic.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider } from "../services/ai-pipeline/providers.ts";
+import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { transcriptFromCaptions, type CaptionPayload } from "../services/ai-pipeline/youtube-transcript.ts";
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
@@ -58,9 +59,11 @@ try {
   const llamaBaseUrl = process.env.LOCAL_LLM_BASE_URL ?? "http://127.0.0.1:8080";
   const llamaModel = process.env.LOCAL_LLM_MODEL ?? "qwen2.5-3b-instruct";
 
+  // CachedSemanticProvider: replays stored highlights for the same transcript +
+  // prompt version instead of re-calling the LLM; identity includes the model.
   const semanticProvider: SemanticHighlightProvider | undefined =
-    strategy === "semantic-gemini" && geminiKey ? new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini")
-    : strategy === "semantic-local" ? new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp")
+    strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
+    : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
   const chooseFallback = (): Highlight[] => duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);

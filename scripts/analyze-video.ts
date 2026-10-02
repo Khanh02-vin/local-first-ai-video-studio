@@ -1,5 +1,6 @@
 import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider } from "../services/ai-pipeline/providers.ts";
+import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -55,9 +56,12 @@ try {
     onProgress: (completed: number, total: number) => store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * completed / total }),
   };
 
+  // CachedSemanticProvider: same transcript + prompt version replays stored
+  // highlights instead of re-calling the LLM (identity includes the model so a
+  // model swap never serves the wrong cache).
   const semanticProvider: SemanticHighlightProvider | undefined =
-    strategy === "semantic-gemini" && geminiKey ? new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini")
-    : strategy === "semantic-local" ? new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp")
+    strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
+    : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
   const result = semanticProvider
