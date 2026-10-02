@@ -290,13 +290,28 @@ jobs:
       - name: Upload installers to Google Drive (customer-facing links)
         run: |
           RCLONE=/home/khanh/.local/bin/rclone
-          "$RCLONE" copy dist/macos-app "gdrive:LFaIVS-Releases/" --include "*.zip"
-          "$RCLONE" copy dist/windows-installer "gdrive:LFaIVS-Releases/" --include "*.msi"
-          "$RCLONE" copy dist/linux-installer "gdrive:LFaIVS-Releases/" --include "*.AppImage"
-          "$RCLONE" copy dist/windows-portable "gdrive:LFaIVS-Releases/" --include "*.zip"
+          DEST="gdrive:LFaIVS-Releases"
+          # rclone copy matches by destination FILENAME. The portable's staging
+          # name (portable-windows.zip) never matched the canonical customer
+          # file ("Local-first AI Video Studio Portable.zip"), so every publish
+          # created a stray instead of updating the link customers already have
+          # (manual API PATCH was required after each run). copyto pins the
+          # exact destination name → updates the existing file in place, Drive
+          # file id preserved. Staged sources are globbed so a rename on the
+          # builder side still uploads; only the Drive-side names are fixed.
+          mac_zip=$(ls dist/macos-app/*.zip | head -1)
+          msi=$(ls dist/windows-installer/*.msi | head -1)
+          appimage=$(ls dist/linux-installer/*.AppImage | head -1)
+          portable=$(ls dist/windows-portable/*.zip | head -1)
+          "$RCLONE" copyto "$mac_zip"   "$DEST/Local-first AI Video Studio.zip"
+          "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio_0.1.0_x64_en-US.msi"
+          "$RCLONE" copyto "$appimage"  "$DEST/Local-first AI Video Studio_0.1.0_amd64.AppImage"
+          "$RCLONE" copyto "$portable"  "$DEST/Local-first AI Video Studio Portable.zip"
+          # Self-heal: remove the stray that pre-fix publishes left behind.
+          "$RCLONE" deletefile "$DEST/portable-windows.zip" 2>/dev/null || true
           echo "=== Customer download links (Google Drive):"
-          for f in "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio.zip" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_amd64.AppImage" "gdrive:LFaIVS-Releases/Local-first.AI.Video.Studio_0.1.0_x64_en-US.msi" "gdrive:LFaIVS-Releases/portable-windows.zip"; do
-            echo "$("$RCLONE" link "$f")"
+          for f in "Local-first AI Video Studio Portable.zip" "Local-first AI Video Studio.zip" "Local-first AI Video Studio_0.1.0_amd64.AppImage" "Local-first AI Video Studio_0.1.0_x64_en-US.msi"; do
+            echo "$("$RCLONE" link "$DEST/$f")"
           done | tee drive-links.txt
           cat drive-links.txt >> "$GITHUB_STEP_SUMMARY"
 
