@@ -3,6 +3,8 @@
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
 
+let { active = true }: { active?: boolean } = $props();
+
 // Engine/storage/license details come from the shared runtime store (fetched
 // once by the layout) — this page reads the cache and only forces a refresh
 // on its Refresh button and after changes.
@@ -19,7 +21,6 @@ let whisperBusy = $state(false);
 let modelProgress = $state<Progress | null>(null);
 let modelPresent = $state(false);
 let llmModelBusy = $state(false);
-let pollTimer: ReturnType<typeof setInterval> | undefined;
 let smallBusy = $state(false);
 let smallProgress = $state<Progress | null>(null);
 let smallPresent = $state(false);
@@ -109,15 +110,16 @@ async function pollSmall() {
 }
 onMount(refresh);
 onMount(readStrategy);
-onMount(() => {
-  void reloadSetupState();
-  // Poll while a long-running first-run setup is in flight.
-  pollTimer = setInterval(() => {
+onMount(() => { void reloadSetupState(); });
+$effect(() => {
+  const setupBusy = whisperBusy || llmModelBusy || smallBusy;
+  if (!active || !setupBusy) return;
+  const pollTimer = setInterval(() => {
     if (whisperBusy) void pollWhisper();
     if (llmModelBusy) void pollModel();
     if (smallBusy) void pollSmall();
   }, 2000);
-  return () => { if (pollTimer) clearInterval(pollTimer); };
+  return () => clearInterval(pollTimer);
 });
 </script>
 

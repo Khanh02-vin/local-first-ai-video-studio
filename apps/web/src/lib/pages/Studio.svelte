@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
   import { studioState } from "../studio-state.svelte.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
+  import Icon from "../icons.svelte";
 
   // Keep-alive mounted by +layout.svelte: `active` tells this page it is the
   // visible one, so background polls only run while the user can see them.
@@ -26,6 +27,9 @@
   let progress = $state(0);
   let elapsedSeconds = $state(0);
   let timer: ReturnType<typeof setInterval> | undefined;
+  let pollRun = 0;
+  let watchStarted = false;
+  let timerStartedAt = 0;
   let highlights = $state<Highlight[]>([]);
   let selectedId = $state("");
   let youtubeUrl = $state("");
@@ -76,8 +80,16 @@
   }
 
   function stopTimer() { if (timer) clearInterval(timer); timer = undefined; }
-  function startTimer() { stopTimer(); const started = Date.now(); elapsedSeconds = 0; timer = setInterval(() => elapsedSeconds = Math.floor((Date.now() - started) / 1000), 250); }
+  function resetTimer() { stopTimer(); timerStartedAt = 0; elapsedSeconds = 0; }
   function elapsedLabel() { return `${Math.floor(elapsedSeconds / 60)}m ${String(elapsedSeconds % 60).padStart(2, "0")}s`; }
+  $effect(() => {
+    const visible = active;
+    const running = busy;
+    if (!visible || !running) { stopTimer(); return; }
+    if (!timerStartedAt) timerStartedAt = Date.now() - untrack(() => elapsedSeconds) * 1000;
+    timer = setInterval(() => elapsedSeconds = Math.floor((Date.now() - timerStartedAt) / 1000), 1000);
+    return stopTimer;
+  });
 
   async function clearCache(id: string) {
     try { const bytes = await invoke<number>("clear_analysis_cache", { id }); resumableJobs = resumableJobs.filter((job) => job.id !== id); message = `Cleared ${(bytes / 1024 / 1024).toFixed(1)} MB for this setup.`; }
@@ -102,10 +114,15 @@
   }
 
   async function watch(id: string, resuming = true) {
-    jobId = id; busy = true; phase = "queued"; progress = 0; currentStep = 3; message = resuming ? "Resuming analysis…" : "Analyzing…"; startTimer();
+    if (!active) { jobId = id; busy = true; return; }
+    if (watchStarted) return;
+    watchStarted = true;
+    const run = ++pollRun;
+    jobId = id; busy = true; if (!resuming) { phase = "queued"; progress = 0; resetTimer(); timerStartedAt = Date.now(); } currentStep = 3; message = resuming ? "Resuming analysis…" : "Analyzing…";
     try {
-      while (busy && jobId === id) {
+      while (busy && jobId === id && pollRun === run && active) {
         const job = await invoke<{ status: string; phase: string; progress: number; chunkCompleted?: number; chunkTotal?: number; currentChunk?: number; result?: string; error?: string }>("analysis_status", { id });
+        if (!active || pollRun !== run || jobId !== id) break;
         phase = job.chunkTotal ? `${job.phase} · chunk ${Math.min((job.currentChunk ?? job.chunkCompleted ?? 0) + 1, job.chunkTotal)}/${job.chunkTotal}` : job.phase;
         progress = job.progress;
         if (job.status === "completed") {
@@ -113,14 +130,19 @@
           if (result.videoId) youtubeVideoId = result.videoId;
           studioState.highlights = highlights; studioState.selectedId = selectedId;
           message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
-          currentStep = 4; busy = false; stopTimer(); break;
+          currentStep = 4; busy = false; resetTimer(); break;
         }
-        if (job.status === "failed") { message = `Analyze failed: ${job.error ?? "unknown error"}`; busy = false; stopTimer(); break; }
+        if (job.status === "failed") { message = `Analyze failed: ${job.error ?? "unknown error"}`; busy = false; resetTimer(); break; }
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
-    } catch (error) { message = `Resume failed: ${String(error)}`; busy = false; stopTimer(); }
-    finally { await reconnectJobs(false); }
+    } catch (error) { if (pollRun === run) { message = `Resume failed: ${String(error)}`; busy = false; resetTimer(); } }
+    finally { if (pollRun === run) { watchStarted = false; await reconnectJobs(false); } }
   }
+  $effect(() => {
+    const visible = active;
+    const id = jobId;
+    if (visible && busy && id && !watchStarted) void watch(id, true);
+  });
 
   async function analyze() {
     if (!isTauri()) { message = "Analysis runs in the desktop app only — this browser preview cannot transcribe."; return; }
@@ -132,7 +154,7 @@
     try {
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
       await watch(id, false);
-    } catch (error) { message = `Analyze failed: ${String(error)}`; busy = false; stopTimer(); }
+    } catch (error) { message = `Analyze failed: ${String(error)}`; busy = false; resetTimer(); }
   }
 
   /// YouTube: one metadata call → transcript-based analysis (no Whisper, no download).
@@ -141,7 +163,7 @@
     const url = youtubeUrl.trim();
     if (!url || busy) return;
     highlights = []; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
-    busy = true; message = "Fetching YouTube transcript…"; startTimer();
+    busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
       inputPath = url;
@@ -151,7 +173,7 @@
       await watch(info.id, false);
     } catch (error) {
       message = `YouTube analyze failed: ${String(error)}`;
-      busy = false; stopTimer();
+      busy = false; resetTimer();
     }
   }
 
@@ -169,10 +191,10 @@
   }
 
   async function abort() {
-    if (!jobId) { busy = false; stopTimer(); return; }
+    if (!jobId) { busy = false; resetTimer(); return; }
     try { await invoke("stop_analysis", { id: jobId }); message = "Analysis stopped."; }
     catch (error) { message = `Abort failed: ${String(error)}`; }
-    finally { busy = false; stopTimer(); await reconnectJobs(false); }
+    finally { busy = false; resetTimer(); await reconnectJobs(false); }
   }
 
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
@@ -192,9 +214,7 @@
     // session — the old per-mount window listeners leaked on every visit).
     return () => { stopTimer(); unlisten.then((fn) => fn()); };
   });
-  // Refresh the jobs list only while this page is visible — keep-alive means
-  // onMount never re-runs, and a background node spawn every 5 s is churn the
-  // user cannot see.
+  // Refresh job lists only while visible; keep-alive pages remain mounted.
   $effect(() => {
     if (!active) return;
     const refresh = setInterval(() => { if (!busy) void reconnectJobs(); }, 5000);
@@ -221,10 +241,10 @@
     <div class="card dropzone" class:over={dragOver} role="region" aria-label="Video upload drop zone" ondragover={(e) => { e.preventDefault(); dragOver = true; }} ondragleave={() => dragOver = false} ondrop={(e) => { e.preventDefault(); onDrop(e); }}>
       {#if !inputPath}
         <div class="drop-inner">
-          <div class="drop-icon">🎬</div>
+          <div class="drop-icon"><Icon name="film" size={28} /></div>
           <h2>Drop a video to start</h2>
           <p>Drag & drop here, or</p>
-          <button class="browse" onclick={choose} disabled={busy}>Browse files</button>
+          <button class="browse" onclick={choose} disabled={busy}><Icon name="folder" size={15} /> Browse files</button>
           <p class="hint">MP4 · MOV · MKV — processed 100% on your device</p>
           <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap;justify-content:center;">
             <input type="url" placeholder="…or paste a YouTube URL" aria-label="YouTube URL" bind:value={youtubeUrl} disabled={busy} style="flex:1;min-width:220px;" />
@@ -234,7 +254,7 @@
         </div>
       {:else if meta}
         <div class="preview-card">
-          <div class="thumb">🎞️</div>
+          <div class="thumb"><Icon name="film" size={22} /></div>
           <div class="preview-info">
             <strong>{meta.name}</strong>
             <span>{clock(meta.duration)} · {meta.width && meta.height ? `${meta.width}×${meta.height}` : ""}</span>

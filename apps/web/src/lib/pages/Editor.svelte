@@ -1,6 +1,8 @@
 <script lang="ts">
   import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
+  import { onDestroy } from "svelte";
   import { studioState } from "../studio-state.svelte.ts";
+  import Icon from "../icons.svelte";
   import { captionsFromTranscript, createEditorState, loadTranscriptCaptions, removeCaption, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../packages/editor-core/index.ts";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
   import type { Caption } from "../../../../../packages/contracts/render-plan.ts";
@@ -16,6 +18,7 @@
   let selectedId = fallback.id;
   let state: EditorState = createEditorState("demo-source", 60, fallback);
   let saved = false;
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let powered = false;
   let playing = false;
   let currentTime = 1;
@@ -113,6 +116,7 @@
     currentTime = range.start;
   }
   $: if (active) loadFromStudio();
+  $: if (!active && video && !video.paused) video.pause();
 
   function select(id: string) {
     const candidate = candidates.find((item) => item.id === id) ?? fallback;
@@ -136,7 +140,8 @@
   function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); studioState.plan = state.plan; } catch { /* validation follows the contract */ } }
   function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; studioState.plan = state.plan; }
   function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; studioState.plan = state.plan; }
-  function save() { if (!isTauri()) { saved = false; return; } saved = true; studioState.plan = state.plan; setTimeout(() => saved = false, 1200); }
+  function save() { if (!isTauri()) return; saved = true; studioState.plan = state.plan; if (saveTimer) clearTimeout(saveTimer); saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600); }
+  onDestroy(() => { if (saveTimer) clearTimeout(saveTimer); });
   function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); studioState.plan = state.plan; } catch { /* keep current valid hook */ } }
 </script>
 
@@ -163,7 +168,9 @@
       <span class="eyebrow">Source</span>
       <dl class="kv"><dt>Duration</dt><dd class="tc">{clock(sourceDuration)}</dd><dt>Selected</dt><dd class="tc">{clock(range.start)}–{clock(range.end)}</dd><dt>Plan</dt><dd class="tc">v{state.plan.version}</dd></dl>
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
-      <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>{#if saved}<span class="badge ok" role="status" style="align-self:center;">Saved locally</span>{/if}
+      {#if !isTauri()}<p class="note">Save and export are available in the installed desktop app.</p>{/if}
+      <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>
+      {#if saved}<div class="save-toast" role="status" aria-live="polite"><Icon name="check" size={16} />Saved locally</div>{/if}
     </div>
   </aside>
 
@@ -175,11 +182,13 @@
           {#if powered}<video bind:this={video} aria-label="Video preview" src={convertFileSrc(sourcePath)} ontimeupdate={syncTime} onplay={() => playing = true} onpause={() => playing = false} onloadedmetadata={() => { sourceDuration = video.duration || sourceDuration; seek(range.start); }}><track kind="captions" /></video>{:else}<div class="empty-canvas"><span class="eyebrow">Preview canvas</span><strong>Open Studio and analyze a source</strong><span class="note">The editor workspace is ready with a demo cut.</span></div>{/if}
           <div class="frame-guide {state.plan.aspectRatio === "9:16" ? "r916" : state.plan.aspectRatio === "1:1" ? "r11" : "r169"}"><i></i></div>
         </div>
-        <div class="transport"><button class="btn btn-icon" aria-label={playing ? "Pause" : "Play"} onclick={togglePlay}>{playing ? "Ⅱ" : "▶"}</button><span class="tc">{clock(currentTime)}</span><span class="transport-track"><span style={`width:${pct(currentTime)}`}></span></span><span class="tc muted">{clock(sourceDuration)}</span></div>
+        <div class="transport"><button class="btn btn-icon" aria-label={playing ? "Pause" : "Play"} onclick={togglePlay}><Icon name={playing ? "pause" : "play"} size={14} /></button><span class="tc">{clock(currentTime)}</span><span class="transport-track"><span style={`width:${pct(currentTime)}`}></span></span><span class="tc muted">{clock(sourceDuration)}</span></div>
         <div class="timeline" aria-label="Editor timeline" bind:this={timeline}>
           <div class="tl-ruler" role="presentation" onclick={seekTimeline}>{#each [0, 0.25, 0.5, 0.75, 1] as tick}<span class="tl-tick" style={`left:${tick * 100}%`}></span><span class="tl-tick-label" style={`left:${tick * 100}%`}>{clock(sourceDuration * tick)}</span>{/each}</div>
-          <div class="timeline-label">VIDEO</div>
-          <div class="tl-lane" role="presentation" onclick={seekTimeline}>
+        <div class="timeline-label">VIDEO</div>
+        <p class="timeline-help">Click the ruler to seek. Drag the highlighted range to move it, or drag its left/right edges to trim. Arrow keys adjust the selected range.</p>
+        <div class="tl-lane" role="presentation" onclick={seekTimeline}>
+
             <div class="tl-clip-base"></div>
             <div class="tl-range" class:dragging={dragging === "range"} style={`left:${pct(range.start)};width:${(Math.max(0, range.end - range.start) / Math.max(sourceDuration, 1)) * 100}%`}
                  onmousedown={onTimelineMouseDown} onkeydown={onRangeKeydown} role="slider" tabindex="0"
