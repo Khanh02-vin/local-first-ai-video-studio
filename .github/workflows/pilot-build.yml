@@ -84,7 +84,9 @@ jobs:
           cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
           cp -r "$ROOT/apps/web/build-node" portable/build-node
           printf 'Local-first AI Video Studio Portable\r\n\r\nExtract all files and run local-first-ai-video-studio.exe.\r\n' > portable/README.txt
-          7z a -tzip -mx=3 portable-windows.zip ./portable/* >/dev/null
+          cd portable
+          7z a -tzip -mx=3 ../portable-windows.zip ./* >/dev/null
+          cd ..
           7z t portable-windows.zip >/dev/null
           mkdir -p "$GITHUB_WORKSPACE/dist/windows"
           cp portable-windows.zip "$GITHUB_WORKSPACE/dist/windows/Local-first AI Video Studio Portable.zip"
