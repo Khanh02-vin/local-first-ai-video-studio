@@ -64,24 +64,30 @@ jobs:
         run: |
           set -euo pipefail
           cd apps/desktop/src-tauri/target/release
-          mkdir -p portable
-          for exe in *.exe; do cp "$exe" portable/; done
-          cp *.dll portable/ 2>/dev/null || true
+          mkdir -p 'portable/Local-first AI Video Studio'
+          APP='portable/Local-first AI Video Studio'
+          for exe in *.exe; do cp "$exe" "$APP/"; done
+          cp *.dll "$APP/" 2>/dev/null || true
           RES=../../resources
-          cp -r "$RES/node" portable/node
+          cp -r "$RES/node" "$APP/node"
           for bin in ffmpeg ffprobe; do
-            for cand in "$RES/$bin" "$RES/$bin.exe"; do [[ -f "$cand" ]] && cp "$cand" portable/; done
+            for cand in "$RES/$bin" "$RES/$bin.exe"; do [[ -f "$cand" ]] && cp "$cand" "$APP/"; done
           done
-          mkdir -p portable/models
-          cp "$RES"/models/*.pt portable/models/ 2>/dev/null || true
+          mkdir -p "$APP/models"
+          cp "$RES"/models/*.pt "$APP/models/" 2>/dev/null || true
           ROOT=../../../../..
-          cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" portable/
-          cp -r "$ROOT/apps/web/build-node" portable/build-node
-          printf 'Local-first AI Video Studio Portable\r\n\r\nExtract all files and run local-first-ai-video-studio.exe.\r\n' > portable/README.txt
+          cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" "$APP/"
+          cp -r "$ROOT/apps/web/build-node" "$APP/build-node"
+          printf 'Local-first AI Video Studio Portable\r\n\r\nExtract the ZIP, open the Local-first AI Video Studio folder, and run local-first-ai-video-studio.exe.\r\n' > "$APP/README.txt"
           cd portable
           7z a -tzip -mx=3 ../portable-windows.zip ./* >/dev/null
           cd ..
           7z t portable-windows.zip >/dev/null
+          entries=$(7z l -slt portable-windows.zip | awk -F' = ' '/^Path = / {print $2}')
+          while IFS= read -r entry; do
+            [[ "$entry" == 'Local-first AI Video Studio' || "$entry" == 'Local-first AI Video Studio/'* ]] || { echo "unexpected ZIP root entry: $entry" >&2; exit 1; }
+          done < <(printf '%s\n' "$entries" | tail -n +2)
+          grep -Fxq 'Local-first AI Video Studio/local-first-ai-video-studio.exe' <<< "$entries" || { echo 'portable executable missing from app folder' >&2; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/dist/windows"
           cp portable-windows.zip "$GITHUB_WORKSPACE/dist/windows/Local-first AI Video Studio Portable.zip"
           cp bundle/msi/*.msi "$GITHUB_WORKSPACE/dist/windows/"
@@ -111,7 +117,8 @@ jobs:
           gh release upload v0.1.1-pilot.1 \
             "Local-first AI Video Studio Portable.zip" \
             SHA256SUMS-portable.txt BUILD-INFO.txt \
-            --repo "$GITHUB_REPOSITORY"
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
       - uses: actions/upload-artifact@v4
         with:
           name: pilot-windows-msi
