@@ -68,10 +68,7 @@ jobs:
           security import signing.p12 -k build.keychain -P "$APPLE_IDENTITY_PASSWORD" -T /usr/bin/codesign
           security set-keychain-settings -u build.keychain
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
-      - name: Fetch model weights (git-ignored) and llama.cpp binaries
-        shell: bash
-        env:
-          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
+      - name: Fetch bundled core resources
         run: bash scripts/fetch-bundled-assets.sh
       - name: Build web frontend
         run: |
@@ -111,10 +108,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Fetch model weights (git-ignored) and llama.cpp binaries
-        shell: bash
-        env:
-          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
+      - name: Fetch bundled core resources
         run: bash scripts/fetch-bundled-assets.sh
       - name: Verify bundled helper names (Windows)
         shell: bash
@@ -122,10 +116,8 @@ jobs:
           # Guards the customer build: bundled_bin probes node/bin/node.exe,
           # ffmpeg.exe and ffprobe.exe on Windows — a layout drift here shipped
           # a portable whose analysis/RAG helpers silently fell back to PATH.
-          # llama-server.exe guards the portable/MSI semantic-local LLM (the
-          # committed llama-server is a Linux ELF; only fetch produces .exe).
           RES=apps/desktop/src-tauri/resources
-          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe llama/llama-server.exe; do
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe; do
             if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
           done
           echo "all bundled helpers present"
@@ -158,14 +150,8 @@ jobs:
               [[ -f "$cand" ]] && cp "$cand" portable/
             done
           done
-          cp -r "$RES/models" portable/models
-          # llama-server for Windows: resources/llama also holds the committed
-          # Linux ELF + .so symlinks, which `cp -r` cannot materialize on
-          # Windows (symlink creation fails) — copy only the runnable files.
-          [[ -f "$RES/llama/llama-server.exe" ]] || { echo "missing bundled helper: resources/llama/llama-server.exe" >&2; exit 1; }
-          mkdir -p portable/llama
-          cp "$RES/llama/"*.exe portable/llama/
-          for dll in "$RES/llama/"*.dll; do [[ -f "$dll" ]] && cp "$dll" portable/llama/; done
+          mkdir -p portable/models
+          cp "$RES"/models/*.pt portable/models/ 2>/dev/null || true
           # RAG sidecar (build-node is gitignored; beforeBuildCommand built it
           # during the MSI build above) — without it YouTube Studio RAG is dead.
           ROOT=../../../../..
@@ -201,10 +187,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo -n apt-get update && sudo -n apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev || echo "deps already present on this runner — skipping apt"
-      - name: Fetch model weights (git-ignored) and llama.cpp binaries
-        shell: bash
-        env:
-          LLM_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m
+      - name: Fetch bundled core resources
         run: bash scripts/fetch-bundled-assets.sh
       - name: Verify bundled helper names (Linux)
         shell: bash

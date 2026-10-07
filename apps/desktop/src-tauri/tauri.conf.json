@@ -46,9 +46,7 @@
       "./resources/node": "node",
       "./resources/ffmpeg*": "",
       "./resources/ffprobe*": "",
-      "./resources/llama": "llama",
-      "./resources/models": "models",
-      "./resources/models/llama": "models/llama"
+      "./resources/models/*.pt": "models/"
     },
     "createUpdaterArtifacts": false
   }
