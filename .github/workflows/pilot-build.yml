@@ -83,7 +83,7 @@ jobs:
           7z a -tzip -mx=3 ../portable-windows.zip ./* >/dev/null
           cd ..
           7z t portable-windows.zip >/dev/null
-          entries=$(7z l -slt portable-windows.zip | awk -F' = ' '/^Path = / {print $2}')
+          entries=$(7z l -slt portable-windows.zip | awk -F' = ' '/^Path = / {print $2}' | tr '\\' '/')
           while IFS= read -r entry; do
             [[ "$entry" == 'Local-first AI Video Studio' || "$entry" == 'Local-first AI Video Studio/'* ]] || { echo "unexpected ZIP root entry: $entry" >&2; exit 1; }
           done < <(printf '%s\n' "$entries" | tail -n +2)
