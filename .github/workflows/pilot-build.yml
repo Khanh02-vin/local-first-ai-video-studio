@@ -5,7 +5,7 @@ on:
   pull_request:
     branches: [main]
 permissions:
-  contents: read
+  contents: write
 jobs:
   macos:
     runs-on: macos-latest
@@ -97,9 +97,21 @@ jobs:
           path: |
             dist/windows/Local-first AI Video Studio Portable.zip
             dist/windows/BUILD-INFO.txt
-            dist/windows/SHA256SUMS-portable.txt
           if-no-files-found: error
           retention-days: 14
+      - name: Publish portable build to prerelease
+        if: ${{ runner.os == 'Windows' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist/windows"
+          sha256sum -c SHA256SUMS-portable.txt
+          gh release upload v0.1.1-pilot.1 \
+            "Local-first AI Video Studio Portable.zip" \
+            SHA256SUMS-portable.txt BUILD-INFO.txt \
+            --repo "$GITHUB_REPOSITORY"
       - uses: actions/upload-artifact@v4
         with:
           name: pilot-windows-msi
