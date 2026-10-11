@@ -4,6 +4,7 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
+  import type { Collection } from "../../../../../packages/contracts/collection.ts";
   import { studioState } from "../studio-state.svelte.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
   import Icon from "../icons.svelte";
@@ -31,6 +32,8 @@
   let watchStarted = false;
   let timerStartedAt = 0;
   let highlights = $state<Highlight[]>([]);
+  let collections = $state<Collection[]>([]);
+  let selectedCollection = $state("");
   let selectedId = $state("");
   let youtubeUrl = $state("");
   let youtubeVideoId = $state("");
@@ -39,6 +42,17 @@
   // where the plain embed already works.
   let previewBase = $state("");
   let selectedCandidate = $derived(highlights.find((item) => item.id === selectedId) ?? null);
+  // Highlight ids belonging to the selected collection, so the candidate list
+  // can mark which clips the grouping picked. Empty when nothing is selected.
+  let collectionMembers = $derived(new Set(
+    collections.find((collection) => collection.id === selectedCollection)?.items
+      .map((item) => (item.reference.kind === "highlight" ? item.reference.highlightId : "")) ?? []
+  ));
+  function pickCollection(collection: Collection) {
+    selectedCollection = collection.id;
+    const first = collection.items[0]?.reference;
+    if (first?.kind === "highlight" && highlights.some((item) => item.id === first.highlightId)) selectedId = first.highlightId;
+  }
   let modelBusy = $state(false);
   let meta = $state<Meta | null>(null);
   let dragOver = $state(false);
@@ -52,7 +66,7 @@
   }
 
   async function loadVideo(path: string) {
-    inputPath = path; highlights = []; selectedId = ""; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
+    inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
     await reconnectJobs(false);
     try {
       const probe = JSON.parse(await invoke<string>("probe_video", { path }));
@@ -127,6 +141,7 @@
         progress = job.progress;
         if (job.status === "completed") {
           const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? "";
+          collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? "";
           if (result.videoId) youtubeVideoId = result.videoId;
           studioState.highlights = highlights; studioState.selectedId = selectedId;
           message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
@@ -150,7 +165,7 @@
     const existing = resumableJobs.find((job) => job.input === inputPath && (job.status === "queued" || job.status === "running") && Math.abs((job.rangeStart ?? 0) - analyzeStart) < 0.01 && Math.abs((job.rangeEnd ?? analyzeEnd) - analyzeEnd) < 0.01);
     if (existing && confirm("Continue existing analysis? Cancel = clear this setup and start fresh.")) { await watch(existing.id, true); return; }
     if (existing) await clearCache(existing.id);
-    highlights = []; selectedId = ""; message = "Analyzing…";
+    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; message = "Analyzing…";
     try {
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
       await watch(id, false);
@@ -162,7 +177,7 @@
     if (!isTauri()) { message = "YouTube analysis runs in the desktop app only."; return; }
     const url = youtubeUrl.trim();
     if (!url || busy) return;
-    highlights = []; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
+    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
     busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
@@ -316,16 +331,30 @@
     {#if highlights.length}
       <div class="card">
         <div class="section-title">Shorts Showcase</div>
+        {#if collections.length}
+          <div class="stack">
+            {#each collections as collection}
+              <button class="cand" class:on={collection.id === selectedCollection} aria-pressed={collection.id === selectedCollection} onclick={() => pickCollection(collection)}>
+                <span class="cand-rank">{collection.items.length}</span>
+                <span>
+                  <span class="cand-title">{collection.title}</span>
+                  {#if collection.topic}<span class="cand-sub">{collection.topic}</span>{/if}
+                </span>
+                <span class="cand-score">{collection.state}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
         <div class="candidates">
           {#each highlights as candidate}
             <button class:selected={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => selectedId = candidate.id}>
               <strong>{candidate.title}</strong>
-              <span>{clock(candidate.start)}–{clock(candidate.end)} · score {candidate.score}</span>
+              <span>{clock(candidate.start)}–{clock(candidate.end)} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
               {#if candidate.hook}<small>{candidate.hook}</small>{/if}
             </button>
           {/each}
         </div>
-        <div class="spec-line"><span>Export {aspectRatio}</span><span>{highlights.length} candidates</span></div>
+        <div class="spec-line"><span>Export {aspectRatio}</span><span>{highlights.length} candidates{collections.length ? ` · ${collections.length} collections` : ""}</span></div>
         <button class="cta secondary" disabled={busy || !selectedId} onclick={render}>
           {#if busy}<span class="spinner"></span>{/if}
           {busy ? "Rendering…" : `Render selected candidate (${aspectRatio})`}
