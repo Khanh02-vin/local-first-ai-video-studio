@@ -3,6 +3,8 @@
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
 
+let { active = true }: { active?: boolean } = $props();
+
 // Engine/storage/license details come from the shared runtime store (fetched
 // once by the layout) — this page reads the cache and only forces a refresh
 // on its Refresh button and after changes.
@@ -18,8 +20,8 @@ let whisperProgress = $state<Progress | null>(null);
 let whisperBusy = $state(false);
 let modelProgress = $state<Progress | null>(null);
 let modelPresent = $state(false);
-let llmModelBusy = $state(false);
-let pollTimer: ReturnType<typeof setInterval> | undefined;
+let llamaRuntimePresent = $state(false);
+let llmSetupBusy = $state(false);
 let smallBusy = $state(false);
 let smallProgress = $state<Progress | null>(null);
 let smallPresent = $state(false);
@@ -35,22 +37,26 @@ async function pollWhisper() {
   whisperProgress = progress;
   if (progress?.done) { whisperBusy = false; await refresh(); message = progress.error ? `Whisper setup error: ${progress.error}` : "Whisper is ready."; }
 }
-async function downloadModel() {
-  if (!isTauri()) { message = "Model download runs in the desktop app only."; return; }
-  llmModelBusy = true;
-  try { await invoke("download_llm_model"); await pollModel(); }
-  catch (error) { message = `Model download failed: ${String(error)}`; llmModelBusy = false; }
+async function setupLocalLlm() {
+  if (!isTauri()) { message = "Local LLM setup runs in the desktop app only."; return; }
+  if (!confirm("Download the local LLM runtime and model? This needs an internet connection and about 2.2 GB of disk space. It is optional; Heuristic mode works without it.")) return;
+  llmSetupBusy = true;
+  try { await invoke("install_local_llm"); await pollLocalLlm(); }
+  catch (error) { message = `Local LLM setup failed: ${String(error)}`; llmSetupBusy = false; }
 }
-async function pollModel() {
-  const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("model_download_status");
-  modelProgress = status.progress; modelPresent = status.modelPresent;
-  if (status.progress?.done || modelPresent) { llmModelBusy = false; message = status.progress?.error ? `Model error: ${status.progress.error}` : "Local LLM model ready."; }
+async function pollLocalLlm() {
+  const status = await invoke<{ progress: Progress | null; runtimePresent: boolean; modelPresent: boolean }>("local_llm_setup_status");
+  modelProgress = status.progress; llamaRuntimePresent = status.runtimePresent; modelPresent = status.modelPresent;
+  if (status.progress?.done) {
+    llmSetupBusy = false;
+    message = status.progress.error ? `Local LLM setup error: ${status.progress.error}` : "Local LLM runtime and model are ready.";
+  }
 }
 async function reloadSetupState() {
   try {
     whisperProgress = await invoke<Progress>("whisper_bootstrap_status");
-    const status = await invoke<{ progress: Progress | null; modelPresent: boolean }>("model_download_status");
-    modelProgress = status.progress; modelPresent = status.modelPresent;
+    const status = await invoke<{ progress: Progress | null; runtimePresent: boolean; modelPresent: boolean }>("local_llm_setup_status");
+    modelProgress = status.progress; llamaRuntimePresent = status.runtimePresent; modelPresent = status.modelPresent;
     const small = await invoke<{ progress: Progress | null; modelPresent: boolean }>("whisper_model_download_status");
     smallProgress = small.progress; smallPresent = small.modelPresent;
   } catch { /* browser dev: ignore */ }
@@ -74,6 +80,10 @@ async function pollSmall() {
 
   async function saveStrategy(next: string, key: string, llamaUrl: string, llamaModel: string) {
     if (!isTauri()) { message = "Strategy changes apply in the desktop app only."; return; }
+    if (next === "semantic-local" && !(modelPresent && llamaRuntimePresent)) {
+      message = "Install the Local LLM runtime and model below before selecting this strategy.";
+      return;
+    }
     strategyBusy = true;
     try {
       strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key, localLlmBaseUrl: llamaUrl, localLlmModel: llamaModel });
@@ -109,15 +119,16 @@ async function pollSmall() {
 }
 onMount(refresh);
 onMount(readStrategy);
-onMount(() => {
-  void reloadSetupState();
-  // Poll while a long-running first-run setup is in flight.
-  pollTimer = setInterval(() => {
+onMount(() => { void reloadSetupState(); });
+$effect(() => {
+  const setupBusy = whisperBusy || llmSetupBusy || smallBusy;
+  if (!active || !setupBusy) return;
+  const pollTimer = setInterval(() => {
     if (whisperBusy) void pollWhisper();
-    if (llmModelBusy) void pollModel();
+    if (llmSetupBusy) void pollLocalLlm();
     if (smallBusy) void pollSmall();
   }, 2000);
-  return () => { if (pollTimer) clearInterval(pollTimer); };
+  return () => clearInterval(pollTimer);
 });
 </script>
 
@@ -169,9 +180,9 @@ onMount(() => {
           <div class="spread"><span class="note" style="margin:0;">Whisper — installs openai-whisper + PyTorch into the app's own environment (one time, a few GB).</span><button class="btn btn-sm" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Setup Whisper"}</button></div>
           {#if whisperProgress}<p class="hint" aria-live="polite">{whisperProgress.message}{whisperProgress.error ? ` — ${whisperProgress.error}` : ""}</p>{:else}<p class="note">Status unknown — press Setup to check.</p>{/if}
           <div class="spread" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
-            <span class="note" style="margin:0;">Local LLM — Qwen2.5-3B GGUF (~2.1 GB), checksum-verified; only needed for the "Local LLM" strategy.</span><button class="btn btn-sm" disabled={llmModelBusy || modelPresent} onclick={downloadModel}>{modelPresent ? "Downloaded ✓" : llmModelBusy ? "Downloading…" : "Download model"}</button>
+            <span class="note" style="margin:0;">Local LLM — optional llama.cpp runtime and Qwen2.5-3B GGUF model (~2.2 GB total); downloads on request and verifies checksums.</span><button class="btn btn-sm" disabled={llmSetupBusy || (modelPresent && llamaRuntimePresent)} onclick={setupLocalLlm}>{modelPresent && llamaRuntimePresent ? "Ready ✓" : llmSetupBusy ? "Installing…" : "Install Local LLM"}</button>
           </div>
-          {#if modelPresent}<p class="note">Model present on disk.</p>{:else if modelProgress}<p class="hint" aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>{/if}
+          {#if modelProgress}<p class="hint" aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>{:else}<p class="note">Runtime: {llamaRuntimePresent ? "installed" : "not installed"} · Model: {modelPresent ? "downloaded" : "not downloaded"}. Only needed for the Local LLM highlight strategy.</p>{/if}
         </div>
 
         <div class="panel">
@@ -187,7 +198,7 @@ onMount(() => {
             </button>
             <button class="strategy-card" class:on={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>
               <span class="spread"><strong>Local LLM (offline)</strong>{#if strategy === "semantic-local"}<span class="badge ok">active</span>{/if}</span>
-              <p>Rank with the bundled Qwen model via llama.cpp — no key.</p>
+              <p>Rank with the locally installed Qwen model via llama.cpp — no key. Runtime and model are optional and must be installed above first.</p>
             </button>
           </div>
           {#if strategy === "semantic-gemini"}

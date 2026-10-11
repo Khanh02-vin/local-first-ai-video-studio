@@ -1,0 +1,31 @@
+name: publish-pilot-portable
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified pilot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pilot-windows-portable
+          repository: Khanh02-vin/local-first-ai-video-studio
+          run-id: 37576372457
+          github-token: ${{ github.token }}
+          path: dist/pilot-portable
+      - name: Verify artifact checksum
+        run: |
+          cd dist/pilot-portable
+          sha256sum -c SHA256SUMS-portable.txt
+      - name: Upload portable ZIP to prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v0.1.1-pilot.1 \
+            "dist/pilot-portable/Local-first AI Video Studio Portable.zip" \
+            dist/pilot-portable/SHA256SUMS-portable.txt \
+            dist/pilot-portable/BUILD-INFO.txt \
+            --repo Khanh02-vin/local-first-ai-video-studio

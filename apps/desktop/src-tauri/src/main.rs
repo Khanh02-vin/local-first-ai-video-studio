@@ -115,6 +115,16 @@ fn set_runtime_model(_app: tauri::AppHandle, model: String) -> Result<String, St
 #[tauri::command]
 fn set_highlight_strategy(_app: tauri::AppHandle, strategy: String, gemini_api_key: String, local_llm_base_url: String, local_llm_model: String) -> Result<String, String> {
     if !["heuristic", "semantic-gemini", "semantic-local"].contains(&strategy.as_str()) { return Err("INVALID_STRATEGY: choose heuristic, semantic-gemini or semantic-local".into()); }
+    if strategy == "semantic-local" {
+        if !["qwen2.5-3b-instruct", "qwen2.5-3b-instruct-q4_k_m"].contains(&local_llm_model.as_str()) {
+            return Err("LOCAL_LLM_MODEL_UNSUPPORTED: only qwen2.5-3b-instruct is currently available".into());
+        }
+        let model_path = local_llm_model_path(&_app, &local_llm_model);
+        let model_ready = model_path.as_ref().is_some_and(|path| path.is_file() && sha256_file(path).is_ok_and(|sha| sha == LLM_MODEL_SHA256));
+        if existing_llama(state_dir().join("llama/runtime")).is_none() || !model_ready {
+            return Err("LOCAL_LLM_SETUP_REQUIRED: install the local runtime and model in Settings first".into());
+        }
+    }
     let file = runtime_env();
     let command = file.get("WHISPER_COMMAND").cloned().filter(|c| !c.is_empty() && whisper_usable(c)).unwrap_or_else(whisper_command);
     let model = file.get("WHISPER_MODEL").cloned().filter(|c| !c.is_empty()).unwrap_or_else(|| "tiny".into());
@@ -171,37 +181,20 @@ fn whisper_command() -> String {
     "whisper".into()
 }
 type LlamaState = Arc<Mutex<Option<u32>>>; // pid of the detached llama-server, if running
-/// Finds the platform's llama-server inside `dir` (state llama/, bundled resources, …).
-/// Windows must probe only `.exe`: the git-committed `llama-server` is a Linux ELF
-/// and picking it would spawn an unrunnable binary.
+/// Finds the platform's llama-server inside the app-owned state directory.
 fn existing_llama(dir: PathBuf) -> Option<PathBuf> {
     let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
     let candidate = dir.join(name);
     if candidate.is_file() { Some(candidate) } else { None }
 }
-fn llama_binary(resource_dir: Option<PathBuf>) -> PathBuf {
-    if let Ok(path) = std::env::var("LOCAL_LLM_BINARY") { if Path::new(&path).is_file() { return PathBuf::from(path); } }
-    if let Ok(state) = std::env::var("LOCAL_FIRST_STATE_DIR") {
-        if let Some(candidate) = existing_llama(Path::new(&state).join("llama")) { return candidate; }
-    }
-    // Packaged builds (deb/AppImage/MSI/portable) ship llama-server under
-    // <resources>/llama via tauri bundle.resources; probe it BEFORE the baked
-    // dev-tree path, which is meaningless on a customer machine.
-    if let Some(dir) = resource_dir {
-        if let Some(candidate) = existing_llama(dir.join("llama")) { return candidate; }
-    }
-    if let Some(candidate) = existing_llama(Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/llama")) { return candidate; }
-    PathBuf::from("llama-server")
+fn llama_binary() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("LOCAL_LLM_BINARY") { if Path::new(&path).is_file() { return Ok(PathBuf::from(path)); } }
+    existing_llama(state_dir().join("llama/runtime")).ok_or_else(|| "LLAMA_RUNTIME_MISSING: install the local LLM runtime in Settings".into())
 }
-fn local_llm_model_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>, model: &str) -> Option<PathBuf> {
-    let resource_dir = app.path().resource_dir().ok()?;
-    let state = state_dir();
-    let candidates = [
-        state.join("models/llama").join(format!("{model}.gguf")),
-        resource_dir.join("models/llama").join(format!("{model}.gguf")),
-    ];
-    for candidate in &candidates { if candidate.is_file() { return Some(candidate.clone()); } }
-    None
+fn local_llm_model_path<R: tauri::Runtime>(_app: &tauri::AppHandle<R>, model: &str) -> Option<PathBuf> {
+    if !["qwen2.5-3b-instruct", "qwen2.5-3b-instruct-q4_k_m"].contains(&model) { return None; }
+    let candidate = llm_model_file("qwen2.5-3b-instruct-q4_k_m");
+    candidate.is_file().then_some(candidate)
 }
 fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHandle<R>, port: u16) -> Result<(), String> {
     // If a llama-server is already answering on this port, reuse it.
@@ -209,10 +202,10 @@ fn ensure_llama_server<R: tauri::Runtime>(state: &LlamaState, app: &tauri::AppHa
     if tool("curl").args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &health_url]).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200").unwrap_or(false) {
         return Ok(());
     }
-    let binary = llama_binary(app.path().resource_dir().ok());
-    let model = runtime_env().get("LOCAL_LLM_MODEL").cloned().filter(|m| !m.is_empty()).unwrap_or_else(|| "qwen2.5-3b-instruct-q4_k_m".into());
-    let model_path = local_llm_model_path(app, &model).ok_or_else(|| format!("LLAMA_MODEL_MISSING:{model}"))?;
-    let mut cmd = tool(&binary);
+    let binary = llama_binary()?;
+    let model = runtime_env().get("LOCAL_LLM_MODEL").filter(|m| ["qwen2.5-3b-instruct", "qwen2.5-3b-instruct-q4_k_m"].contains(&m.as_str())).cloned().unwrap_or_else(|| "qwen2.5-3b-instruct".into());
+    let model_path = local_llm_model_path(app, &model).ok_or_else(|| format!("LLAMA_MODEL_MISSING:{model}; install the model in Settings"))?;
+    let mut cmd = tool(binary);
     cmd.arg("-m").arg(&model_path)
         .arg("--port").arg(port.to_string())
         .arg("--host").arg("127.0.0.1")
@@ -509,10 +502,144 @@ fn whisper_bootstrap_status(state: tauri::State<'_, BootstrapState>) -> Option<B
 type ProgressCell = Arc<Mutex<Option<BootstrapProgress>>>;
 #[derive(Clone)]
 struct ModelDownloadState(ProgressCell);
+#[derive(Clone)]
+struct LlamaDownloadState(ProgressCell);
 /// Separate managed state so Whisper-model downloads never collide with the
 /// local-LLM download progress (Tauri manages state by type).
 #[derive(Clone)]
 struct WhisperDlState(ProgressCell);
+const LLAMA_VERSION: &str = "b11160";
+const LLAMA_RUNTIME_ASSETS: &[(&str, &str, &str)] = &[
+    ("linux-x64", "llama-b11160-bin-ubuntu-x64.tar.gz", "48ece24283876fc3401b737724008c03cbc4c7ba335b6c1aa2a7b6ce2d49e435"),
+    ("linux-arm64", "llama-b11160-bin-ubuntu-arm64.tar.gz", "4ffc2f68959e102219eaa8d007c9fd5b6e7d1cb298672c8945ec80b9f57b6076"),
+    ("macos-x64", "llama-b11160-bin-macos-x64.tar.gz", "8c9029bb2491c9c39a497bbd3499d38df0b1c134006bc0e3ec6b5b37319955c8"),
+    ("macos-arm64", "llama-b11160-bin-macos-arm64.tar.gz", "5679b3e952772a9f9a39f9d42d7f0eb3d4c424103fe56f5516507583a0c6e3fa"),
+    ("windows-x64", "llama-b11160-bin-win-cpu-x64.zip", "b144d125972c57eb30062524269b31bf981dfb81d36fad6a1494e18814a06acc"),
+];
+fn llama_runtime_asset() -> Result<(&'static str, &'static str), String> {
+    let key = if cfg!(target_os = "windows") { "windows-x64" }
+        else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") { "macos-arm64" }
+        else if cfg!(target_os = "macos") { "macos-x64" }
+        else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") { "linux-arm64" }
+        else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") { "linux-x64" }
+        else { return Err("LLAMA_PLATFORM_UNSUPPORTED".into()); };
+    let (_, name, sha) = LLAMA_RUNTIME_ASSETS.iter().find(|(platform, _, _)| *platform == key).unwrap();
+    Ok((*name, *sha))
+}
+fn sha256_file(path: &Path) -> Result<String, String> {
+    #[cfg(windows)]
+    let output = tool("certutil").args(["-hashfile", path.to_string_lossy().as_ref(), "SHA256"]).output();
+    #[cfg(target_os = "macos")]
+    let output = tool("shasum").args(["-a", "256"]).arg(path).output();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let output = tool("sha256sum").arg(path).output();
+    let output = output.map_err(|e| format!("SHA256_SPAWN:{e}"))?;
+    if !output.status.success() { return Err("SHA256_FAILED".into()); }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    #[cfg(windows)]
+    let digest = stdout.lines().nth(1).unwrap_or("").replace(' ', "").to_ascii_lowercase();
+    #[cfg(not(windows))]
+    let digest = stdout.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err("SHA256_OUTPUT_INVALID".into()); }
+    Ok(digest)
+}
+fn install_llama_runtime(state: &LlamaDownloadState) -> Result<(), String> {
+    let result = install_llama_runtime_inner(state);
+    if let Err(error) = &result {
+        if let Ok((asset, _)) = llama_runtime_asset() {
+            let root = state_dir().join("llama");
+            let _ = std::fs::remove_file(root.join(format!("{asset}.part")));
+            let _ = std::fs::remove_dir_all(root.join("installing"));
+    let _ = std::fs::remove_dir_all(root.join("runtime-new"));
+            let _ = std::fs::remove_dir_all(root.join("runtime-new"));
+        }
+        set_download(&state.0, "failed", "Local LLM runtime setup failed.", true, Some(error.clone()));
+    }
+    result
+}
+fn install_llama_runtime_inner(state: &LlamaDownloadState) -> Result<(), String> {
+    let (asset, expected_sha) = llama_runtime_asset()?;
+    let root = state_dir().join("llama");
+    let binary_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    if existing_llama(root.join("runtime")).is_some() { set_download(&state.0, "ready", "Local LLM runtime already installed.", true, None); return Ok(()); }
+    std::fs::create_dir_all(&root).map_err(|e| format!("LLAMA_DIR:{e}"))?;
+    let archive = root.join(format!("{asset}.part"));
+    let url = format!("https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_VERSION}/{asset}");
+    set_download(&state.0, "download", "Downloading local LLM runtime…", false, None);
+    let curl = tool("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&archive).arg(url).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
+    if !curl.status.success() { let _ = std::fs::remove_file(&archive); return Err(format!("LLAMA_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
+    set_download(&state.0, "verify", "Verifying runtime checksum…", false, None);
+    let runtime_hash = sha256_file(&archive);
+    if !matches!(&runtime_hash, Ok(actual) if actual == expected_sha) {
+        let _ = std::fs::remove_file(&archive);
+        return Err(match runtime_hash { Ok(_) => "LLAMA_CHECKSUM_MISMATCH".into(), Err(error) => error });
+    }
+    let staging = root.join("installing");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("LLAMA_STAGE:{e}"))?;
+    set_download(&state.0, "install", "Installing local LLM runtime…", false, None);
+    #[cfg(windows)]
+    let extract = tool("powershell").args(["-NoProfile", "-Command", "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force", archive.to_string_lossy().as_ref(), staging.to_string_lossy().as_ref()]).status();
+    #[cfg(not(windows))]
+    let extract = tool("tar").arg("-xzf").arg(&archive).arg("-C").arg(&staging).status();
+    let extraction = extract.map_err(|e| format!("LLAMA_EXTRACT:{e}"));
+    let _ = std::fs::remove_file(&archive);
+    if !extraction?.success() { let _ = std::fs::remove_dir_all(&staging); return Err("LLAMA_EXTRACT_FAILED".into()); }
+    let server = find_runtime_server(&staging, binary_name).ok_or_else(|| "LLAMA_SERVER_MISSING".to_string())?;
+    let server_parent = server.parent().ok_or_else(|| "LLAMA_SERVER_PARENT_MISSING".to_string())?;
+    let runtime_stage = root.join("runtime-new");
+    let _ = std::fs::remove_dir_all(&runtime_stage);
+    std::fs::create_dir_all(&runtime_stage).map_err(|e| format!("LLAMA_STAGE:{e}"))?;
+    std::fs::copy(&server, runtime_stage.join(binary_name)).map_err(|e| format!("LLAMA_COPY:{e}"))?;
+    for entry in std::fs::read_dir(server_parent).map_err(|e| format!("LLAMA_READ:{e}"))? {
+        let entry = entry.map_err(|e| format!("LLAMA_READ:{e}"))?;
+        let path = entry.path();
+        if path.is_file() && (path.extension().is_some_and(|ext| ["dll", "so", "dylib"].iter().any(|e| ext == *e)) || path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("lib"))) {
+            std::fs::copy(&path, runtime_stage.join(path.file_name().unwrap())).map_err(|e| format!("LLAMA_COPY:{}:{e}", path.display()))?;
+        }
+    }
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let mut permissions = std::fs::metadata(runtime_stage.join(binary_name)).map_err(|e| format!("LLAMA_PERMISSIONS:{e}"))?.permissions(); permissions.set_mode(0o755); std::fs::set_permissions(runtime_stage.join(binary_name), permissions).map_err(|e| format!("LLAMA_PERMISSIONS:{e}"))?; }
+    let final_dir = root.join("runtime");
+    std::fs::rename(&runtime_stage, &final_dir).map_err(|e| format!("LLAMA_INSTALL:{e}"))?;
+    let _ = std::fs::remove_dir_all(&staging);
+    set_download(&state.0, "ready", "Local LLM runtime ready.", true, None);
+    Ok(())
+}
+fn find_runtime_server(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() { if let Some(found) = find_runtime_server(&path, name) { return Some(found); } }
+        else if path.file_name().is_some_and(|file| file == name) { return Some(path); }
+    }
+    None
+}
+#[tauri::command]
+fn install_local_llm(state: tauri::State<'_, LlamaDownloadState>, model_state: tauri::State<'_, ModelDownloadState>) -> Result<(), String> {
+    if state.0.lock().ok().and_then(|g| g.clone()).is_some_and(|p| !p.done) { return Ok(()); }
+    set_download(&state.0, "starting", "Preparing Local LLM setup…", false, None);
+    let runtime = state.inner().clone();
+    let model = model_state.inner().clone();
+    let model_name = "qwen2.5-3b-instruct-q4_k_m".to_string();
+    thread::spawn(move || {
+        if let Err(error) = install_llama_runtime(&runtime) { set_download(&runtime.0, "failed", "Local LLM runtime setup failed.", true, Some(error)); return; }
+        if let Err(error) = run_model_download(&model, &model_name) { set_download(&runtime.0, "failed", "Local LLM model setup failed.", true, Some(error)); }
+        else { set_download(&runtime.0, "ready", "Local LLM is ready.", true, None); }
+    });
+    Ok(())
+}
+#[tauri::command]
+fn local_llm_setup_status(state: tauri::State<'_, LlamaDownloadState>, model_state: tauri::State<'_, ModelDownloadState>, app: tauri::AppHandle) -> serde_json::Value {
+    let model = "qwen2.5-3b-instruct";
+    let binary = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    let runtime_present = existing_llama(state_dir().join("llama/runtime")).is_some();
+    let model_path = local_llm_model_path(&app, model);
+    let model_present = model_path.as_ref().is_some_and(|path| sha256_file(path).is_ok_and(|sha| sha == LLM_MODEL_SHA256));
+    let progress = state.0.lock().ok().and_then(|g| g.clone());
+    let model_progress = model_state.0.lock().ok().and_then(|g| g.clone());
+    let effective_progress = model_progress.clone().filter(|p| !p.done).or(progress);
+    serde_json::json!({ "runtimePresent": runtime_present, "modelPresent": model_present, "progress": effective_progress, "modelProgress": model_progress, "model": model, "binary": binary })
+}
+
 const LLM_MODEL_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf";
 const LLM_MODEL_SHA256: &str = "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d";
 fn llm_model_file(model: &str) -> PathBuf { state_dir().join("models/llama").join(format!("{model}.gguf")) }
@@ -526,8 +653,13 @@ fn set_download(cell: &ProgressCell, phase: &str, message: &str, done: bool, err
 /// file:// URLs instead of a 2.1 GB network download.
 fn download_and_verify(cell: &ProgressCell, url: &str, expected_sha: &str, target: &Path) -> Result<String, String> {
     if target.is_file() {
-        set_download(cell, "ready", "Model already downloaded.", true, None);
-        return Ok(target.to_string_lossy().into_owned());
+        let existing_sha = sha256_file(target);
+        if matches!(&existing_sha, Ok(digest) if digest == expected_sha) {
+            set_download(cell, "ready", "Model already verified.", true, None);
+            return Ok(target.to_string_lossy().into_owned());
+        }
+        if existing_sha.is_err() { return Err(existing_sha.unwrap_err()); }
+        std::fs::remove_file(target).map_err(|e| format!("MODEL_REMOVE_INVALID:{e}"))?;
     }
     if let Some(parent) = target.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("MODEL_DIR:{e}"))?; }
     let part = PathBuf::from(format!("{}.part", target.display()));
@@ -538,9 +670,11 @@ fn download_and_verify(cell: &ProgressCell, url: &str, expected_sha: &str, targe
     let curl = tool("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(url).output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
     if !curl.status.success() { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_DOWNLOAD_FAILED:{}", String::from_utf8_lossy(&curl.stderr).trim())); }
     set_download(cell, "verify", "Verifying checksum…", false, None);
-    let digest = tool("sha256sum").arg(&part).output().map_err(|e| format!("SHA256_SPAWN:{e}"))?;
-    let actual = String::from_utf8_lossy(&digest.stdout).split_whitespace().next().unwrap_or("").to_string();
-    if actual != expected_sha { let _ = std::fs::remove_file(&part); return Err(format!("MODEL_CHECKSUM_MISMATCH:{actual}")); }
+    let actual = sha256_file(&part);
+    if !matches!(&actual, Ok(digest) if digest == expected_sha) {
+        let _ = std::fs::remove_file(&part);
+        return Err(match actual { Ok(digest) => format!("MODEL_CHECKSUM_MISMATCH:{digest}"), Err(error) => error });
+    }
     std::fs::rename(&part, target).map_err(|e| format!("MODEL_RENAME:{e}"))?;
     set_download(cell, "ready", "Model ready.", true, None);
     Ok(target.to_string_lossy().into_owned())
@@ -1306,6 +1440,7 @@ fn main() {
     let rag_state: RagState = RagState::default();
     let bootstrap_state = BootstrapState(Arc::new(Mutex::new(None)));
     let download_state = ModelDownloadState(Arc::new(Mutex::new(None)));
+    let llama_download_state = LlamaDownloadState(Arc::new(Mutex::new(None)));
     let whisper_dl_state = WhisperDlState(Arc::new(Mutex::new(None)));
     let app = tauri::Builder::default()
         .manage(jobs)
@@ -1313,11 +1448,12 @@ fn main() {
         .manage(rag_state.clone())
         .manage(bootstrap_state)
         .manage(download_state)
+        .manage(llama_download_state)
         .manage(whisper_dl_state.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, last_panic, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, start_youtube_analysis, preview_origin, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
+        .invoke_handler(tauri::generate_handler![app_info, last_panic, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, install_local_llm, local_llm_setup_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, start_youtube_analysis, preview_origin, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let _ = APP_HANDLE.set(app.handle().clone());
@@ -1356,6 +1492,38 @@ mod tests {
             match &self.old_whisper { Some(v) => std::env::set_var("WHISPER_COMMAND", v), None => std::env::remove_var("WHISPER_COMMAND") }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn llama_runtime_platform_assets_are_pinned_and_supported() {
+        assert_eq!(LLAMA_VERSION, "b11160");
+        assert_eq!(LLAMA_RUNTIME_ASSETS.len(), 5);
+        for (_, asset, digest) in LLAMA_RUNTIME_ASSETS {
+            assert!(asset.starts_with("llama-b11160-bin-"), "{asset}");
+            assert_eq!(digest.len(), 64, "{asset}");
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()), "{asset}");
+        }
+        assert_eq!(llama_runtime_asset().unwrap().0, LLAMA_RUNTIME_ASSETS.iter().find(|(platform, _, _)| *platform == if cfg!(target_os = "windows") { "windows-x64" } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") { "macos-arm64" } else if cfg!(target_os = "macos") { "macos-x64" } else if cfg!(target_arch = "aarch64") { "linux-arm64" } else { "linux-x64" }).unwrap().1);
+    }
+
+    #[test]
+    fn runtime_server_search_finds_expected_server_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("runtime-server");
+        let nested = guard.dir.join("bundle/bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        let server = nested.join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" });
+        std::fs::write(&server, b"server").unwrap();
+        assert_eq!(find_runtime_server(&guard.dir, server.file_name().unwrap().to_str().unwrap()), Some(server));
+    }
+
+    #[test]
+    fn sha256_file_hashes_files_without_loading_entire_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("sha256");
+        let file = guard.dir.join("hash.txt");
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(sha256_file(&file).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]
@@ -1406,8 +1574,7 @@ mod tests {
         // file:// URL keeps the test offline: same curl/sha path as the real 2.1 GB download.
         let source = guard.dir.join("weights.bin");
         std::fs::write(&source, b"local-first-llm-model-bytes").unwrap();
-        let sha_out = tool("sha256sum").arg(&source).output().expect("sha256sum");
-        let sha = String::from_utf8_lossy(&sha_out.stdout).split_whitespace().next().unwrap().to_string();
+        let sha = sha256_file(&source).unwrap();
         let url = format!("file://{}", source.display());
         let target = guard.dir.join("model.gguf");
         let state = ModelDownloadState(Arc::new(Mutex::new(None)));
@@ -1448,8 +1615,7 @@ mod tests {
         let guard = EnvGuard::new("stale-part");
         let source = guard.dir.join("weights.bin");
         std::fs::write(&source, b"local-first-llm-model-bytes").unwrap();
-        let sha_out = tool("sha256sum").arg(&source).output().expect("sha256sum");
-        let sha = String::from_utf8_lossy(&sha_out.stdout).split_whitespace().next().unwrap().to_string();
+        let sha = sha256_file(&source).unwrap();
         let target = guard.dir.join("model.gguf");
         // Simulate a leftover .part from an interrupted download.
         let part = PathBuf::from(format!("{}.part", target.display()));

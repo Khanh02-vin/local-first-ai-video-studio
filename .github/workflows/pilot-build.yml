@@ -1,0 +1,130 @@
+# macOS app bundle + zip built with a standard-library Python step, only run on macOS.
+name: pilot-build
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Fetch bundled resources
+        run: bash scripts/fetch-bundled-assets.sh
+      - name: Build macOS app
+        run: |
+          cd apps/web && npm ci && npm run build
+          cd ../desktop && npm ci && npx tauri build -b app --no-sign
+      - name: Package and checksum
+        run: |
+          mkdir -p dist/macos
+          cd apps/desktop/src-tauri/target/release/bundle/macos
+          ditto -c -k --sequesterRsrc --keepParent "Local-first AI Video Studio.app" "$GITHUB_WORKSPACE/dist/macos/Local-first AI Video Studio-macOS.zip"
+          ditto -x -k "$GITHUB_WORKSPACE/dist/macos/Local-first AI Video Studio-macOS.zip" "$RUNNER_TEMP/macos-unpack"
+          test -d "$RUNNER_TEMP/macos-unpack/Local-first AI Video Studio.app"
+          cd "$GITHUB_WORKSPACE/dist/macos"
+          shasum -a 256 *.zip > SHA256SUMS
+          printf 'Source revision: %s\nApp version: 0.1.0\nBuild: macOS app bundle, unsigned; first launch may require right-click > Open.\n' "$GITHUB_SHA" > BUILD-INFO.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pilot-macos
+          path: dist/macos/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Fetch bundled resources
+        shell: bash
+        run: bash scripts/fetch-bundled-assets.sh
+      - name: Verify required bundled helpers
+        shell: bash
+        run: |
+          RES=apps/desktop/src-tauri/resources
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe; do
+            test -f "$RES/$f" || { echo "missing $RES/$f" >&2; exit 1; }
+          done
+      - name: Build Windows app and MSI
+        shell: bash
+        run: |
+          cd apps/web && npm ci && npm run build
+          cd ../desktop && npm ci && npx tauri build -b msi
+      - name: Build and verify portable zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/desktop/src-tauri/target/release
+          mkdir -p 'portable/Local-first AI Video Studio'
+          APP='portable/Local-first AI Video Studio'
+          for exe in *.exe; do cp "$exe" "$APP/"; done
+          cp *.dll "$APP/" 2>/dev/null || true
+          RES=../../resources
+          cp -r "$RES/node" "$APP/node"
+          for bin in ffmpeg ffprobe; do
+            for cand in "$RES/$bin" "$RES/$bin.exe"; do [[ -f "$cand" ]] && cp "$cand" "$APP/"; done
+          done
+          mkdir -p "$APP/models"
+          cp "$RES"/models/*.pt "$APP/models/" 2>/dev/null || true
+          ROOT=../../../../..
+          cp -r "$ROOT/scripts" "$ROOT/adapters" "$ROOT/packages" "$ROOT/services" "$APP/"
+          cp -r "$ROOT/apps/web/build-node" "$APP/build-node"
+          printf 'Local-first AI Video Studio Portable\r\n\r\nExtract the ZIP, open the Local-first AI Video Studio folder, and run local-first-ai-video-studio.exe.\r\n' > "$APP/README.txt"
+          cd portable
+          7z a -tzip -mx=3 ../portable-windows.zip ./* >/dev/null
+          cd ..
+          7z t portable-windows.zip >/dev/null
+          entries=$(7z l -slt portable-windows.zip | awk -F' = ' '/^Path = / {print $2}' | tr '\\' '/')
+          while IFS= read -r entry; do
+            [[ "$entry" == 'Local-first AI Video Studio' || "$entry" == 'Local-first AI Video Studio/'* ]] || { echo "unexpected ZIP root entry: $entry" >&2; exit 1; }
+          done < <(printf '%s\n' "$entries" | tail -n +2)
+          grep -Fxq 'Local-first AI Video Studio/local-first-ai-video-studio.exe' <<< "$entries" || { echo 'portable executable missing from app folder' >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/dist/windows"
+          cp portable-windows.zip "$GITHUB_WORKSPACE/dist/windows/Local-first AI Video Studio Portable.zip"
+          cp bundle/msi/*.msi "$GITHUB_WORKSPACE/dist/windows/"
+          cd "$GITHUB_WORKSPACE/dist/windows"
+          portable_name='Local-first AI Video Studio Portable.zip'
+          msi_name=$(basename ./*.msi)
+          sha256sum "$portable_name" > SHA256SUMS-portable.txt
+          sha256sum "$msi_name" > SHA256SUMS-msi.txt
+          printf 'Source revision: %s\nApp version: 0.1.0\nPortable ZIP is unsigned. MSI signing depends on configured signing secrets.\n' "$GITHUB_SHA" > BUILD-INFO.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pilot-windows-portable
+          path: |
+            dist/windows/Local-first AI Video Studio Portable.zip
+            dist/windows/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish portable build to prerelease
+        if: ${{ runner.os == 'Windows' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist/windows"
+          sha256sum -c SHA256SUMS-portable.txt
+          gh release upload v0.1.1-pilot.1 \
+            "Local-first AI Video Studio Portable.zip" \
+            SHA256SUMS-portable.txt BUILD-INFO.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pilot-windows-msi
+          path: |
+            dist/windows/*.msi
+            dist/windows/BUILD-INFO.txt
+            dist/windows/SHA256SUMS-msi.txt
+          if-no-files-found: error
+          retention-days: 14

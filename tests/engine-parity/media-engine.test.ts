@@ -5,7 +5,10 @@ import { trackFacePath } from "../../packages/media-engine/reframe/index.ts";
 import { validateMediaInput } from "../../packages/media-engine/validation/index.ts";
 
 validateMediaInput({ duration: 60, width: 1920, height: 1080 });
-assert.throws(() => validateMediaInput({ duration: 0, width: 1920, height: 1080 }));
+assert.throws(() => validateMediaInput({ duration: 0, width: 1920, height: 1080 }), /Invalid media duration/);
+assert.throws(() => validateMediaInput({ duration: Number.NaN, width: 1920, height: 1080 }), /Invalid media duration/);
+assert.throws(() => validateMediaInput({ duration: 60, width: 0, height: 1080 }), /Invalid media dimensions/);
+assert.throws(() => validateMediaInput({ duration: 60, width: 1920, height: 1080.5 }), /Invalid media dimensions/);
 
 const tracked = trackFacePath([
   { time: 0, detections: [{ time: 0, x: 0.2, y: 0.2, width: 0.2, height: 0.2, confidence: 0.9 }] },
