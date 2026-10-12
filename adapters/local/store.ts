@@ -115,6 +115,12 @@ export class LocalStore {
     return status !== undefined && status !== "completed";
   }
   update(id: string, patch: Partial<Pick<LocalJob, "status" | "progress" | "error" | "outputBytes">>): LocalJob | undefined { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const columns = entries.map(([key]) => `${key === "outputBytes" ? "output_bytes" : key}=?`).join(","); this.db.prepare(`UPDATE jobs SET ${columns} WHERE id=?`).run(...entries.map(([, value]) => value), id); return this.get(id); }
+  retry(id: string): LocalJob | undefined {
+    const job = this.get(id);
+    if (!job || !["failed", "cancelled", "interrupted"].includes(job.status)) return undefined;
+    this.db.prepare("UPDATE jobs SET status='queued', progress=0, attempts=0, error=NULL, output_bytes=NULL WHERE id=?").run(id);
+    return this.get(id);
+  }
   recover(): void { this.db.prepare("UPDATE jobs SET status=CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'interrupted' END, error=CASE WHEN attempts < max_attempts THEN 'recovered after restart' ELSE 'attempt budget exhausted' END WHERE status='running'").run(); }
 }
 function artifactIsIntact(row: Raw): boolean {

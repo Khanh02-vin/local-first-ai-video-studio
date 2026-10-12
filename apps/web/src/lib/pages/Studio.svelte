@@ -8,6 +8,7 @@
   import { studioState } from "../studio-state.svelte.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
   import Icon from "../icons.svelte";
+  import RelatedYoutubeSearch from "../components/RelatedYoutubeSearch.svelte";
 
   // Keep-alive mounted by +layout.svelte: `active` tells this page it is the
   // visible one, so background polls only run while the user can see them.
@@ -15,7 +16,10 @@
 
   type Meta = { name: string; duration: number; width: number; height: number };
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
+  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; plans: Record<string, import("../../../../../packages/contracts/render-plan.ts").RenderPlan>; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
 
+  let projects = $state<Project[]>([]);
+  let projectId = $state("");
   let inputPath = $state("");
   let outputPath = $state("");
   let analyzeStart = $state(0);
@@ -37,6 +41,7 @@
   let selectedId = $state("");
   let youtubeUrl = $state("");
   let youtubeVideoId = $state("");
+  let relatedQuery = $state("");
   // Loopback base for the preview iframe: the packaged webview's tauri:// origin
   // carries no Referer, which YouTube rejects (error 153). Empty in the browser,
   // where the plain embed already works.
@@ -65,8 +70,59 @@
     if (typeof path === "string") await loadVideo(path);
   }
 
+  async function refreshProjects() {
+    if (!isTauri()) return;
+    try { projects = await invoke<Project[]>("project_list"); } catch { projects = []; }
+  }
+
+  async function persistProject(patch: Partial<Project> = {}) {
+    if (!isTauri() || !projectId) return;
+    const existing = projects.find((item) => item.id === projectId);
+    if (!existing) return;
+    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, plans: studioState.plans, ...patch };
+    try {
+      const saved = await invoke<Project>("project_save", { project: next });
+      projects = [saved, ...projects.filter((item) => item.id !== saved.id)];
+    } catch (error) { message = `Project save failed: ${String(error)}`; }
+  }
+
+  async function openProject(id: string) {
+    try {
+      const project = await invoke<Project>("project_get", { id });
+      hydrateProject(project);
+    } catch (error) { message = `Could not open project: ${String(error)}`; }
+  }
+
+  async function hydrateProject(project: Project) {
+    projectId = project.id; inputPath = project.sourcePath; meta = { name: project.sourceName, duration: project.sourceDuration, width: 0, height: 0 };
+    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? "";
+    studioState.projectId = project.id; studioState.sourcePath = project.sourcePath; studioState.sourceName = project.sourceName; studioState.sourceDuration = project.sourceDuration;
+    studioState.highlights = highlights; studioState.transcript = project.transcript as typeof studioState.transcript; studioState.selectedId = selectedId;
+    studioState.plans = project.plans ?? {}; studioState.plan = studioState.plans[selectedId] ?? null;
+    currentStep = highlights.length ? 4 : 2; message = "Project reopened.";
+    if (project.sourcePath && !/^https?:\/\//i.test(project.sourcePath)) {
+      try { await invoke("probe_video", { path: project.sourcePath }); }
+      catch { message = "Source file is missing or unavailable. Re-link the original file to render."; }
+    }
+  }
+
+  $effect(() => {
+    const id = studioState.projectId;
+    if (active && id && id !== projectId) void openProject(id);
+  });
+
+  async function ensureProject() {
+    if (!isTauri() || projectId || !inputPath) return;
+    try {
+      const project = await invoke<Project>("project_create", { sourcePath: inputPath, sourceName: meta?.name ?? inputPath.split(/[\\\\/]/).pop() ?? inputPath, sourceDuration: meta?.duration ?? 0 });
+      projectId = project.id; studioState.projectId = project.id; projects = [project, ...projects];
+    } catch (error) { message = `Could not create project: ${String(error)}`; }
+  }
+
   async function loadVideo(path: string) {
+    projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
     inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
+    studioState.highlights = []; studioState.selectedId = "";
     await reconnectJobs(false);
     try {
       const probe = JSON.parse(await invoke<string>("probe_video", { path }));
@@ -75,6 +131,8 @@
       studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; studioState.sourceDuration = Number(probe.format?.duration ?? 0);
     } catch { meta = { name: path.split(/[\\/]/).pop() ?? path, duration: 0, width: 0, height: 0 }; studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; }
     message = "Video loaded. Set the range and start analysis.";
+    await ensureProject();
+    await refreshProjects();
   }
 
   function onDrop(event: DragEvent) {
@@ -143,7 +201,13 @@
           const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? "";
           collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? "";
           if (result.videoId) youtubeVideoId = result.videoId;
-          studioState.highlights = highlights; studioState.selectedId = selectedId;
+          studioState.highlights = highlights; studioState.selectedId = selectedId; studioState.transcript = result.transcript ?? null;
+          if (projectId) {
+            const segments = (result.transcript as { segments?: { text?: string }[] } | null)?.segments ?? [];
+            relatedQuery = [result.title, highlights[0]?.title, result.topic, ...segments.slice(0, 12).map((segment) => segment.text)].filter(Boolean).join(" ").slice(0, 200);
+            await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId });
+          }
+
           message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
           currentStep = 4; busy = false; resetTimer(); break;
         }
@@ -180,16 +244,24 @@
     highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
     busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
+      projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
       inputPath = url;
       meta = { name: info.title, duration: info.duration, width: 0, height: 0 };
       studioState.sourcePath = url; studioState.sourceName = info.title; studioState.sourceDuration = info.duration;
+      const project = await invoke<Project>("project_create", { sourcePath: url, sourceName: info.title, sourceDuration: info.duration });
+      projectId = project.id; studioState.projectId = project.id; projects = [project, ...projects];
       youtubeUrl = "";
       await watch(info.id, false);
     } catch (error) {
       message = `YouTube analyze failed: ${String(error)}`;
       busy = false; resetTimer();
     }
+  }
+
+  function chooseCandidate(id: string) {
+    selectedId = id; studioState.selectedId = id;
+    void persistProject({ selectedId: id });
   }
 
   async function render() {
@@ -201,6 +273,7 @@
     busy = true;
     try {
       message = `Rendered: ${await invoke<string>("render_video", { input: inputPath, output: outputPath, start: candidate.start, duration: candidate.end - candidate.start, aspectRatio })}`;
+      await persistProject({ renders: [...(projects.find((item) => item.id === projectId)?.renders ?? []), { output: outputPath, status: "completed", highlightId: candidate.id }] });
     } catch (error) { message = `Render failed: ${String(error)}`; }
     finally { busy = false; }
   }
@@ -214,7 +287,7 @@
 
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   onMount(() => {
-    void refreshRuntime(); void reconnectJobs();
+    void refreshRuntime(); void reconnectJobs(); void refreshProjects();
     if (isTauri()) invoke<string>("preview_origin").then((base) => previewBase = base).catch(() => {});
     const unlisten = getCurrentWindow().onDragDropEvent((event) => {
       const payload = event.payload;
@@ -347,7 +420,7 @@
         {/if}
         <div class="candidates">
           {#each highlights as candidate}
-            <button class:selected={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => selectedId = candidate.id}>
+            <button class:selected={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => chooseCandidate(candidate.id)}>
               <strong>{candidate.title}</strong>
               <span>{clock(candidate.start)}–{clock(candidate.end)} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
               {#if candidate.hook}<small>{candidate.hook}</small>{/if}
@@ -376,6 +449,9 @@
           <p class="hint">Seek preview streams from YouTube — nothing is rendered until you export.</p>
         </div>
       {/if}
+      {#if relatedQuery}
+        <RelatedYoutubeSearch initialQuery={relatedQuery} />
+      {/if}
     {:else}
       <div class="card"><p class="hint">No highlights yet. Run an analysis first.</p><button class="ghost wide" onclick={() => currentStep = 2}>← Back to config</button></div>
     {/if}
@@ -384,8 +460,12 @@
     <p class="message" aria-live="polite">{message}</p>
 
     <div class="panel">
-      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Recent jobs</span></span><span class="badge">{resumableJobs.length}</span></div>
-      {#if resumableJobs.length}{#each resumableJobs as job}<div class="row"><div class="row-body"><span class="row-title">{job.id.slice(-8)}</span><span class="row-sub">{job.status} · {job.phase}</span></div><div class="row-actions">{#if job.status === "queued" || job.status === "running"}<button class="btn btn-sm" disabled={busy} onclick={() => watch(job.id, true)}>Continue</button>{/if}{#if job.status === "failed"}<button class="btn btn-sm" disabled={busy} onclick={() => retryJob(job.id)}>Retry</button>{/if}</div></div>{/each}{:else}<p class="note">No projects yet — analyze a video to see results here.</p>{/if}
+      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Recent projects</span></span><span class="badge">{projects.length}</span></div>
+      {#if projects.length}{#each projects as project}<div class="row"><div class="row-body"><span class="row-title">{project.title}</span><span class="row-sub">{project.highlights.length} clips · {project.sourceName}</span></div><div class="row-actions"><button class="btn btn-sm" onclick={() => openProject(project.id)}>Open</button></div></div>{/each}{:else}<p class="note">No projects yet — load a local video to create one.</p>{/if}
+    </div>
+    <div class="panel">
+      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Analysis jobs</span></span><span class="badge">{resumableJobs.length}</span></div>
+      {#if resumableJobs.length}{#each resumableJobs as job}<div class="row"><div class="row-body"><span class="row-title">{job.id.slice(-8)}</span><span class="row-sub">{job.status} · {job.phase}</span></div><div class="row-actions">{#if job.status === "queued" || job.status === "running"}<button class="btn btn-sm" disabled={busy} onclick={() => watch(job.id, true)}>Continue</button>{/if}{#if job.status === "failed"}<button class="btn btn-sm" disabled={busy} onclick={() => retryJob(job.id)}>Retry</button>{/if}</div></div>{/each}{:else}<p class="note">No analysis jobs yet.</p>{/if}
     </div>
       </div>
     <div class="stage-foot">

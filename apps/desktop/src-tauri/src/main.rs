@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+mod project_store;
+
 /// True once a panic unwound through the process; gates the crash-report sleep
 /// after the event loop stops.
 static PANICKED: AtomicBool = AtomicBool::new(false);
@@ -728,6 +730,53 @@ fn whisper_model_download_status(state: tauri::State<'_, WhisperDlState>) -> ser
     serde_json::json!({ "progress": progress, "modelPresent": present, "model": "small" })
 }
 
+// --- Public YouTube search ------------------------------------------------------
+fn youtube_data_api_key() -> Result<String, String> {
+    std::env::var("YOUTUBE_API_KEY").ok().filter(|key| !key.trim().is_empty())
+        .or_else(|| runtime_env().get("YOUTUBE_API_KEY").cloned().filter(|key| !key.trim().is_empty()))
+        .ok_or_else(|| "YT_API_KEY_MISSING: set YOUTUBE_API_KEY in the app runtime environment or runtime.env".into())
+}
+
+fn youtube_search_query(query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() { return Err("YT_SEARCH_QUERY_EMPTY".into()); }
+    if query.chars().count() > 200 { return Err("YT_SEARCH_QUERY_TOO_LONG: maximum 200 characters".into()); }
+    Ok(query.to_string())
+}
+
+#[tauri::command]
+fn youtube_search_videos(query: String) -> Result<serde_json::Value, String> {
+    let query = youtube_search_query(&query)?;
+    let key = config_value(&youtube_data_api_key()?);
+    // Keep the key out of the curl process arguments; curl reads its URL-encoded
+    // parameters from stdin, and its config's quoted-value syntax is escaped here.
+    fn config_value(value: &str) -> String { value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r") }
+    use std::io::Write;
+    let mut child = tool("curl").args(["-sS", "--get", "https://www.googleapis.com/youtube/v3/search", "--config", "-"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("YT_SEARCH_SPAWN:{e}"))?;
+    let config = format!("data-urlencode = \"key={}\"\ndata-urlencode = \"part=snippet\"\ndata-urlencode = \"type=video\"\ndata-urlencode = \"maxResults=8\"\ndata-urlencode = \"q={}\"\n", config_value(&key), config_value(&query));
+    child.stdin.take().ok_or("YT_SEARCH_STDIN")?.write_all(config.as_bytes()).map_err(|e| format!("YT_SEARCH_WRITE:{e}"))?;
+    let output = child.wait_with_output().map_err(|e| format!("YT_SEARCH_WAIT:{e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| format!("YT_SEARCH_RESPONSE:{}", String::from_utf8_lossy(&output.stderr)))?;
+    if let Some(error) = value.get("error") {
+        let reason = error["errors"][0]["reason"].as_str().unwrap_or("");
+        return Err(if ["quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"].contains(&reason) {
+            format!("YT_SEARCH_QUOTA: YouTube Data API quota exceeded ({})", error["message"].as_str().unwrap_or(reason))
+        } else { format!("YT_SEARCH_API: {}", error["message"].as_str().unwrap_or("request failed")) });
+    }
+    let videos: Vec<serde_json::Value> = value["items"].as_array().into_iter().flatten().filter_map(|item| {
+        let id = item["id"]["videoId"].as_str()?;
+        Some(serde_json::json!({
+            "videoId": id,
+            "title": item["snippet"]["title"].as_str().unwrap_or("Untitled video"),
+            "thumbnail": item["snippet"]["thumbnails"]["medium"]["url"].as_str().or(item["snippet"]["thumbnails"]["default"]["url"].as_str()).unwrap_or(""),
+            "url": format!("https://www.youtube.com/watch?v={id}"),
+        }))
+    }).collect();
+    Ok(serde_json::json!({ "videos": videos }))
+}
+
 // --- YouTube "own channel" mode (Option C) -------------------------------------
 // Customer connects their own Google account once (OAuth loopback flow in the
 // system browser); the app then lists their uploads and pulls captions through
@@ -1317,8 +1366,58 @@ fn preview_origin() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>) -> Result<String, String> {
-    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
+fn project_list() -> Result<Vec<project_store::Project>, String> { project_store::list(&state_dir()) }
+
+#[tauri::command]
+fn project_get(id: String) -> Result<project_store::Project, String> { project_store::get(&state_dir(), &id) }
+
+#[tauri::command]
+fn project_save(project: project_store::Project) -> Result<project_store::Project, String> { project_store::save(&state_dir(), project) }
+
+#[tauri::command]
+fn project_create(source_path: String, source_name: String, source_duration: f64) -> Result<project_store::Project, String> {
+    if !source_duration.is_finite() || source_duration < 0.0 { return Err("INVALID_SOURCE_DURATION".into()); }
+    let id = format!("project-{}", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| format!("CLOCK:{e}"))?.as_nanos());
+    project_store::save(&state_dir(), project_store::Project { id, title: source_name.clone(), source_path, source_name, source_duration, analysis_job_id: None, analysis_result_id: None, transcript: None, highlights: Vec::new(), selected_id: None, plans: serde_json::json!({}), renders: Vec::new(), updated_at: String::new() })
+}
+
+fn run_local_render(app: &tauri::AppHandle, command: &str, value: Option<&str>) -> Result<serde_json::Value, String> {
+    let script = helper_script(app, "local-render.ts")?;
+    let mut cmd = tool(node_bin(app));
+    cmd.args(NODE_ARGS).arg(script).arg(command);
+    if let Some(value) = value { cmd.arg(value); }
+    let env = helper_env(app, &[]);
+    let ffmpeg_set = env.iter().any(|(key, value)| key == "FFMPEG_PATH" && !value.is_empty());
+    let ffprobe_set = env.iter().any(|(key, value)| key == "FFPROBE_PATH" && !value.is_empty());
+    for (key, value) in env { cmd.env(key, value); }
+    if !ffmpeg_set { cmd.env("FFMPEG_PATH", ffmpeg_bin(app)); }
+    if !ffprobe_set { cmd.env("FFPROBE_PATH", ffprobe_bin(app)); }
+    let output = cmd.output().map_err(|e| format!("LOCAL_RENDER_SPAWN:{e}"))?;
+    if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("LOCAL_RENDER_JSON:{e}"))
+}
+
+#[tauri::command]
+fn render_enqueue(app: tauri::AppHandle, request: serde_json::Value) -> Result<serde_json::Value, String> {
+    run_local_render(&app, "enqueue", Some(&request.to_string()))
+}
+
+#[tauri::command]
+fn render_list(app: tauri::AppHandle) -> Result<serde_json::Value, String> { run_local_render(&app, "list", None) }
+
+#[tauri::command]
+fn render_get(app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> { run_local_render(&app, "get", Some(&id)) }
+
+#[tauri::command]
+fn render_retry(app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> { run_local_render(&app, "retry", Some(&id)) }
+
+#[tauri::command]
+async fn render_drain(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || run_local_render(&app, "drain", None)).await.map_err(|e| format!("LOCAL_RENDER_TASK:{e}"))?
+}
+
+#[tauri::command]
+fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>) -> Result<String, String> {    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
     let output_path = Path::new(&output).canonicalize().unwrap_or_else(|_| Path::new(&output).to_path_buf());
     // YouTube inputs skip the local file checks and resolve fresh CDN URLs;
     // -ss/-t before each -i on HTTP becomes a range request (only the section
@@ -1453,7 +1552,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(move |app| { resume_queued_jobs(app.handle().clone(), supervisor_jobs.clone()); Ok(()) })
-        .invoke_handler(tauri::generate_handler![app_info, last_panic, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, install_local_llm, local_llm_setup_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, start_youtube_analysis, preview_origin, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions])
+        .invoke_handler(tauri::generate_handler![app_info, last_panic, license_status, set_runtime_model, set_highlight_strategy, highlight_strategy_status, start_local_llm, stop_local_llm, rag_server_url, bootstrap_whisper, whisper_bootstrap_status, download_llm_model, model_download_status, install_local_llm, local_llm_setup_status, runtime_status, storage_status, clear_analysis_cache, preflight_analyze, start_analysis, start_youtube_analysis, preview_origin, analysis_status, list_analysis_jobs, retry_analysis, abandon_analysis, stop_analysis, probe_video, render_video, render_enqueue, render_list, render_get, render_retry, render_drain, crawl_playlist, download_whisper_model, whisper_model_download_status, youtube_search_videos, youtube_oauth_start, youtube_oauth_status, youtube_oauth_disconnect, youtube_channel_videos, youtube_ingest_captions, project_list, project_get, project_save, project_create])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let _ = APP_HANDLE.set(app.handle().clone());
@@ -1492,6 +1591,13 @@ mod tests {
             match &self.old_whisper { Some(v) => std::env::set_var("WHISPER_COMMAND", v), None => std::env::remove_var("WHISPER_COMMAND") }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn youtube_search_query_is_trimmed_and_bounded() {
+        assert_eq!(youtube_search_query("  related topic  ").unwrap(), "related topic");
+        assert_eq!(youtube_search_query(" \n ").unwrap_err(), "YT_SEARCH_QUERY_EMPTY");
+        assert!(youtube_search_query(&"x".repeat(201)).unwrap_err().contains("YT_SEARCH_QUERY_TOO_LONG"));
     }
 
     #[test]

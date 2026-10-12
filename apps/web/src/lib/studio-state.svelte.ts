@@ -12,4 +12,6 @@ export const studioState = $state<{
   transcript: Transcript | null;
   selectedId: string;
   plan: RenderPlan | null;
-}>({ sourcePath: "", sourceName: "", sourceDuration: 0, highlights: [], transcript: null, selectedId: "", plan: null });
+  projectId: string;
+  plans: Record<string, RenderPlan>;
+}>({ sourcePath: "", sourceName: "", sourceDuration: 0, highlights: [], transcript: null, selectedId: "", plan: null, projectId: "", plans: {} });
