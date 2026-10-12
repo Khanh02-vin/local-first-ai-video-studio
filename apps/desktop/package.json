@@ -5,7 +5,8 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "tauri build",
+    "test:local-bridge": "cd ../.. && node --experimental-strip-types tests/local/desktop-bridge.test.ts"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4"

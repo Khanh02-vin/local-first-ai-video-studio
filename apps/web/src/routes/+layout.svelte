@@ -45,6 +45,7 @@
 
   const items = [
     { href: "/", id: "studio", label: "Studio" },
+    { href: "/projects", id: "project", label: "Projects" },
     { href: "/editor/demo", id: "editor", label: "Editor" },
     { href: "/youtube", id: "youtube", label: "YouTube Studio" },
     { href: "/settings", id: "settings", label: "Settings" },
@@ -120,7 +121,7 @@
       <span class="rail-mark" title="Local-first AI Video Studio">LF</span>
       {#each items as item}
         <a class="rail-link" class:on={isOn(item)} href={item.href} title={item.label} aria-label={item.label}>
-          <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : "studio"} />
+          <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : item.id === "project" ? "folder" : "studio"} />
         </a>
       {/each}
       <div class="rail-foot">

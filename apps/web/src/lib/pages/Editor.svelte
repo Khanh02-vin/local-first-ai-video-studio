@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
+  import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
   import { onDestroy } from "svelte";
   import { studioState } from "../studio-state.svelte.ts";
   import Icon from "../icons.svelte";
@@ -18,6 +18,7 @@
   let selectedId = fallback.id;
   let state: EditorState = createEditorState("demo-source", 60, fallback);
   let saved = false;
+  let saveError = "";
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let powered = false;
   let playing = false;
@@ -46,7 +47,7 @@
       else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }); }
       else handled = false;
     } catch { handled = false; }
-    if (handled) { studioState.plan = state.plan; event.preventDefault(); }
+    if (handled) { studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; event.preventDefault(); }
   }
 
   function onTimelineMouseDown(event: MouseEvent) {
@@ -62,7 +63,7 @@
       let nextEnd = dragStartRange.end + movedByClientX;
       if (nextStart < 0) { nextEnd += -nextStart; nextStart = 0; }
       if (nextEnd > sourceDuration) { nextStart -= nextEnd - sourceDuration; nextEnd = sourceDuration; }
-      try { state = updateRange(state, { start: nextStart, end: nextEnd }); studioState.plan = state.plan; } catch { /* keep the last valid range */ }
+      try { state = updateRange(state, { start: nextStart, end: nextEnd }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep the last valid range */ }
       moveEvent.preventDefault();
     };
     const onUp = () => {
@@ -86,10 +87,10 @@
       const t = ((moveEvent.clientX - rect.left) / rect.width) * sourceDuration;
       if (dragging === "in") {
         const nextStart = Math.max(0, Math.min(t, dragStartRange.end - 0.2));
-        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }); studioState.plan = state.plan; seek(nextStart); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; seek(nextStart); } catch { /* keep last valid range */ }
       } else {
         const nextEnd = Math.min(sourceDuration, Math.max(t, dragStartRange.start + 0.2));
-        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }); studioState.plan = state.plan; seek(nextEnd); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; seek(nextEnd); } catch { /* keep last valid range */ }
       }
       moveEvent.preventDefault();
     };
@@ -110,9 +111,10 @@
     const initial = studioState.selectedId || candidates[0]?.id || fallback.id;
     const picked = candidates.find((candidate) => candidate.id === initial) ?? fallback;
     selectedId = picked.id;
-    state = studioState.plan ? { ...state, plan: studioState.plan } : createEditorState(picked.sourceArtifactId || "demo-source", sourceDuration, picked);
+    const plan = studioState.plans[initial] ?? studioState.plan;
+    state = plan ? { ...state, selected: picked, plan } : createEditorState(picked.sourceArtifactId || "demo-source", sourceDuration, picked);
     if (studioState.transcript && !state.plan.captions.length) state = loadTranscriptCaptions(state, studioState.transcript);
-    studioState.plan = state.plan;
+    studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
     currentTime = range.start;
   }
   $: if (active) loadFromStudio();
@@ -121,10 +123,10 @@
   function select(id: string) {
     const candidate = candidates.find((item) => item.id === id) ?? fallback;
     selectedId = id;
-    state = createEditorState(candidate.sourceArtifactId || "demo-source", sourceDuration, candidate);
+    state = studioState.plans[id] ? { ...state, selected: candidate, plan: studioState.plans[id] } : createEditorState(candidate.sourceArtifactId || "demo-source", sourceDuration, candidate);
     studioState.selectedId = id;
-    studioState.plan = state.plan;
-    currentTime = candidate.start;
+    studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
+    currentTime = state.plan.ranges[0]?.start ?? candidate.start;
   }
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   function pct(seconds: number) { return `${Math.max(0, Math.min(100, (seconds / Math.max(sourceDuration, 1)) * 100))}%`; }
@@ -134,15 +136,30 @@
   function seekTimeline(event: MouseEvent) { const rect = (event.currentTarget as HTMLElement).getBoundingClientRect(); seek(((event.clientX - rect.left) / rect.width) * sourceDuration); }
   function setRangeEdge(edge: "start" | "end", value: number) {
     const next = edge === "start" ? Math.min(value, range.end - 0.1) : Math.max(value, range.start + 0.1);
-    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }); studioState.plan = state.plan; } catch { /* keep the last valid range */ }
+    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep the last valid range */ }
   }
-  function setAspect(value: "9:16" | "1:1" | "16:9") { state = updateAspectRatio(state, value); studioState.plan = state.plan; }
-  function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); studioState.plan = state.plan; } catch { /* validation follows the contract */ } }
-  function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; studioState.plan = state.plan; }
-  function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; studioState.plan = state.plan; }
-  function save() { if (!isTauri()) return; saved = true; studioState.plan = state.plan; if (saveTimer) clearTimeout(saveTimer); saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600); }
+  function setAspect(value: "9:16" | "1:1" | "16:9") { state = updateAspectRatio(state, value); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
+  function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* validation follows the contract */ } }
+  function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
+  function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
+  async function save() {
+    if (!isTauri() || !studioState.projectId || !selectedId) return;
+    saved = false; saveError = "";
+    const plans = { ...studioState.plans, [selectedId]: state.plan };
+    try {
+      const project = await invoke<Record<string, unknown>>("project_get", { id: studioState.projectId });
+      await invoke("project_save", { project: { ...project, selectedId, plans } });
+      studioState.plans = plans;
+      studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
+      saved = true;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600);
+    } catch (error) {
+      saved = false; saveError = `Could not save render plan: ${String(error)}`;
+    }
+  }
   onDestroy(() => { if (saveTimer) clearTimeout(saveTimer); });
-  function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); studioState.plan = state.plan; } catch { /* keep current valid hook */ } }
+  function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep current valid hook */ } }
 </script>
 
 <main class="bench editor-workspace">
@@ -170,6 +187,7 @@
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
       {#if !isTauri()}<p class="note">Save and export are available in the installed desktop app.</p>{/if}
       <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>
+      {#if saveError}<div class="message" role="alert">{saveError}</div>{/if}
       {#if saved}<div class="save-toast" role="status" aria-live="polite"><Icon name="check" size={16} />Saved locally</div>{/if}
     </div>
   </aside>
@@ -214,7 +232,7 @@
     <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Text &amp; hook</span></span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Caption</button></div>
       {#if activeCaption}
         <textarea aria-label="Caption text" value={draftCaption} oninput={(event) => setCaptionText(event.currentTarget.value)}></textarea>
-        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; }} /></label></div>
+        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }} /></label></div>
         <button class="btn btn-danger btn-wide btn-sm" onclick={deleteCaption}>Remove caption</button>
       {:else}<p class="note">No caption cue yet. Add one or load transcript cues.</p>{/if}
       <div class="panel" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
