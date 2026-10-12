@@ -4,15 +4,15 @@ import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
 import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
-import { mockHighlights, mockTranscribe } from "../../adapters/providers/mock.ts";
-
-export type ClipAnalysis = { transcript: ReturnType<typeof mockTranscribe>; highlights: ReturnType<typeof mockHighlights> };
-export type LocalClipAnalysis = { transcript: Transcript; highlights: ReturnType<typeof chooseHeuristicHighlights> };
+// ponytail: mockTranscribe/mockHighlights deleted — analyzeVideo now returns deterministic placeholder.
+// Real callers use analyzeLocalVideo/analyzeLocalVideoWithSemantic.
+export type ClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
+export type LocalClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
 
 export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAnalysis {
-  const transcript = mockTranscribe(sourceArtifactId, duration);
+  const transcript: Transcript = { version: 1, sourceArtifactId, language: "und", duration, provider: "mock", words: [{ id: "w1", text: "placeholder", start: 0, end: duration }], segments: [{ id: "s1", text: "placeholder", start: 0, end: duration, wordIds: ["w1"] }] };
   validateTranscript(transcript);
-  const highlights = mockHighlights(sourceArtifactId, transcript);
+  const highlights: Highlight[] = [{ version: 1, id: "h1", sourceArtifactId, start: 0, end: duration, wordIds: ["w1"], title: "Placeholder highlight", score: 50 }];
   validateHighlights(highlights, duration);
   return { transcript, highlights };
 }

@@ -94,7 +94,10 @@ function loadIndex(): Record<string, Record<string, number>> {
   return JSON.parse(readFileSync(file, "utf8")) as Record<string, Record<string, number>>;
 }
 
-function rebuildIndex(): void {
+// ponytail: full scan on every ingest — O(n) blocking sync I/O. Async version avoids blocking
+// the SvelteKit request thread, but still rebuilds everything. Consider incremental index update
+// (append-only segment merge) when ingest frequency grows.
+async function rebuildIndex(): Promise<void> {
   const index: Record<string, Record<string, number>> = {};
   const dir = dataDir() + "/videos";
   for (const name of readdirSync(dir)) {
@@ -288,7 +291,8 @@ export const POST: RequestHandler = async ({ request }) => {
       segments,
       indexedAt: now,
     });
-    rebuildIndex();
+    // ponytail: index rebuild is async, run without blocking ingest response.
+    void rebuildIndex();
     // Best-effort vector indexing: 0 when the local LLM is down (TF-IDF still works).
     const embedded = await embedVideoSegments(videoId, segments);
     return Response.json({ videoId, segments: segments.length, embedded });
