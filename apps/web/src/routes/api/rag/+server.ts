@@ -46,6 +46,7 @@ type VideoDoc = {
   durationSeconds: number;
   segments: Segment[];
   indexedAt: string;
+  idempotencyKey?: string;
 };
 type PlaylistDoc = {
   id: string;
@@ -271,7 +272,7 @@ export const POST: RequestHandler = async ({ request }) => {
   if (pathname === "/api/rag/ingest") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
-    const { videoUrl, title, segments } = body as { videoUrl?: string; title?: string; segments?: Segment[] };
+    const { videoUrl, title, segments, idempotencyKey } = body as { videoUrl?: string; title?: string; segments?: Segment[]; idempotencyKey?: string };
     if (typeof videoUrl !== "string") return jsonError(400, "VIDEO_URL_REQUIRED");
     const videoId = parseVideoIdFromUrl(videoUrl);
     if (!videoId || !isValidVideoId(videoId)) return jsonError(400, "UNPARSEABLE_VIDEO_ID");
@@ -279,6 +280,13 @@ export const POST: RequestHandler = async ({ request }) => {
     for (const segment of segments) {
       if (typeof segment?.start !== "number" || typeof segment?.end !== "number" || typeof segment?.text !== "string" || segment.end <= segment.start) {
         return jsonError(400, "INVALID_SEGMENT");
+      }
+    }
+    // Idempotency: check if video with same idempotencyKey already exists
+    if (idempotencyKey) {
+      const existing = loadVideo(videoId);
+      if (existing?.idempotencyKey === idempotencyKey) {
+        return Response.json({ videoId, segments: existing.segments.length, embedded: 0, idempotent: true });
       }
     }
     const now = new Date().toISOString();
@@ -290,12 +298,13 @@ export const POST: RequestHandler = async ({ request }) => {
       durationSeconds: Math.max(...segments.map((s) => s.end)),
       segments,
       indexedAt: now,
+      idempotencyKey,
     });
     // ponytail: index rebuild is async, run without blocking ingest response.
     void rebuildIndex();
     // Best-effort vector indexing: 0 when the local LLM is down (TF-IDF still works).
     const embedded = await embedVideoSegments(videoId, segments);
-    return Response.json({ videoId, segments: segments.length, embedded });
+    return Response.json({ videoId, segments: segments.length, embedded, idempotent: false });
   }
 
   if (pathname === "/api/rag/query") {
