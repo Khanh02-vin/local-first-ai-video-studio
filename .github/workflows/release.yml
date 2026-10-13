@@ -263,9 +263,11 @@ jobs:
             Desktop builds (local-first, offline).
 
             - **Windows:** `windows-installer/*.msi` — signed
+            - **Windows (Portable):** `windows-portable/*.zip` — no install needed
             - **macOS:** `macos-app/*.zip` — unzip → drag `.app` to Applications (unsigned: right-click → Open)
             - **Linux:** `linux-installer/*.AppImage` — `chmod +x` then run
           files: |
+            dist/windows-portable/*.zip
             dist/**/*.msi
             dist/**/*.AppImage
             dist/macos-app/*.zip
