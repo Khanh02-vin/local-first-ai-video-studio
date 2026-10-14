@@ -14,7 +14,10 @@ assert.match(studio, /async function renderSelected/, "selected clips must rende
 assert.match(studio, /plan\s*\}\);/, "render must pass the selected RenderPlan");
 assert.match(studio, /selectedIds\s*,\s*plans:/, "multi-selection must be saved on the project");
 assert.match(bridge, /plan:\s*Option<serde_json::Value>/, "render command must accept an optional plan");
-assert.match(bridge, /drawtext/, "FFmpeg export must overlay hook/captions");
+assert.match(bridge, /ass_dialogue\(captions, start, duration\)/, "desktop export must build clip-relative ASS captions");
+assert.match(bridge, /filters\.push\(format!\([\s\S]*?ass='/, "desktop export must burn ASS captions into FFmpeg output");
+assert.match(bridge, /drawtext=text=/, "hook overlay must remain available");
+assert.doesNotMatch(bridge, /drawtext=text='\{\}':x=\(w-text_w\)\/2:y=h\*0\.78/, "captions must not be rendered as per-cue drawtext");
 assert.match(ranking, /rankCandidates/, "related results must be reranked from source semantics");
 
 console.log("clip workflow wiring tests: ok");

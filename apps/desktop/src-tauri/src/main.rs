@@ -1416,6 +1416,60 @@ async fn render_drain(app: tauri::AppHandle) -> Result<serde_json::Value, String
     tauri::async_runtime::spawn_blocking(move || run_local_render(&app, "drain", None)).await.map_err(|e| format!("LOCAL_RENDER_TASK:{e}"))?
 }
 
+struct TemporarySubtitle(PathBuf);
+
+impl Drop for TemporarySubtitle {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+fn ass_timestamp(seconds: f64) -> String {
+    let centiseconds = (seconds.max(0.0) * 100.0).floor() as u64;
+    format!("{}:{:02}:{:02}.{:02}", centiseconds / 360_000, centiseconds / 6_000 % 60, centiseconds / 100 % 60, centiseconds % 100)
+}
+
+fn escape_ass_text(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('{', "\\{").replace('}', "\\}").replace('\r', " ").replace('\n', " ")
+}
+
+fn ass_dialogue(captions: &[serde_json::Value], start: f64, duration: f64) -> Result<Option<String>, String> {
+    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
+    let end = start + duration;
+    let mut events = Vec::new();
+    for caption in captions {
+        let text = caption["text"].as_str().ok_or("INVALID_RENDER_CAPTION")?;
+        let cue_start = caption["start"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
+        let cue_end = caption["end"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
+        if !cue_start.is_finite() || !cue_end.is_finite() || cue_end <= cue_start { return Err("INVALID_RENDER_CAPTION".into()); }
+        let from = cue_start.max(start);
+        let to = cue_end.min(end);
+        if to > from { events.push(format!("Dialogue: 0,{},{},Shorts,,0,0,0,,{}", ass_timestamp(from - start), ass_timestamp(to - start), escape_ass_text(text))); }
+    }
+    if events.is_empty() { return Ok(None); }
+    let header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Shorts,Arial,70,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,1,6,0,2,40,40,650,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+    Ok(Some(format!("{header}{}\n", events.join("\n"))))
+}
+
+fn write_temporary_ass(contents: &str) -> Result<TemporarySubtitle, String> {
+    use std::io::Write;
+    for attempt in 0..100 {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| format!("CLOCK:{e}"))?.as_nanos();
+        let path = std::env::temp_dir().join(format!("lfai-subtitle-{}-{suffix}-{attempt}.ass", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(contents.as_bytes()) { let _ = std::fs::remove_file(&path); return Err(format!("SUBTITLE_WRITE:{error}")); }
+                return Ok(TemporarySubtitle(path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("SUBTITLE_CREATE:{error}")),
+        }
+    }
+    Err("SUBTITLE_TEMP_COLLISION".into())
+}
+
+fn escape_ass_filter_path(path: &str) -> String {
+    path.replace('\\', "/").replace(':', "\\:").replace('\'', "\\'").replace(',', "\\,").replace('[', "\\[").replace(']', "\\]").replace(';', "\\;")
+}
+
 #[tauri::command]
 fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>, plan: Option<serde_json::Value>) -> Result<String, String> {    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
     let output_path = Path::new(&output).canonicalize().unwrap_or_else(|_| Path::new(&output).to_path_buf());
@@ -1434,6 +1488,7 @@ fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64
     let crop = match ratio.as_str() { "1:1" => "crop=ih:ih:(iw-ih)/2:0,scale=1080:1080", "16:9" => "crop=ih*16/9:ih:(iw-ih*16/9)/2:0,scale=1920:1080", _ => "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" };
     fn drawtext_escape(text: &str) -> String { text.replace('\\', "\\\\").replace(':', "\\:").replace('\'', "\\'").replace('%', "\\%").replace(',', "\\,").replace('[', "\\[").replace(']', "\\]").replace(';', "\\;") }
     let mut filters = vec![crop.to_string()];
+    let mut subtitle_file = None;
     if let Some(plan) = plan {
         if let Some(hook) = plan.get("hook").filter(|hook| !hook.is_null()) {
             let text = hook["text"].as_str().ok_or("INVALID_RENDER_HOOK")?;
@@ -1444,13 +1499,10 @@ fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64
             if to > from { filters.push(format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.12:fontsize=h/18:fontcolor=white:borderw=3:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text))); }
         }
         if let Some(captions) = plan.get("captions").and_then(serde_json::Value::as_array) {
-            for caption in captions {
-                let text = caption["text"].as_str().ok_or("INVALID_RENDER_CAPTION")?;
-                let cue_start = caption["start"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
-                let cue_end = caption["end"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
-                if !cue_start.is_finite() || !cue_end.is_finite() || cue_end <= cue_start { return Err("INVALID_RENDER_CAPTION".into()); }
-                let from = (cue_start - start).max(0.0); let to = (cue_end - start).min(duration);
-                if to > from { filters.push(format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.78:fontsize=h/24:fontcolor=white:borderw=2:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text))); }
+            if let Some(contents) = ass_dialogue(captions, start, duration)? {
+                let subtitle = write_temporary_ass(&contents)?;
+                filters.push(format!("ass='{}'", escape_ass_filter_path(&subtitle.0.to_string_lossy())));
+                subtitle_file = Some(subtitle);
             }
         }
     }
@@ -1464,6 +1516,7 @@ fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64
     cmd.args(["-vf", &vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]);
     if media.len() > 1 { cmd.args(["-map", "0:v:0", "-map", "1:a:0"]); }
     let status = cmd.arg(&output_path).status().map_err(|e| format!("FFMPEG_SPAWN:{e}"))?;
+    drop(subtitle_file);
     if !status.success() { return Err(format!("FFMPEG_EXIT:{status}")); } Ok(output_path.to_string_lossy().into_owned())
 }
 
@@ -1594,6 +1647,47 @@ mod tests {
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
     /// process-wide env vars, so they take turns on this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ass_dialogue_clips_cues_to_clip_and_escapes_text() {
+        let captions = vec![
+            serde_json::json!({"text": "before", "start": 1.0, "end": 2.0}),
+            serde_json::json!({"text": "hello {world}\nline", "start": 4.5, "end": 6.0}),
+            serde_json::json!({"text": "after", "start": 9.0, "end": 10.0}),
+        ];
+        let ass = ass_dialogue(&captions, 5.0, 3.0).unwrap().unwrap();
+        assert!(!ass.contains("before"));
+        assert!(!ass.contains("after"));
+        assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:01.00,Shorts,,0,0,0,,hello \\{world\\} line"), "{ass}");
+    }
+
+    #[test]
+    fn ass_dialogue_uses_centiseconds_and_returns_none_when_empty() {
+        assert_eq!(ass_timestamp(3661.239), "1:01:01.23");
+        let captions = vec![serde_json::json!({"text": "outside", "start": 1.0, "end": 2.0})];
+        assert_eq!(ass_dialogue(&captions, 2.0, 3.0).unwrap(), None);
+        assert_eq!(ass_dialogue(&[], 2.0, 3.0).unwrap(), None);
+    }
+
+    #[test]
+    fn ass_dialogue_rejects_invalid_caption_timings() {
+        let captions = vec![serde_json::json!({"text": "bad", "start": 2.0, "end": 1.0})];
+        assert_eq!(ass_dialogue(&captions, 0.0, 3.0).unwrap_err(), "INVALID_RENDER_CAPTION");
+    }
+
+    #[test]
+    fn ass_filter_path_escapes_filter_syntax() {
+        assert_eq!(escape_ass_filter_path(r"C:\clips,[one];'two'.ass"), r"C\:/clips\,\[one\]\;\'two\'.ass");
+    }
+
+    #[test]
+    fn temporary_ass_is_removed_when_dropped() {
+        let subtitle = write_temporary_ass("test").unwrap();
+        assert!(subtitle.0.is_file());
+        let path = subtitle.0.clone();
+        drop(subtitle);
+        assert!(!path.exists());
+    }
 
     struct EnvGuard { dir: PathBuf, old_state: Option<String>, old_whisper: Option<String> }
     impl EnvGuard {
