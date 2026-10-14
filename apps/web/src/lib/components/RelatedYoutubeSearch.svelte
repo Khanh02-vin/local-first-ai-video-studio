@@ -1,13 +1,39 @@
 <script lang="ts">
   import { invoke, isTauri } from "@tauri-apps/api/core";
+  import { rankCandidates, type RelatedVideo } from "../../../../../packages/media-engine/related-videos/index.ts";
 
-  type Video = { videoId: string; title: string; thumbnail: string; url: string };
+  type Video = RelatedVideo;
 
-  let { initialQuery = "" }: { initialQuery?: string } = $props();
-  let query = $state(initialQuery);
+  let { initialQuery = "", sourceText = "" }: { initialQuery?: string; sourceText?: string } = $props();
+  let query = $state("");
+  let ragBase = "";
+  let tauriFetch: typeof globalThis.fetch | null = null;
   let videos = $state<Video[]>([]);
   let busy = $state(false);
   let status = $state("");
+
+  async function initRag() {
+    if (!isTauri()) return;
+    try {
+      const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
+      tauriFetch = tFetch as typeof globalThis.fetch;
+      ragBase = await invoke<string>("rag_server_url");
+    } catch { /* retain YouTube's original ranking */ }
+  }
+
+  const searchRank = (source: string, candidates: Video[]) => {
+    if (!source.trim() || !candidates.length) return Promise.resolve(candidates);
+    const doFetch = tauriFetch ?? globalThis.fetch;
+    return doFetch(ragBase + "/api/rag/related-rank", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ source, candidates }) })
+      .then(async (response) => {
+        if (!response.ok) return candidates;
+        const data = await response.json() as { videos?: Video[] };
+        return data.videos?.length === candidates.length ? data.videos : candidates;
+      }).catch(() => candidates);
+  }
+
+  $effect(() => { query = initialQuery; });
+  initRag();
 
   async function search() {
     if (!query.trim()) return;
@@ -15,8 +41,8 @@
     busy = true; status = "Searching public YouTube videos…"; videos = [];
     try {
       const result = await invoke<{ videos: Video[] }>("youtube_search_videos", { query });
-      videos = result.videos;
-      status = `${videos.length} public videos found.`;
+      videos = await searchRank(sourceText, result.videos);
+      status = `${videos.length} public videos found${sourceText.trim() ? " · ranked by source similarity when local embeddings are available" : ""}.`;
     } catch (error) { status = String(error); }
     finally { busy = false; }
   }

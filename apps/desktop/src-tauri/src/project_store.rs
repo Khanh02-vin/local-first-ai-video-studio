@@ -19,6 +19,8 @@ pub struct Project {
     pub transcript: Option<Value>,
     pub highlights: Vec<Value>,
     pub selected_id: Option<String>,
+    #[serde(default)]
+    pub selected_ids: Vec<String>,
     pub plans: Value,
     pub renders: Vec<Value>,
     pub updated_at: String,
@@ -181,6 +183,7 @@ mod tests {
             transcript: None,
             highlights: vec![],
             selected_id: None,
+            selected_ids: vec![],
             plans: serde_json::json!({}),
             renders: vec![],
             updated_at: String::new(),
@@ -198,6 +201,15 @@ mod tests {
         assert_eq!(get(&dir, "project-1").unwrap(), saved);
         drop(open(&dir).unwrap());
         assert_eq!(get(&dir, "project-1").unwrap().title, "Edited");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn persists_selected_highlights_across_reopen() {
+        let dir = temp();
+        let mut project = sample("selected-1");
+        project.selected_ids = vec!["h1".into(), "h2".into()];
+        save(&dir, project.clone()).unwrap();
+        assert_eq!(get(&dir, "selected-1").unwrap().selected_ids, project.selected_ids);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

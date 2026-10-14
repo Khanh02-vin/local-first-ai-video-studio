@@ -6,6 +6,7 @@
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
   import type { Collection } from "../../../../../packages/contracts/collection.ts";
   import { studioState } from "../studio-state.svelte.ts";
+  import { createEditorState } from "../../../../../packages/editor-core/index.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
   import Icon from "../icons.svelte";
   import RelatedYoutubeSearch from "../components/RelatedYoutubeSearch.svelte";
@@ -16,7 +17,7 @@
 
   type Meta = { name: string; duration: number; width: number; height: number };
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
-  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; plans: Record<string, import("../../../../../packages/contracts/render-plan.ts").RenderPlan>; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
+  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, import("../../../../../packages/contracts/render-plan.ts").RenderPlan>; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
 
   let projects = $state<Project[]>([]);
   let projectId = $state("");
@@ -39,9 +40,11 @@
   let collections = $state<Collection[]>([]);
   let selectedCollection = $state("");
   let selectedId = $state("");
+  let selectedIds = $state<string[]>([]);
   let youtubeUrl = $state("");
   let youtubeVideoId = $state("");
   let relatedQuery = $state("");
+  let relatedSourceText = $state("");
   // Loopback base for the preview iframe: the packaged webview's tauri:// origin
   // carries no Referer, which YouTube rejects (error 153). Empty in the browser,
   // where the plain embed already works.
@@ -79,7 +82,8 @@
     if (!isTauri() || !projectId) return;
     const existing = projects.find((item) => item.id === projectId);
     if (!existing) return;
-    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, plans: studioState.plans, ...patch };
+    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, ...patch };
+
     try {
       const saved = await invoke<Project>("project_save", { project: next });
       projects = [saved, ...projects.filter((item) => item.id !== saved.id)];
@@ -95,7 +99,7 @@
 
   async function hydrateProject(project: Project) {
     projectId = project.id; inputPath = project.sourcePath; meta = { name: project.sourceName, duration: project.sourceDuration, width: 0, height: 0 };
-    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? "";
+    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? ""; selectedIds = project.selectedIds ?? (selectedId ? [selectedId] : []);
     studioState.projectId = project.id; studioState.sourcePath = project.sourcePath; studioState.sourceName = project.sourceName; studioState.sourceDuration = project.sourceDuration;
     studioState.highlights = highlights; studioState.transcript = project.transcript as typeof studioState.transcript; studioState.selectedId = selectedId;
     studioState.plans = project.plans ?? {}; studioState.plan = studioState.plans[selectedId] ?? null;
@@ -121,7 +125,7 @@
 
   async function loadVideo(path: string) {
     projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
-    inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
+    inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
     studioState.highlights = []; studioState.selectedId = "";
     await reconnectJobs(false);
     try {
@@ -198,12 +202,13 @@
         phase = job.chunkTotal ? `${job.phase} · chunk ${Math.min((job.currentChunk ?? job.chunkCompleted ?? 0) + 1, job.chunkTotal)}/${job.chunkTotal}` : job.phase;
         progress = job.progress;
         if (job.status === "completed") {
-          const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? "";
+          const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : [];
           collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? "";
           if (result.videoId) youtubeVideoId = result.videoId;
           studioState.highlights = highlights; studioState.selectedId = selectedId; studioState.transcript = result.transcript ?? null;
           if (projectId) {
             const segments = (result.transcript as { segments?: { text?: string }[] } | null)?.segments ?? [];
+            relatedSourceText = (segments.map((segment) => segment.text ?? "").join(" ") || result.title || highlights[0]?.title || "").slice(0, 4000);
             relatedQuery = [result.title, highlights[0]?.title, result.topic, ...segments.slice(0, 12).map((segment) => segment.text)].filter(Boolean).join(" ").slice(0, 200);
             await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId });
           }
@@ -241,7 +246,7 @@
     if (!isTauri()) { message = "YouTube analysis runs in the desktop app only."; return; }
     const url = youtubeUrl.trim();
     if (!url || busy) return;
-    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; jobId = ""; youtubeVideoId = ""; meta = null;
+    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; youtubeVideoId = ""; meta = null;
     busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
       projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
@@ -261,21 +266,46 @@
 
   function chooseCandidate(id: string) {
     selectedId = id; studioState.selectedId = id;
-    void persistProject({ selectedId: id });
+    selectedIds = selectedIds.includes(id) ? selectedIds : [...selectedIds, id];
+    void persistProject({ selectedId: id, selectedIds });
+  }
+
+  function toggleCandidate(id: string) {
+    selectedIds = selectedIds.includes(id) ? selectedIds.filter((selected) => selected !== id) : [...selectedIds, id];
+    selectedId = id; studioState.selectedId = id;
+    void persistProject({ selectedId: id, selectedIds });
+  }
+
+  async function renderSelected() {
+    if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
+    const ids = selectedIds.filter((id) => highlights.some((item) => item.id === id));
+    if (!inputPath || !ids.length) return;
+    busy = true;
+    const renders = [...(projects.find((item) => item.id === projectId)?.renders ?? [])];
+    try {
+      for (const id of ids) {
+        const candidate = highlights.find((item) => item.id === id)!;
+        const plan = studioState.plans[id] ?? createEditorState(candidate.sourceArtifactId, meta?.duration ?? candidate.end, candidate).plan;
+        const range = plan.ranges[0] ?? { start: candidate.start, end: candidate.end };
+        const output = await save({ defaultPath: `${candidate.title.replace(/[^\\w-]+/g, "_") || "short"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
+        if (!output) break;
+        try {
+          await invoke<string>("render_video", { input: inputPath, output, start: range.start, duration: range.end - range.start, aspectRatio: plan.aspectRatio, plan });
+          renders.push({ output, status: "completed", highlightId: id });
+          outputPath = output;
+          message = `Rendered ${candidate.title}: ${output}`;
+        } catch (error) {
+          renders.push({ output, status: `failed: ${String(error)}`, highlightId: id });
+          message = `Render failed for ${candidate.title}: ${String(error)}`;
+        }
+        await persistProject({ renders });
+      }
+    } finally { busy = false; }
   }
 
   async function render() {
-    if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
-    const candidate = highlights.find((item) => item.id === selectedId);
-    if (!inputPath || !candidate) return;
-    outputPath = await save({ defaultPath: "short.mp4", filters: [{ name: "MP4", extensions: ["mp4"] }] }) ?? "";
-    if (!outputPath) return;
-    busy = true;
-    try {
-      message = `Rendered: ${await invoke<string>("render_video", { input: inputPath, output: outputPath, start: candidate.start, duration: candidate.end - candidate.start, aspectRatio })}`;
-      await persistProject({ renders: [...(projects.find((item) => item.id === projectId)?.renders ?? []), { output: outputPath, status: "completed", highlightId: candidate.id }] });
-    } catch (error) { message = `Render failed: ${String(error)}`; }
-    finally { busy = false; }
+    if (!selectedIds.includes(selectedId)) selectedIds = [...selectedIds, selectedId];
+    await renderSelected();
   }
 
   async function abort() {
@@ -422,15 +452,16 @@
           {#each highlights as candidate}
             <button class:selected={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => chooseCandidate(candidate.id)}>
               <strong>{candidate.title}</strong>
-              <span>{clock(candidate.start)}–{clock(candidate.end)} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
+              <span>{clock(candidate.start)}–{clock(candidate.end)} · rank {highlights.findIndex((item) => item.id === candidate.id) + 1} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
               {#if candidate.hook}<small>{candidate.hook}</small>{/if}
             </button>
+            <label class="chip"><input type="checkbox" checked={selectedIds.includes(candidate.id)} onchange={() => toggleCandidate(candidate.id)} /> Keep clip</label>
           {/each}
         </div>
         <div class="spec-line"><span>Export {aspectRatio}</span><span>{highlights.length} candidates{collections.length ? ` · ${collections.length} collections` : ""}</span></div>
-        <button class="cta secondary" disabled={busy || !selectedId} onclick={render}>
+        <button class="cta secondary" disabled={busy || !selectedIds.length} onclick={renderSelected}>
           {#if busy}<span class="spinner"></span>{/if}
-          {busy ? "Rendering…" : `Render selected candidate (${aspectRatio})`}
+          {busy ? "Rendering…" : `Render ${selectedIds.length} selected clip${selectedIds.length === 1 ? "" : "s"} (${aspectRatio})`}
         </button>
         {#if outputPath}<p class="hint">Saved: {outputPath}</p>{/if}
       </div>
@@ -450,7 +481,7 @@
         </div>
       {/if}
       {#if relatedQuery}
-        <RelatedYoutubeSearch initialQuery={relatedQuery} />
+        <RelatedYoutubeSearch initialQuery={relatedQuery} sourceText={relatedSourceText} />
       {/if}
     {:else}
       <div class="card"><p class="hint">No highlights yet. Run an analysis first.</p><button class="ghost wide" onclick={() => currentStep = 2}>← Back to config</button></div>

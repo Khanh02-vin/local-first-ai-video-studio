@@ -1,6 +1,7 @@
 import type { RequestHandler } from "@sveltejs/kit";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { rankCandidates } from "../../../../../../packages/media-engine/related-videos/index.ts";
 
 /**
  * Local YouTube knowledge base, served entirely from the client's machine.
@@ -305,6 +306,19 @@ export const POST: RequestHandler = async ({ request }) => {
     // Best-effort vector indexing: 0 when the local LLM is down (TF-IDF still works).
     const embedded = await embedVideoSegments(videoId, segments);
     return Response.json({ videoId, segments: segments.length, embedded, idempotent: false });
+  }
+
+  if (pathname === "/api/rag/related-rank") {
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
+    const { source, candidates } = body as { source?: string; candidates?: Array<{ videoId?: string; title?: string; thumbnail?: string; url?: string }> };
+    if (typeof source !== "string" || !source.trim() || source.length > 20_000) return jsonError(400, "INVALID_SOURCE_TEXT");
+    if (!Array.isArray(candidates) || candidates.length > 8 || candidates.some((video) => typeof video?.title !== "string" || typeof video?.videoId !== "string")) return jsonError(400, "INVALID_CANDIDATES");
+    const response = await embedTexts([source.slice(0, 4000), ...candidates.map((video) => video.title!.slice(0, 500))]);
+    if (!response || response.vectors.length !== candidates.length + 1) return Response.json({ videos: candidates, ranked: false });
+    const [sourceVector, ...titleVectors] = response.vectors;
+    const ranked = rankCandidates(sourceVector, titleVectors, candidates.map((video) => ({ videoId: video.videoId!, title: video.title!, thumbnail: video.thumbnail ?? "", url: video.url ?? "" })));
+    return Response.json({ videos: ranked, ranked: true });
   }
 
   if (pathname === "/api/rag/query") {

@@ -1378,7 +1378,7 @@ fn project_save(project: project_store::Project) -> Result<project_store::Projec
 fn project_create(source_path: String, source_name: String, source_duration: f64) -> Result<project_store::Project, String> {
     if !source_duration.is_finite() || source_duration < 0.0 { return Err("INVALID_SOURCE_DURATION".into()); }
     let id = format!("project-{}", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| format!("CLOCK:{e}"))?.as_nanos());
-    project_store::save(&state_dir(), project_store::Project { id, title: source_name.clone(), source_path, source_name, source_duration, analysis_job_id: None, analysis_result_id: None, transcript: None, highlights: Vec::new(), selected_id: None, plans: serde_json::json!({}), renders: Vec::new(), updated_at: String::new() })
+    project_store::save(&state_dir(), project_store::Project { id, title: source_name.clone(), source_path, source_name, source_duration, analysis_job_id: None, analysis_result_id: None, transcript: None, highlights: Vec::new(), selected_id: None, selected_ids: Vec::new(), plans: serde_json::json!({}), renders: Vec::new(), updated_at: String::new() })
 }
 
 fn run_local_render(app: &tauri::AppHandle, command: &str, value: Option<&str>) -> Result<serde_json::Value, String> {
@@ -1417,7 +1417,7 @@ async fn render_drain(app: tauri::AppHandle) -> Result<serde_json::Value, String
 }
 
 #[tauri::command]
-fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>) -> Result<String, String> {    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
+fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64, duration: f64, aspect_ratio: Option<String>, plan: Option<serde_json::Value>) -> Result<String, String> {    if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 { return Err("INVALID_RENDER_REQUEST".into()); }
     let output_path = Path::new(&output).canonicalize().unwrap_or_else(|_| Path::new(&output).to_path_buf());
     // YouTube inputs skip the local file checks and resolve fresh CDN URLs;
     // -ss/-t before each -i on HTTP becomes a range request (only the section
@@ -1431,14 +1431,37 @@ fn render_video(app: tauri::AppHandle, input: String, output: String, start: f64
         vec![input_path.to_string_lossy().into_owned()]
     };
     let ratio = aspect_ratio.unwrap_or_else(|| "9:16".into());
-    let vf = match ratio.as_str() { "1:1" => "crop=ih:ih:(iw-ih)/2:0,scale=1080:1080", "16:9" => "crop=ih*16/9:ih:(iw-ih*16/9)/2:0,scale=1920:1080", _ => "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" };
+    let crop = match ratio.as_str() { "1:1" => "crop=ih:ih:(iw-ih)/2:0,scale=1080:1080", "16:9" => "crop=ih*16/9:ih:(iw-ih*16/9)/2:0,scale=1920:1080", _ => "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" };
+    fn drawtext_escape(text: &str) -> String { text.replace('\\', "\\\\").replace(':', "\\:").replace('\'', "\\'").replace('%', "\\%").replace(',', "\\,").replace('[', "\\[").replace(']', "\\]").replace(';', "\\;") }
+    let mut filters = vec![crop.to_string()];
+    if let Some(plan) = plan {
+        if let Some(hook) = plan.get("hook").filter(|hook| !hook.is_null()) {
+            let text = hook["text"].as_str().ok_or("INVALID_RENDER_HOOK")?;
+            let cue_start = hook["start"].as_f64().ok_or("INVALID_RENDER_HOOK")?;
+            let cue_end = hook["end"].as_f64().ok_or("INVALID_RENDER_HOOK")?;
+            if !cue_start.is_finite() || !cue_end.is_finite() || cue_end <= cue_start { return Err("INVALID_RENDER_HOOK".into()); }
+            let from = (cue_start - start).max(0.0); let to = (cue_end - start).min(duration);
+            if to > from { filters.push(format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.12:fontsize=h/18:fontcolor=white:borderw=3:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text))); }
+        }
+        if let Some(captions) = plan.get("captions").and_then(serde_json::Value::as_array) {
+            for caption in captions {
+                let text = caption["text"].as_str().ok_or("INVALID_RENDER_CAPTION")?;
+                let cue_start = caption["start"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
+                let cue_end = caption["end"].as_f64().ok_or("INVALID_RENDER_CAPTION")?;
+                if !cue_start.is_finite() || !cue_end.is_finite() || cue_end <= cue_start { return Err("INVALID_RENDER_CAPTION".into()); }
+                let from = (cue_start - start).max(0.0); let to = (cue_end - start).min(duration);
+                if to > from { filters.push(format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.78:fontsize=h/24:fontcolor=white:borderw=2:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text))); }
+            }
+        }
+    }
+    let vf = filters.join(",");
     let parent = output_path.parent().ok_or("OUTPUT_PARENT_MISSING")?; std::fs::create_dir_all(parent).map_err(|e| format!("OUTPUT_DIR:{e}"))?;
     let mut cmd = tool(ffmpeg_bin(&app));
     cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"]);
     for source in &media {
         cmd.args(["-ss"]).arg(format!("{start:.3}")).args(["-t"]).arg(format!("{duration:.3}")).args(["-i"]).arg(source);
     }
-    cmd.args(["-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]);
+    cmd.args(["-vf", &vf, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]);
     if media.len() > 1 { cmd.args(["-map", "0:v:0", "-map", "1:a:0"]); }
     let status = cmd.arg(&output_path).status().map_err(|e| format!("FFMPEG_SPAWN:{e}"))?;
     if !status.success() { return Err(format!("FFMPEG_EXIT:{status}")); } Ok(output_path.to_string_lossy().into_owned())
