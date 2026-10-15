@@ -63,6 +63,15 @@ const plan = { version: 1, sourceArtifactId: "src", ranges: [{ start: 1, end: 10
 validateRenderPlan(plan, 60);
 assert.throws(() => validateRenderPlan({ ...plan, version: 0 }, 60));
 assert.throws(() => validateRenderPlan({ ...plan, aspectRatio: "4:3" as never }, 60));
+assert.throws(() => validateRenderPlan({ ...plan, ranges: [] }, 60), /at least one range/);
+validateRenderPlan({ ...plan, ranges: [{ start: 10, end: 12 }, { start: 1, end: 3 }, { start: 3, end: 4 }] }, 60);
+validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, speakerId: "Speaker 1", sourceArtifactId: "src", confidence: 0.9, confirmed: true }] }, 60);
+assert.throws(() => validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, sourceArtifactId: "other", confidence: 0.9, confirmed: true }] }, 60), /source mismatch/);
+assert.throws(() => validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 1.1, confidence: 0.9, confirmed: true }] }, 60), /crop keyframe/);
+validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-by-side", confidence: 0.8, confirmed: true }] }, 60);
+validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-by-side", confidence: 0.8, confirmed: true, subjectBoxes: [{ x: 0.1, y: 0.1, width: 0.2, height: 0.3, confidence: 0.8 }, { x: 0.7, y: 0.2, width: 0.2, height: 0.3, confidence: 0.7 }] }] }, 60);
+assert.throws(() => validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-by-side", confidence: 0.8, confirmed: true, subjectBoxes: [{ x: 0.9, y: 0.1, width: 0.3, height: 0.3, confidence: 0.8 }, { x: 0.2, y: 0.2, width: 0.1, height: 0.1, confidence: 0.8 }] }] }, 60), /subject boxes/);
+assert.throws(() => validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "picture-in-picture", confidence: 2, confirmed: true }] }, 60), /scene layout/);
 
 assertTransition("created", "queued");
 assert.throws(() => assertTransition("completed", "queued"));

@@ -114,9 +114,11 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist/windows"
           sha256sum -c SHA256SUMS-portable.txt
+          sha256sum -c SHA256SUMS-msi.txt
           gh release upload v0.1.1-pilot.1 \
             "Local-first AI Video Studio Portable.zip" \
-            SHA256SUMS-portable.txt BUILD-INFO.txt \
+            *.msi \
+            SHA256SUMS-portable.txt SHA256SUMS-msi.txt BUILD-INFO.txt \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
       - uses: actions/upload-artifact@v4

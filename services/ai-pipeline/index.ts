@@ -4,6 +4,8 @@ import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
 import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
+export * from "./variants.ts";
+export * from "./diarization.ts";
 // ponytail: mockTranscribe/mockHighlights deleted — analyzeVideo now returns deterministic placeholder.
 // Real callers use analyzeLocalVideo/analyzeLocalVideoWithSemantic.
 export type ClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
@@ -68,3 +70,4 @@ export async function analyzeLocalVideoWithSemantic(
 
 // Re-export all symbols from semantic.ts so they are available at package boundary
 export * from "./semantic.ts";
+export * from "./variants.ts";

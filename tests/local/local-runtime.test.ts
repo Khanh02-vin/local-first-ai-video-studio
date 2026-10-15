@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import { LocalRunner } from "../../adapters/local/runner.ts";
+
+const execFile = promisify(execFileCb);
+
 
 const root = "/tmp/local-first-ai-video-studio-test";
 await rm(root, { recursive: true, force: true });
@@ -10,9 +15,20 @@ const input = join(root, "input.mp4");
 const output = join(root, "output.mp4");
 const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
 const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
-const { execFile } = await import("node:child_process");
-const { promisify } = await import("node:util");
-await promisify(execFile)(ffmpeg, ["-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10", "-f", "lavfi", "-i", "sine=frequency=1000", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", input]);
+await execFile(ffmpeg, ["-y", "-f", "lavfi", "-i", "color=c=red:s=160x120:r=10:d=3", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=44100:duration=3", "-f", "lavfi", "-i", "color=c=blue:s=160x120:r=10:d=3", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100:duration=3", "-filter_complex", "[0:v][1:a][2:v][3:a]concat=n=2:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", input]);
+const segmentA = join(root, "segment-a.mp4");
+const segmentB = join(root, "segment-b.mp4");
+await execFile(ffmpeg, ["-y", "-ss", "3.5", "-t", "0.7", "-i", input, "-map", "0:v:0", "-map", "0:a:0", "-vf", "scale=160:120", "-r", "10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", segmentA]);
+await execFile(ffmpeg, ["-y", "-ss", "0.5", "-t", "0.8", "-i", input, "-map", "0:v:0", "-map", "0:a:0", "-vf", "scale=160:120", "-r", "10", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", segmentB]);
+await execFile(ffmpeg, ["-y", "-i", segmentA, "-i", segmentB, "-filter_complex", "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", output]);
+const probe = JSON.parse((await execFile(ffprobe, ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", output])).stdout) as { format: { duration: string }; streams: Array<{ codec_type: string; width?: number; height?: number }> };
+assert.ok(Math.abs(Number(probe.format.duration) - 1.5) < 0.25, `expected trimmed concatenated duration, got ${probe.format.duration}`);
+assert.deepEqual(probe.streams.map((stream) => stream.codec_type), ["video", "audio"]);
+assert.equal(probe.streams[0].width, 160);
+const first = (await execFile(ffmpeg, ["-v", "error", "-ss", "0.2", "-i", output, "-frames:v", "1", "-vf", "scale=1:1,format=rgb24", "-f", "rawvideo", "-"], { encoding: "buffer" })).stdout;
+const last = (await execFile(ffmpeg, ["-v", "error", "-ss", "1.2", "-i", output, "-frames:v", "1", "-vf", "scale=1:1,format=rgb24", "-f", "rawvideo", "-"], { encoding: "buffer" })).stdout;
+assert.ok(first.readUInt8(2) > first.readUInt8(0), "first output frame should be blue range");
+assert.ok(last.readUInt8(0) > last.readUInt8(2), "second output frame should be red range");
 const runner = new LocalRunner({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
 const job = runner.enqueue({ input, output });
 assert.equal(job.status, "queued");
@@ -21,4 +37,5 @@ assert.equal(runner.store.get(job.id)?.status, "completed");
 assert.ok((runner.store.get(job.id)?.outputBytes ?? 0) > 0);
 assert.throws(() => runner.enqueue({ input, output: input }), /OUTPUT_MUST_DIFFER_FROM_INPUT/);
 runner.close();
+await rm(root, { recursive: true, force: true });
 console.log("local runtime tests: ok");

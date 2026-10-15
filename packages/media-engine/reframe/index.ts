@@ -1,3 +1,5 @@
+import type { AspectRatio, RenderPlan } from "../../contracts/render-plan.ts";
+
 export type FaceTrackPoint = {
   time: number;
   x: number;
@@ -59,6 +61,56 @@ export function trackFacePath(frames: Array<{ time: number; detections: FaceTrac
   return { points: smoothFacePath(output), sceneCuts, fallbackCount: output.filter((point) => point.fallback).length };
 }
 
-function distance(a: FaceTrackPoint, b: FaceTrackPoint): number {
-  return Math.hypot(a.x + a.width / 2 - b.x - b.width / 2, a.y + a.height / 2 - b.y - b.height / 2);
+export type CropKeyframe = NonNullable<RenderPlan["cropKeyframes"]>[number];
+
+export type CropCenter = { x: number; y: number };
+
+export function cropCenterAt(keyframes: CropKeyframe[], time: number): CropCenter {
+  const sorted = [...keyframes].sort((a, b) => a.time - b.time);
+  if (!sorted.length) return { x: 0.5, y: 0.5 };
+  const center = (key: CropKeyframe) => ({ x: clamp(key.centerX), y: clamp(key.centerY ?? 0.5) });
+  if (time <= sorted[0].time) return center(sorted[0]);
+  for (let index = 1; index < sorted.length; index++) {
+    const right = sorted[index];
+    const left = sorted[index - 1];
+    if (time <= right.time) {
+      const amount = (time - left.time) / (right.time - left.time);
+      return { x: clamp(left.centerX + amount * (right.centerX - left.centerX)), y: clamp((left.centerY ?? 0.5) + amount * ((right.centerY ?? 0.5) - (left.centerY ?? 0.5))) };
+    }
+  }
+  return center(sorted[sorted.length - 1]);
 }
+
+export function ffmpegCropCenterExpression(keyframes: CropKeyframe[], rangeStart: number, axis: "x" | "y" = "x"): string {
+  if (!keyframes.length) return "0.5";
+  const position = (key: CropKeyframe) => clamp(axis === "x" ? key.centerX : key.centerY ?? 0.5);
+  const sorted = [...keyframes].sort((a, b) => a.time - b.time);
+  let expression = String(position(sorted[sorted.length - 1]));
+  for (let index = sorted.length - 1; index >= 0; index--) {
+    const key = sorted[index];
+    const localTime = Math.max(0, key.time - rangeStart);
+    if (index === 0) expression = `if(lt(t\\,${localTime.toFixed(3)})\\,${position(key)}\\,${expression})`;
+    else {
+      const previous = sorted[index - 1];
+      const from = Math.max(0, previous.time - rangeStart);
+      const to = Math.max(0, key.time - rangeStart);
+      if (to <= 0) continue;
+      const slope = (position(key) - position(previous)) / (key.time - previous.time);
+      const intercept = position(previous) - slope * previous.time + slope * rangeStart;
+      const linear = `${slope.toFixed(6)}*t+${intercept.toFixed(6)}`;
+      expression = `if(lt(t\\,${from.toFixed(3)})\\,${position(previous)}\\,if(lt(t\\,${to.toFixed(3)})\\,${linear}\\,${expression}))`;
+    }
+  }
+  return expression;
+}
+
+export function sceneLayoutAt(plan: RenderPlan, time: number): "solo" | "side-by-side" | "picture-in-picture" {
+  return plan.sceneLayouts?.find((scene) => time >= scene.start && time < scene.end)?.layout ?? plan.layout ?? "solo";
+}
+
+export function aspectTarget(aspectRatio: AspectRatio): number {
+  return aspectRatio === "9:16" ? 9 / 16 : aspectRatio === "1:1" ? 1 : 16 / 9;
+}
+
+function clamp(value: number): number { return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.5)); }
+function distance(a: FaceTrackPoint, b: FaceTrackPoint): number { return Math.hypot(a.x + a.width / 2 - b.x - b.width / 2, a.y + a.height / 2 - b.y - b.height / 2); }

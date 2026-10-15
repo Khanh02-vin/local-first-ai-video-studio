@@ -22,6 +22,12 @@ pub struct Project {
     #[serde(default)]
     pub selected_ids: Vec<String>,
     pub plans: Value,
+    #[serde(default)]
+    pub variants: Vec<Value>,
+    #[serde(default)]
+    pub selected_variant_id: Option<String>,
+    #[serde(default)]
+    pub speaker_face_matches: Option<Value>,
     pub renders: Vec<Value>,
     pub updated_at: String,
 }
@@ -185,10 +191,37 @@ mod tests {
             selected_id: None,
             selected_ids: vec![],
             plans: serde_json::json!({}),
+            variants: Vec::new(),
+            selected_variant_id: None,
+            speaker_face_matches: None,
             renders: vec![],
             updated_at: String::new(),
         }
     }
+    #[test]
+    fn saves_speaker_face_mapping_additively() {
+        let dir = temp();
+        let mut project = sample("speaker-project");
+        project.speaker_face_matches = Some(
+            serde_json::json!({ "version": 1, "sourceArtifactId": "source-1", "confirmed": true, "matches": { "Speaker 1": "face-1" } }),
+        );
+        save(&dir, project.clone()).unwrap();
+        assert_eq!(
+            get(&dir, "speaker-project").unwrap().speaker_face_matches,
+            project.speaker_face_matches
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_project_without_speaker_face_mapping_defaults_to_none() {
+        let mut project = sample("legacy-speaker-project");
+        let mut value = serde_json::to_value(&project).unwrap();
+        value.as_object_mut().unwrap().remove("speakerFaceMatches");
+        project = serde_json::from_value(value).unwrap();
+        assert_eq!(project.speaker_face_matches, None);
+    }
+
     #[test]
     fn creates_lists_updates_and_reopens_project() {
         let dir = temp();
@@ -209,7 +242,10 @@ mod tests {
         let mut project = sample("selected-1");
         project.selected_ids = vec!["h1".into(), "h2".into()];
         save(&dir, project.clone()).unwrap();
-        assert_eq!(get(&dir, "selected-1").unwrap().selected_ids, project.selected_ids);
+        assert_eq!(
+            get(&dir, "selected-1").unwrap().selected_ids,
+            project.selected_ids
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -238,6 +274,22 @@ mod tests {
         assert_eq!(save(&dir, bad).unwrap_err(), "INVALID_RENDER_PLAN_VERSION");
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn saves_transcript_variants_and_variant_plans_additively() {
+        let dir = temp();
+        let mut project = sample("variant-project");
+        project.plans =
+            serde_json::json!({"highlight-1":{"version":1,"sourceArtifactId":"source-1"}});
+        project.variants = vec![serde_json::json!({"id":"variant-1","title":"Short"})];
+        project.selected_variant_id = Some("variant-1".into());
+        let saved = save(&dir, project).unwrap();
+        let reopened = get(&dir, "variant-project").unwrap();
+        assert_eq!(reopened.variants, saved.variants);
+        assert_eq!(reopened.selected_variant_id.as_deref(), Some("variant-1"));
+        assert!(reopened.plans.get("highlight-1").is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn rejects_path_traversal_ids() {
         assert!(validate_id("../bad").is_err());

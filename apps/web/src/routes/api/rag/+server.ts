@@ -1,6 +1,6 @@
 import type { RequestHandler } from "@sveltejs/kit";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { rankCandidates } from "../../../../../../packages/media-engine/related-videos/index.ts";
 
 /**

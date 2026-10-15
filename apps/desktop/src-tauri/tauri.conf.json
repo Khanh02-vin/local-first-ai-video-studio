@@ -39,6 +39,7 @@
     ],
     "resources": {
       "../../../scripts": "scripts",
+      "../../../scripts/detect-face-boxes.py": "scripts/detect-face-boxes.py",
       "../../../adapters": "adapters",
       "../../../packages": "packages",
       "../../../services": "services",

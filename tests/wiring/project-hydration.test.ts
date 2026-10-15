@@ -16,7 +16,9 @@ assert.ok(/studioState\.selectedId\s*=\s*selectedId/.test(studio), "hydrateProje
 assert.ok(/studioState\.plan\s*=\s*studioState\.plans\[selectedId\]/.test(studio), "hydrateProject must set active plan from map");
 
 assert.ok(/studioState\.plans\[id\]/.test(editor), "Editor must read per-highlight plan on select");
-assert.ok(/project_save/.test(editor) && /selectedId/.test(editor) && /plans/.test(editor), "Editor save must persist selected plan back to project");
+assert.ok(/studioState\.variants\s*=\s*project\.variants/.test(studio), "hydrateProject must restore transcript variants");
+assert.ok(/studioState\.plans\s*=\s*\{\s*\.\.\.studioState\.plans,\s*\[`variant:\$\{editingVariantId\}`\]/.test(editor), "Editor must store variant plans separately from highlight plans");
+assert.ok(/project_save/.test(editor) && /variants/.test(editor) && /plans/.test(editor), "Editor save must persist variant plan back to project");
 
 assert.ok(/studioState\.plans\s*=\s*\{\}/.test(studio), "loadVideo must clear plans");
 assert.ok(/inputPath\s*=\s*path/.test(studio), "loadVideo must assign inputPath");

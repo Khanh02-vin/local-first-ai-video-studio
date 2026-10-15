@@ -3,9 +3,10 @@
   import { onDestroy } from "svelte";
   import { studioState } from "../studio-state.svelte.ts";
   import Icon from "../icons.svelte";
-  import { captionsFromTranscript, createEditorState, loadTranscriptCaptions, removeCaption, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../packages/editor-core/index.ts";
+  import { addRange, captionsFromTranscript, createEditorState, createEditorStateFromVariant, loadTranscriptCaptions, moveRange, removeCaption, removeRange, setCropKeyframes, setSceneLayouts, setSpeakerMap, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../packages/editor-core/index.ts";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
-  import type { Caption } from "../../../../../packages/contracts/render-plan.ts";
+  import type { Caption, CropKeyframe, SceneLayout } from "../../../../../packages/contracts/render-plan.ts";
+  import { cropCenterAt, trackFacePath } from "../../../../../packages/media-engine/reframe/index.ts";
 
   // Keep-alive mounted by +layout.svelte: re-read the Studio state whenever
   // this page becomes visible, so analysis results show up after navigation.
@@ -16,6 +17,7 @@
   let sourcePath = "";
   let sourceDuration = 60;
   let selectedId = fallback.id;
+  let editingVariantId = "";
   let state: EditorState = createEditorState("demo-source", 60, fallback);
   let saved = false;
   let saveError = "";
@@ -30,24 +32,60 @@
   let dragging: "range" | "in" | "out" | null = null;
   let dragStartX = 0;
   let dragStartRange = { start: 0, end: 0 };
+  let activeRangeIndex = 0;
+  let cropBusy = false;
+  let cropMessage = "";
+  let trackingEnabled = false;
+  let sceneBusy = false;
+  let sceneMessage = "";
 
   $: activeCaption = state.plan.captions.find((caption) => caption.id === activeCaptionId) ?? state.plan.captions[0];
-  $: range = state.plan.ranges[0];
+  $: range = state.plan.ranges[activeRangeIndex] ?? state.plan.ranges[0];
 
   function clientXToTime(event: MouseEvent): number {
     const rect = timeline.getBoundingClientRect();
     return Math.max(0, Math.min(sourceDuration, ((event.clientX - rect.left) / rect.width) * sourceDuration));
   }
 
+  function savePlan() {
+    studioState.plan = state.plan;
+    if (editingVariantId) {
+      const variants = studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant);
+      studioState.variants = variants; studioState.plans = { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan };
+      if (isTauri() && studioState.projectId) void save();
+    } else studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
+  }
+  function chooseRange(index: number) { activeRangeIndex = index; seek(state.plan.ranges[index].start); }
+  function addRangeAfter() {
+    const start = Math.min(sourceDuration - 0.2, range.end + 0.2);
+    if (start < 0) return;
+    const end = Math.min(sourceDuration, start + Math.min(5, sourceDuration - start));
+    if (end <= start) return;
+    try {
+      state = addRange(state, { start, end }, activeRangeIndex + 1);
+      activeRangeIndex += 1; savePlan(); seek(start);
+    } catch { /* no valid gap at this position */ }
+  }
+  function deleteActiveRange() {
+    if (state.plan.ranges.length <= 1) return;
+    state = removeRange(state, activeRangeIndex);
+    activeRangeIndex = Math.min(activeRangeIndex, state.plan.ranges.length - 1); savePlan(); seek(range.start);
+  }
+  function reorderRange(offset: -1 | 1) {
+    const target = activeRangeIndex + offset;
+    if (target < 0 || target >= state.plan.ranges.length) return;
+    state = moveRange(state, activeRangeIndex, offset); activeRangeIndex = target; savePlan();
+  }
+
   function onRangeKeydown(event: KeyboardEvent) {
     const step = event.shiftKey ? 1 : 0.25;
     let handled = true;
     try {
-      if (event.key === "ArrowLeft" || event.key === "ArrowDown") { state = updateRange(state, { start: Math.max(0, range.start - step), end: range.end }); }
-      else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }); }
+      if (event.key === "ArrowLeft" || event.key === "ArrowDown") { state = updateRange(state, { start: Math.max(0, range.start - step), end: range.end }, activeRangeIndex); }
+      else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }, activeRangeIndex); }
       else handled = false;
     } catch { handled = false; }
-    if (handled) { studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; event.preventDefault(); }
+    if (handled) { savePlan(); event.preventDefault(); }
   }
 
   function onTimelineMouseDown(event: MouseEvent) {
@@ -63,7 +101,7 @@
       let nextEnd = dragStartRange.end + movedByClientX;
       if (nextStart < 0) { nextEnd += -nextStart; nextStart = 0; }
       if (nextEnd > sourceDuration) { nextStart -= nextEnd - sourceDuration; nextEnd = sourceDuration; }
-      try { state = updateRange(state, { start: nextStart, end: nextEnd }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep the last valid range */ }
+      try { state = updateRange(state, { start: nextStart, end: nextEnd }, activeRangeIndex); savePlan(); } catch { /* keep the last valid range */ }
       moveEvent.preventDefault();
     };
     const onUp = () => {
@@ -87,10 +125,10 @@
       const t = ((moveEvent.clientX - rect.left) / rect.width) * sourceDuration;
       if (dragging === "in") {
         const nextStart = Math.max(0, Math.min(t, dragStartRange.end - 0.2));
-        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; seek(nextStart); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }, activeRangeIndex); savePlan(); seek(nextStart); } catch { /* keep last valid range */ }
       } else {
         const nextEnd = Math.min(sourceDuration, Math.max(t, dragStartRange.start + 0.2));
-        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; seek(nextEnd); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }, activeRangeIndex); savePlan(); seek(nextEnd); } catch { /* keep last valid range */ }
       }
       moveEvent.preventDefault();
     };
@@ -103,14 +141,79 @@
     window.addEventListener("mouseup", onUp);
   }
 
+  function setTracking(enabled: boolean) {
+    const usable = (state.plan.cropKeyframes ?? []).some((keyframe) => keyframe.confidence >= 0.5 && keyframe.speakerId && keyframe.sourceFaceId && keyframe.sourceArtifactId === state.plan.sourceArtifactId);
+    trackingEnabled = enabled && usable;
+    const keys = (state.plan.cropKeyframes ?? []).map((keyframe) => ({ ...keyframe, confirmed: trackingEnabled }));
+    state = setCropKeyframes(state, keys); savePlan();
+  }
+  async function analyzeCropPath() {
+    if (!isTauri() || !sourcePath || !studioState.transcript || cropBusy) return;
+    const transcript = studioState.transcript;
+    const intervals = transcript.segments.filter((segment) => segment.speakerId).map((segment) => ({ start: segment.start, end: segment.end, speakerId: segment.speakerId }));
+    cropBusy = true; cropMessage = "Analyzing local frames…";
+    try {
+      const raw = await invoke<Array<{ time: number; centerX: number; centerY: number; speakerId?: string; faceIndex: number; confidence: number; sourceArtifactId: string; sceneId: number }>>("analyze_crop_path", { path: sourcePath, duration: Math.min(sourceDuration, 1800), speakerIntervals: intervals, faceMapping: { confirmed: studioState.speakerFaceConfirmed, sourceArtifactId: transcript.sourceArtifactId, matches: studioState.speakerFaceMatches }, sourceArtifactId: state.plan.sourceArtifactId });
+      const frames = raw.map((item) => ({ time: item.time, detections: [{ time: item.time, x: item.centerX - 0.05, y: item.centerY - 0.05, width: 0.1, height: 0.1, confidence: item.confidence }] }));
+      const tracked = trackFacePath(frames);
+      const confirmedMapping = studioState.speakerFaceConfirmed && studioState.transcript?.sourceArtifactId === state.plan.sourceArtifactId && Object.keys(studioState.speakerFaceMatches).length > 0;
+      const keys: CropKeyframe[] = tracked.points.map((point) => { const item = raw.find((value) => value.time === point.time); const mapped = !!item?.speakerId && confirmedMapping && !!studioState.speakerFaceMatches[item.speakerId]; return { time: point.time, centerX: Math.max(0, Math.min(1, point.x + point.width / 2)), centerY: Math.max(0, Math.min(1, point.y + point.height / 2)), speakerId: mapped ? item?.speakerId : undefined, sourceFaceId: mapped ? studioState.speakerFaceMatches[item!.speakerId!] : undefined, sourceArtifactId: state.plan.sourceArtifactId, sceneId: item?.sceneId, confidence: mapped ? point.confidence : Math.min(0.49, point.confidence), confirmed: false }; });
+      state = setSpeakerMap(state, studioState.speakerFaceConfirmed && studioState.transcript?.sourceArtifactId === state.plan.sourceArtifactId ? { ...studioState.speakerFaceMatches } : {});
+      state = setCropKeyframes(state, keys); savePlan(); trackingEnabled = false;
+      cropMessage = keys.length ? `${keys.length} crop points ready for review. Approve tracking to use them in export.` : "No usable face path; export will use center crop.";
+    } catch (error) { cropMessage = `Crop analysis failed: ${String(error)}`; }
+    finally { cropBusy = false; }
+  }
+  function updateManualCropCenter(centerX: number) {
+    const keys = [...(state.plan.cropKeyframes ?? [])];
+    const current = cropCenterAt(keys, currentTime);
+    const item: CropKeyframe = { time: currentTime, centerX, centerY: current.y, sourceArtifactId: state.plan.sourceArtifactId, confidence: 1, confirmed: trackingEnabled };
+    const index = keys.findIndex((key) => Math.abs(key.time - currentTime) < 0.25);
+    if (index >= 0) keys[index] = { ...keys[index], ...item }; else keys.push(item);
+    keys.sort((a, b) => a.time - b.time);
+    state = setCropKeyframes(state, keys.slice(0, 600)); savePlan();
+  }
+  function adjustCropCenter() {
+    const current = cropCenterAt(state.plan.cropKeyframes ?? [], currentTime);
+    updateManualCropCenter(current.x);
+  }
+  async function analyzeScenes() {
+    if (!isTauri() || !sourcePath || sceneBusy) return;
+    sceneBusy = true; sceneMessage = "Analyzing local scene samples…";
+    try {
+      const scenes = await invoke<SceneLayout[]>("analyze_scene_layouts", { path: sourcePath, duration: Math.min(sourceDuration, 1800), sourceArtifactId: state.plan.sourceArtifactId });
+        state = setSceneLayouts(state, scenes.map((scene) => ({ ...scene, sourceArtifactId: state.plan.sourceArtifactId, confirmed: false }))); savePlan();
+      sceneMessage = `${scenes.length} scene intervals ready for review; uncertain scenes remain solo.`;
+    } catch (error) { sceneMessage = `Scene analysis failed: ${String(error)}`; }
+    finally { sceneBusy = false; }
+  }
+  function chooseLayout(index: number, layout: SceneLayout["layout"]) {
+    const scenes = [...(state.plan.sceneLayouts ?? [])]; scenes[index] = { ...scenes[index], layout, confirmed: true };
+    state = setSceneLayouts(state, scenes); savePlan();
+  }
+  function approveScenes() { state = setSceneLayouts(state, (state.plan.sceneLayouts ?? []).map((scene) => ({ ...scene, confirmed: true }))); savePlan(); }
+  function disableScenes() { state = setSceneLayouts(state, []); savePlan(); }
+
   function loadFromStudio() {
     candidates = studioState.highlights.length ? studioState.highlights : [fallback];
     sourcePath = studioState.sourcePath;
     sourceDuration = studioState.sourceDuration || 60;
     powered = sourcePath !== "";
+    editingVariantId = studioState.editingVariantId;
+    if (editingVariantId) {
+      const variant = studioState.variants.find((item) => item.id === editingVariantId);
+      if (!variant || !studioState.transcript) { editingVariantId = ""; studioState.editingVariantId = ""; return; }
+      selectedId = `variant:${variant.id}`;
+      const storedPlan = variant.plan ?? studioState.plans[selectedId];
+      state = storedPlan ? { sourceArtifactId: variant.sourceArtifactId, duration: studioState.transcript.duration, plan: storedPlan } : createEditorStateFromVariant(studioState.transcript, variant);
+      if (!storedPlan) { variant.plan = state.plan; studioState.variants = [...studioState.variants]; }
+      activeRangeIndex = 0; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
+      currentTime = range.start; return;
+    }
     const initial = studioState.selectedId || candidates[0]?.id || fallback.id;
     const picked = candidates.find((candidate) => candidate.id === initial) ?? fallback;
     selectedId = picked.id;
+    activeRangeIndex = 0;
     const plan = studioState.plans[initial] ?? studioState.plan;
     state = plan ? { ...state, selected: picked, plan } : createEditorState(picked.sourceArtifactId || "demo-source", sourceDuration, picked);
     if (studioState.transcript && !state.plan.captions.length) state = loadTranscriptCaptions(state, studioState.transcript);
@@ -123,6 +226,7 @@
   function select(id: string) {
     const candidate = candidates.find((item) => item.id === id) ?? fallback;
     selectedId = id;
+    editingVariantId = ""; studioState.editingVariantId = "";
     state = studioState.plans[id] ? { ...state, selected: candidate, plan: studioState.plans[id] } : createEditorState(candidate.sourceArtifactId || "demo-source", sourceDuration, candidate);
     studioState.selectedId = id;
     studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
@@ -136,21 +240,28 @@
   function seekTimeline(event: MouseEvent) { const rect = (event.currentTarget as HTMLElement).getBoundingClientRect(); seek(((event.clientX - rect.left) / rect.width) * sourceDuration); }
   function setRangeEdge(edge: "start" | "end", value: number) {
     const next = edge === "start" ? Math.min(value, range.end - 0.1) : Math.max(value, range.start + 0.1);
-    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep the last valid range */ }
+    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }, activeRangeIndex); savePlan(); } catch { /* keep the last valid range */ }
   }
-  function setAspect(value: "9:16" | "1:1" | "16:9") { state = updateAspectRatio(state, value); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
-  function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* validation follows the contract */ } }
-  function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
-  function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }
+  function setAspect(value: "9:16" | "1:1" | "16:9") { state = updateAspectRatio(state, value); savePlan(); }
+  function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); savePlan(); } catch { /* validation follows the contract */ } }
+  function addCaption() { const start = Math.max(range.start, Math.min(currentTime, range.end - 0.5)); const caption: Caption = { id: `caption-${Date.now()}`, text: "New caption", start, end: Math.min(range.end, start + 2.5) }; state = upsertCaption(state, caption); activeCaptionId = caption.id; draftCaption = caption.text; savePlan(); }
+  function deleteCaption() { if (!activeCaption) return; state = removeCaption(state, activeCaption.id); activeCaptionId = state.plan.captions[0]?.id ?? ""; savePlan(); }
   async function save() {
     if (!isTauri() || !studioState.projectId || !selectedId) return;
     saved = false; saveError = "";
-    const plans = { ...studioState.plans, [selectedId]: state.plan };
     try {
       const project = await invoke<Record<string, unknown>>("project_get", { id: studioState.projectId });
-      await invoke("project_save", { project: { ...project, selectedId, plans } });
-      studioState.plans = plans;
-      studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
+      if (editingVariantId) {
+        const variants = studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant);
+        const plans = { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan };
+        await invoke("project_save", { project: { ...project, variants, plans, selectedVariantId: editingVariantId } });
+        studioState.variants = variants; studioState.plans = plans;
+      } else {
+        const plans = { ...studioState.plans, [selectedId]: state.plan };
+        await invoke("project_save", { project: { ...project, selectedId, plans } });
+        studioState.plans = plans;
+      }
+      studioState.plan = state.plan;
       saved = true;
       if (saveTimer) clearTimeout(saveTimer);
       saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600);
@@ -159,7 +270,7 @@
     }
   }
   onDestroy(() => { if (saveTimer) clearTimeout(saveTimer); });
-  function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; } catch { /* keep current valid hook */ } }
+  function updateHookText(text: string) { if (!state.plan.hook) return; try { state = updateHook(state, { ...state.plan.hook, text }); savePlan(); } catch { /* keep current valid hook */ } }
 </script>
 
 <main class="bench editor-workspace">
@@ -170,8 +281,13 @@
       <p class="note">{powered ? "Local source connected" : "Demo source · open Studio to load media"}</p>
     </div>
     <div class="panel">
-      <div class="panel-head"><span class="panel-title">Highlights</span><span class="badge">{candidates.length}</span></div>
+      <div class="panel-head"><span class="panel-title">{editingVariantId ? "Transcript variants" : "Highlights"}</span><span class="badge">{editingVariantId ? studioState.variants.length : candidates.length}</span></div>
       <div class="stack">
+        {#each studioState.variants as variant, index}
+          <button class="cand" class:on={variant.id === editingVariantId} aria-pressed={variant.id === editingVariantId} onclick={() => { editingVariantId = variant.id; studioState.editingVariantId = variant.id; loadFromStudio(); }}>
+            <span class="cand-rank">V{index + 1}</span><span><span class="cand-title">{variant.title}</span><span class="cand-sub">Transcript variant · {variant.ranges.length} ranges</span></span>
+          </button>
+        {/each}
         {#each candidates as candidate, index}
           <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => select(candidate.id)}>
             <span class="cand-rank">{String(index + 1).padStart(2, "0")}</span>
@@ -194,7 +310,7 @@
 
   <section class="bench-center">
     <div class="stage">
-      <div class="stage-head"><div class="stage-title"><span class="badge">cut / 01</span><span class="stage-name">{state.selected?.title ?? "Demo highlight"}</span></div><span class="badge ok">local timeline</span></div>
+      <div class="stage-head"><div class="stage-title"><span class="badge">cut / 01</span><span class="stage-name">{editingVariantId ? (studioState.variants.find((variant) => variant.id === editingVariantId)?.title ?? "Transcript variant") : (state.selected?.title ?? "Demo highlight")}</span></div><span class="badge ok">local timeline</span></div>
       <div class="stage-body">
         <div class="canvas-view">
           {#if powered}<video bind:this={video} aria-label="Video preview" src={convertFileSrc(sourcePath)} ontimeupdate={syncTime} onplay={() => playing = true} onpause={() => playing = false} onloadedmetadata={() => { sourceDuration = video.duration || sourceDuration; seek(range.start); }}><track kind="captions" /></video>{:else}<div class="empty-canvas"><span class="eyebrow">Preview canvas</span><strong>Open Studio and analyze a source</strong><span class="note">The editor workspace is ready with a demo cut.</span></div>{/if}
@@ -206,14 +322,19 @@
         <div class="timeline-label">VIDEO</div>
         <p class="timeline-help">Click the ruler to seek. Drag the highlighted range to move it, or drag its left/right edges to trim. Arrow keys adjust the selected range.</p>
         <div class="tl-lane" role="presentation" onclick={seekTimeline}>
-
             <div class="tl-clip-base"></div>
-            <div class="tl-range" class:dragging={dragging === "range"} style={`left:${pct(range.start)};width:${(Math.max(0, range.end - range.start) / Math.max(sourceDuration, 1)) * 100}%`}
-                 onmousedown={onTimelineMouseDown} onkeydown={onRangeKeydown} role="slider" tabindex="0"
-                 aria-label="Selected range" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={sourceDuration} aria-valuenow={Math.round(range.start * 100) / 100} aria-valuetext={`${clock(range.start)} to ${clock(range.end)}`}>
-              <span class="tl-handle in" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={Math.round(range.end * 100) / 100} aria-valuenow={Math.round(range.start * 100) / 100} aria-label="Trim in" onmousedown={(event) => beginHandleDrag("in", event)}></span>
-              <span class="tl-handle out" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin={Math.round(range.start * 100) / 100} aria-valuemax={sourceDuration} aria-valuenow={Math.round(range.end * 100) / 100} aria-label="Trim out" onmousedown={(event) => beginHandleDrag("out", event)}></span>
-            </div>
+            {#each state.plan.ranges as item, index}
+              <div class="tl-range" class:dragging={dragging === "range" && index === activeRangeIndex} class:inactive={index !== activeRangeIndex} style={`left:${pct(item.start)};width:${(Math.max(0, item.end - item.start) / Math.max(sourceDuration, 1)) * 100}%`}
+                   onclick={(event) => { event.stopPropagation(); if (index !== activeRangeIndex) chooseRange(index); }}
+                   onmousedown={(event) => { if (index === activeRangeIndex) onTimelineMouseDown(event); }}
+                   onkeydown={index === activeRangeIndex ? onRangeKeydown : (event) => { if (event.key === "Enter" || event.key === " ") chooseRange(index); }}
+                   role="slider" tabindex="0" aria-label={`Range ${index + 1}`} aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={sourceDuration} aria-valuenow={Math.round(item.start * 100) / 100} aria-valuetext={`${clock(item.start)} to ${clock(item.end)}`}>
+                {#if index === activeRangeIndex}
+                  <span class="tl-handle in" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={Math.round(item.end * 100) / 100} aria-valuenow={Math.round(item.start * 100) / 100} aria-label="Trim in" onmousedown={(event) => beginHandleDrag("in", event)}></span>
+                  <span class="tl-handle out" role="slider" tabindex="0" aria-orientation="horizontal" aria-valuemin={Math.round(item.start * 100) / 100} aria-valuemax={sourceDuration} aria-valuenow={Math.round(item.end * 100) / 100} aria-label="Trim out" onmousedown={(event) => beginHandleDrag("out", event)}></span>
+                {:else}<span class="tl-range-number">{index + 1}</span>{/if}
+              </div>
+            {/each}
             <div class="tl-playhead" style={`left:${pct(currentTime)}`}></div>
           </div>
           <div class="timeline-label">CAPTIONS</div><div class="tl-lane captions" role="presentation" onclick={seekTimeline}>{#each state.plan.captions as caption}<button class="tl-clip" class:on={caption.id === activeCaption?.id} style={`left:${pct(caption.start)};width:${(Math.max(0.5, caption.end - caption.start) / Math.max(sourceDuration, 1)) * 100}%`} onclick={(event) => { event.stopPropagation(); activeCaptionId = caption.id; draftCaption = caption.text; seek(caption.start); }}>{caption.text}</button>{/each}</div>
@@ -225,14 +346,17 @@
 
   <aside class="bench-right">
     <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Clip</span></span><span class="badge volt">active</span></div>
-      <div class="field-row"><label class="field"><span class="field-label">In</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">Out</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div>
-      <div class="seg">{#each ["9:16", "1:1", "16:9"] as ratio}<button class="seg-item" class:on={state.plan.aspectRatio === ratio} onclick={() => setAspect(ratio as "9:16" | "1:1" | "16:9")}>{ratio}</button>{/each}</div>
-      <p class="note">{clock(range.end - range.start)} selected · crop tracked subject · solo layout</p>
-    </div>
+        <div class="field-row"><label class="field"><span class="field-label">In</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">Out</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div>
+      <div class="spread"><span class="note">Range {activeRangeIndex + 1} of {state.plan.ranges.length} · {clock(range.end - range.start)}</span><span class="note">Order is export order</span></div>
+      <div class="field-row"><button class="btn btn-sm btn-quiet" onclick={addRangeAfter}>+ Add range</button><button class="btn btn-sm btn-quiet" disabled={activeRangeIndex === 0} onclick={() => reorderRange(-1)}>Move earlier</button><button class="btn btn-sm btn-quiet" disabled={activeRangeIndex === state.plan.ranges.length - 1} onclick={() => reorderRange(1)}>Move later</button><button class="btn btn-danger btn-sm" disabled={state.plan.ranges.length <= 1} onclick={deleteActiveRange}>Remove</button></div>{#each ["9:16", "1:1", "16:9"] as ratio}<button class="seg-item" class:on={state.plan.aspectRatio === ratio} onclick={() => setAspect(ratio as "9:16" | "1:1" | "16:9")}>{ratio}</button>{/each}
+      </div>
+      <div class="crop-review"><div class="panel-head"><span class="eyebrow">Speaker framing</span><span class="badge" class:ok={trackingEnabled}>{trackingEnabled ? "approved" : "center crop"}</span></div><p class="note">{cropMessage || "Local face path is used only after explicit review."}</p><div class="field-row"><button class="btn btn-sm" disabled={!powered || cropBusy || !studioState.transcript} onclick={analyzeCropPath}>{cropBusy ? "Analyzing…" : "Analyze local crop path"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.cropKeyframes?.length} onclick={() => setTracking(!trackingEnabled)}>{trackingEnabled ? "Use center crop" : "Approve tracking"}</button><button class="btn btn-sm btn-quiet" disabled={!trackingEnabled} onclick={adjustCropCenter}>Adjust center here</button></div><div class="field-row"><label>Crop X <input type="range" min="0" max="1" step="0.01" value={cropCenterAt(state.plan.cropKeyframes ?? [], currentTime).x} oninput={(event) => updateManualCropCenter(Number(event.currentTarget.value))} /></label></div></div>
+      <p class="note">{clock(range.end - range.start)} selected · {trackingEnabled && state.plan.cropKeyframes?.some((key) => key.confirmed && key.confidence >= 0.5) ? "approved speaker tracking" : "center crop fallback"} · {state.plan.sceneLayouts?.some((scene) => scene.confirmed) ? "reviewed scene layout" : "static solo layout"}</p>
+      <div class="scene-review"><div class="panel-head"><span class="eyebrow">Scene layouts</span><button class="btn btn-sm" disabled={!powered || sceneBusy} onclick={analyzeScenes}>{sceneBusy ? "Analyzing…" : "Analyze scenes"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.sceneLayouts?.length} onclick={approveScenes}>Approve scenes</button><button class="btn btn-sm btn-quiet" onclick={disableScenes}>Disable</button></div><p class="note">{sceneMessage || "Local shot analysis is bounded; review each proposed layout before export."}</p>{#if state.plan.sceneLayouts?.length}{#each state.plan.sceneLayouts as scene, index}<div class="field-row"><span class="note">{clock(scene.start)}–{clock(scene.end)} · {Math.round(scene.confidence * 100)}%</span><select value={scene.layout} onchange={(event) => chooseLayout(index, event.currentTarget.value as SceneLayout["layout"])}><option value="solo">Solo</option><option value="side-by-side">Side by side</option></select></div>{/each}{:else}<p class="note">No reviewed scenes. Export keeps the static solo layout.</p>{/if}</div>
     <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Text &amp; hook</span></span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Caption</button></div>
       {#if activeCaption}
         <textarea aria-label="Caption text" value={draftCaption} oninput={(event) => setCaptionText(event.currentTarget.value)}></textarea>
-        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; state = upsertCaption(state, next); studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan }; }} /></label></div>
+        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label></div>
         <button class="btn btn-danger btn-wide btn-sm" onclick={deleteCaption}>Remove caption</button>
       {:else}<p class="note">No caption cue yet. Add one or load transcript cues.</p>{/if}
       <div class="panel" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">

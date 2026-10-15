@@ -5,8 +5,12 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
   import type { Collection } from "../../../../../packages/contracts/collection.ts";
+  import type { Transcript } from "../../../../../packages/contracts/transcript.ts";
+  import { applySpeakerIntervals, transcriptSpeakerIds, speakerExamples } from "../../../../../services/ai-pipeline/diarization.ts";
+  import type { EditVariant, RenderPlan } from "../../../../../packages/contracts/render-plan.ts";
+  import { mapEditVariantProposals, VARIANT_PROMPT_VERSION } from "../../../../../services/ai-pipeline/variants.ts";
   import { studioState } from "../studio-state.svelte.ts";
-  import { createEditorState } from "../../../../../packages/editor-core/index.ts";
+  import { createEditorState, createEditorStateFromVariant } from "../../../../../packages/editor-core/index.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
   import Icon from "../icons.svelte";
   import RelatedYoutubeSearch from "../components/RelatedYoutubeSearch.svelte";
@@ -17,7 +21,7 @@
 
   type Meta = { name: string; duration: number; width: number; height: number };
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
-  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, import("../../../../../packages/contracts/render-plan.ts").RenderPlan>; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
+  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, RenderPlan>; variants?: EditVariant[]; selectedVariantId?: string | null; speakerFaceMatches?: { version: 1; sourceArtifactId: string; confirmed: boolean; matches: Record<string, string> } | null; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
 
   let projects = $state<Project[]>([]);
   let projectId = $state("");
@@ -41,6 +45,19 @@
   let selectedCollection = $state("");
   let selectedId = $state("");
   let selectedIds = $state<string[]>([]);
+  let variants = $state<EditVariant[]>([]);
+  let selectedVariantId = $state("");
+  let variantsBusy = $state(false);
+  let diarizationBusy = $state(false);
+  let faceSamplesBusy = $state(false);
+  let speakerMatches = $state<Record<string, string>>({});
+  let faceSamples = $state<Array<{ id: string; speakerId: string; time: number; thumbnail: string }>>([]);
+  let diarizedSourceId = $state("");
+  let speakerMatchesConfirmed = $state(false);
+  let hfToken = $state("");
+  let hfTokenPresent = $state(false);
+  let diarizationInstalled = $state(false);
+  let diarizationInstallBusy = $state(false);
   let youtubeUrl = $state("");
   let youtubeVideoId = $state("");
   let relatedQuery = $state("");
@@ -73,6 +90,109 @@
     if (typeof path === "string") await loadVideo(path);
   }
 
+  async function refreshDiarizationStatus() {
+    if (!isTauri()) return;
+    try {
+      const status = await invoke<{ installed: boolean; hasToken: boolean }>("diarization_setup_status");
+      diarizationInstalled = status.installed; hfTokenPresent = status.hasToken;
+    } catch { diarizationInstalled = false; hfTokenPresent = false; }
+  }
+
+  async function runDiarization() {
+    const transcript = studioState.transcript;
+    if (!isTauri() || !transcript || diarizationBusy || !inputPath || inputPath.startsWith("http")) return;
+    if (!hfTokenPresent || !diarizationInstalled) { message = "Save your Hugging Face token and install the optional diarization runtime in Settings first."; return; }
+    diarizationBusy = true; message = "Running local speaker diarization…";
+    try {
+      const intervals = await invoke<unknown>("diarize_video", { path: inputPath, duration: Math.min(meta?.duration ?? transcript.duration, 1800) });
+      const updated = applySpeakerIntervals(transcript, intervals);
+      studioState.transcript = updated;
+      diarizedSourceId = updated.sourceArtifactId;
+      speakerMatches = {}; speakerMatchesConfirmed = false; faceSamples = [];
+      studioState.speakerFaceMatches = {}; studioState.speakerFaceConfirmed = false;
+      await persistProject({ transcript: updated, speakerFaceMatches: null });
+      message = `Diarization complete: ${transcriptSpeakerIds(updated).length} speakers found. Review the labels and confirm any face matches.`;
+    } catch (error) { message = `Diarization failed: ${String(error)}`; }
+    finally { diarizationBusy = false; }
+  }
+
+  async function sampleFaces() {
+    const transcript = studioState.transcript;
+    if (!isTauri() || !transcript || faceSamplesBusy || !inputPath || inputPath.startsWith("http")) return;
+    const speakers = transcriptSpeakerIds(transcript);
+    if (!speakers.length) return;
+    const samples = speakers.slice(0, 8).map((speakerId) => {
+      const segment = transcript.segments.find((item) => item.speakerId === speakerId);
+      const midpoint = segment ? (segment.start + segment.end) / 2 : transcript.words.find((word) => word.speakerId === speakerId)?.start ?? 0;
+      return { speakerId, time: Math.max(0, Math.min(midpoint, Math.max(0, (meta?.duration ?? transcript.duration) - 0.05))) };
+    });
+    faceSamplesBusy = true; message = "Sampling temporary face crops locally…";
+    try {
+      const detected = await invoke<Array<{ id: string; speakerId: string; time: number; thumbnail: string }>>("sample_speaker_faces", { path: inputPath, speakers: samples });
+      faceSamples = detected.slice(0, 32).map((sample) => ({ ...sample, thumbnail: speakerFaceDataUrl(sample.thumbnail) })).filter((sample) => sample.thumbnail);
+      message = faceSamples.length ? `${faceSamples.length} temporary face samples ready. Choose matches, then confirm.` : "No faces were detected in the sampled frames.";
+    } catch (error) { message = `Face sampling failed: ${String(error)}`; }
+    finally { faceSamplesBusy = false; }
+  }
+
+  async function cancelSpeakerMatches() {
+    const transcript = studioState.transcript;
+    if (transcript) {
+      const words = transcript.words.map(({ speakerId: _speakerId, ...word }) => word);
+      const segments = transcript.segments.map(({ speakerId: _speakerId, ...segment }) => segment);
+      studioState.transcript = { ...transcript, words, segments };
+      await persistProject({ transcript: studioState.transcript, speakerFaceMatches: null });
+    }
+    clearSpeakerState();
+    message = "Diarization and face-match changes cancelled.";
+  }
+
+  function confirmSpeakerMatches() {
+    const transcript = studioState.transcript;
+    if (!transcript) return;
+    const speakers = transcriptSpeakerIds(transcript);
+    const sampleIds = new Set(faceSamples.map((sample) => sample.id));
+    const clean: Record<string, string> = {};
+    const usedSamples = new Set<string>();
+    for (const speakerId of speakers) {
+      const selected = speakerMatches[speakerId];
+      if (selected && sampleIds.has(selected) && !usedSamples.has(selected) && faceSamples.some((sample) => sample.id === selected && sample.speakerId === speakerId)) { clean[speakerId] = selected; usedSamples.add(selected); }
+    }
+    speakerMatches = clean; diarizedSourceId = transcript.sourceArtifactId; speakerMatchesConfirmed = true;
+    studioState.speakerFaceMatches = clean; studioState.speakerFaceConfirmed = true;
+    void persistProject({ speakerFaceMatches: { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: clean } });
+    message = "Speaker labels and face matches confirmed and saved with this project.";
+  }
+
+  async function saveHfToken() {
+    if (!isTauri() || hfToken.trim().length < 10) return;
+    try {
+      await invoke("save_diarization_token", { token: hfToken });
+      await refreshDiarizationStatus(); message = "Hugging Face token saved locally.";
+    } catch (error) { message = `Token save failed: ${String(error)}`; }
+  }
+
+  async function installDiarizationRuntime() {
+    if (!isTauri() || diarizationInstallBusy) return;
+    if (!confirm("Install optional pyannote.audio and OpenCV into the app's local Python environment? This downloads packages from the internet and may use several GB of disk space.")) return;
+    diarizationInstallBusy = true; message = "Installing optional local diarization packages…";
+    try { await invoke("install_diarization_runtime"); await refreshDiarizationStatus(); message = "Local diarization runtime installed."; }
+    catch (error) { message = `Diarization setup failed: ${String(error)}`; }
+    finally { diarizationInstallBusy = false; }
+  }
+
+  function speakerFaceDataUrl(thumbnail: string): string {
+    if (thumbnail.startsWith("data:image/jpeg;base64,")) return thumbnail;
+    if (!/^(?:[0-9a-f]{2})+$/i.test(thumbnail)) return "";
+    const binary = (thumbnail.match(/.{2}/g) ?? []).map((byte) => String.fromCharCode(parseInt(byte, 16))).join("");
+    return `data:image/jpeg;base64,${btoa(binary)}`;
+  }
+
+  function clearSpeakerState() {
+    speakerMatches = {}; faceSamples = []; diarizedSourceId = ""; speakerMatchesConfirmed = false;
+    studioState.speakerFaceMatches = {}; studioState.speakerFaceConfirmed = false;
+  }
+
   async function refreshProjects() {
     if (!isTauri()) return;
     try { projects = await invoke<Project[]>("project_list"); } catch { projects = []; }
@@ -82,7 +202,7 @@
     if (!isTauri() || !projectId) return;
     const existing = projects.find((item) => item.id === projectId);
     if (!existing) return;
-    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, ...patch };
+    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, variants, selectedVariantId: selectedVariantId || null, speakerFaceMatches: speakerMatchesConfirmed && diarizedSourceId === (studioState.transcript?.sourceArtifactId ?? "") ? { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: speakerMatches } : null, ...patch };
 
     try {
       const saved = await invoke<Project>("project_save", { project: next });
@@ -99,10 +219,19 @@
 
   async function hydrateProject(project: Project) {
     projectId = project.id; inputPath = project.sourcePath; meta = { name: project.sourceName, duration: project.sourceDuration, width: 0, height: 0 };
+    await refreshDiarizationStatus();
+    faceSamples = []; diarizationBusy = false; faceSamplesBusy = false;
     highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? ""; selectedIds = project.selectedIds ?? (selectedId ? [selectedId] : []);
     studioState.projectId = project.id; studioState.sourcePath = project.sourcePath; studioState.sourceName = project.sourceName; studioState.sourceDuration = project.sourceDuration;
     studioState.highlights = highlights; studioState.transcript = project.transcript as typeof studioState.transcript; studioState.selectedId = selectedId;
-    studioState.plans = project.plans ?? {}; studioState.plan = studioState.plans[selectedId] ?? null;
+    studioState.plans = project.plans ?? {}; studioState.variants = project.variants ?? []; studioState.selectedVariantId = project.selectedVariantId ?? ""; variants = studioState.variants; selectedVariantId = studioState.selectedVariantId;
+    const mapping = project.speakerFaceMatches;
+    const mappingMatchesTranscript = mapping?.sourceArtifactId === studioState.transcript?.sourceArtifactId;
+    speakerMatches = mappingMatchesTranscript ? mapping?.matches ?? {} : {};
+    speakerMatchesConfirmed = mappingMatchesTranscript && !!mapping?.confirmed;
+    diarizedSourceId = speakerMatchesConfirmed ? mapping?.sourceArtifactId ?? "" : "";
+    studioState.speakerFaceMatches = speakerMatches; studioState.speakerFaceConfirmed = speakerMatchesConfirmed;
+    studioState.editingVariantId = ""; studioState.plan = studioState.plans[selectedId] ?? null;
     currentStep = highlights.length ? 4 : 2; message = "Project reopened.";
     if (project.sourcePath && !/^https?:\/\//i.test(project.sourcePath)) {
       try { await invoke("probe_video", { path: project.sourcePath }); }
@@ -124,7 +253,7 @@
   }
 
   async function loadVideo(path: string) {
-    projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
+    projectId = ""; studioState.projectId = ""; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
     inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
     studioState.highlights = []; studioState.selectedId = "";
     await reconnectJobs(false);
@@ -203,14 +332,14 @@
         progress = job.progress;
         if (job.status === "completed") {
           const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : [];
-          collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? "";
+          collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? ""; variants = []; selectedVariantId = "";
           if (result.videoId) youtubeVideoId = result.videoId;
-          studioState.highlights = highlights; studioState.selectedId = selectedId; studioState.transcript = result.transcript ?? null;
+          studioState.highlights = highlights; studioState.selectedId = selectedId; clearSpeakerState(); studioState.transcript = result.transcript ?? null; studioState.variants = []; studioState.selectedVariantId = ""; studioState.editingVariantId = "";
           if (projectId) {
             const segments = (result.transcript as { segments?: { text?: string }[] } | null)?.segments ?? [];
             relatedSourceText = (segments.map((segment) => segment.text ?? "").join(" ") || result.title || highlights[0]?.title || "").slice(0, 4000);
             relatedQuery = [result.title, highlights[0]?.title, result.topic, ...segments.slice(0, 12).map((segment) => segment.text)].filter(Boolean).join(" ").slice(0, 200);
-            await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId });
+            await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId, variants: [], selectedVariantId: null });
           }
 
           message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
@@ -234,7 +363,7 @@
     const existing = resumableJobs.find((job) => job.input === inputPath && (job.status === "queued" || job.status === "running") && Math.abs((job.rangeStart ?? 0) - analyzeStart) < 0.01 && Math.abs((job.rangeEnd ?? analyzeEnd) - analyzeEnd) < 0.01);
     if (existing && confirm("Continue existing analysis? Cancel = clear this setup and start fresh.")) { await watch(existing.id, true); return; }
     if (existing) await clearCache(existing.id);
-    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; message = "Analyzing…";
+    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; clearSpeakerState(); variants = []; studioState.variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; message = "Analyzing…";
     try {
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
       await watch(id, false);
@@ -249,7 +378,7 @@
     highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; youtubeVideoId = ""; meta = null;
     busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
-      projectId = ""; studioState.projectId = ""; studioState.plans = {}; studioState.plan = null; studioState.transcript = null;
+      projectId = ""; studioState.projectId = ""; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
       inputPath = url;
       meta = { name: info.title, duration: info.duration, width: 0, height: 0 };
@@ -262,6 +391,56 @@
       message = `YouTube analyze failed: ${String(error)}`;
       busy = false; resetTimer();
     }
+  }
+
+  async function generateVariants() {
+    if (!isTauri()) { message = "Variant generation is available in the desktop app."; return; }
+    if (!studioState.transcript || variantsBusy) return;
+    variantsBusy = true; message = "AI is proposing transcript edits…";
+    try {
+      const result = await invoke<{ promptVersion: string; variants: EditVariant[] }>("generate_transcript_variants", { transcript: studioState.transcript });
+      if (result.promptVersion !== VARIANT_PROMPT_VERSION || !result.variants.length) throw new Error("No valid transcript variants were returned.");
+      variants = result.variants.map((variant) => {
+        const plan = studioState.plans[`variant:${variant.id}`] ?? variant.plan;
+        return { ...variant, ...(plan ? { plan } : {}) };
+      });
+      studioState.variants = variants; selectedVariantId = variants[0]?.id ?? ""; studioState.selectedVariantId = selectedVariantId;
+      await persistProject({ variants, selectedVariantId });
+      message = `${variants.length} transcript variants ready to compare.`;
+    } catch (error) { message = `Variant generation failed: ${String(error)}`; }
+    finally { variantsBusy = false; }
+  }
+
+  function chooseVariant(id: string) {
+    selectedVariantId = id; studioState.selectedVariantId = id;
+    void persistProject({ selectedVariantId: id });
+  }
+
+  function editVariant(id: string) {
+    const variant = variants.find((item) => item.id === id);
+    if (!variant) return;
+    selectedVariantId = id; studioState.selectedVariantId = id; studioState.editingVariantId = id;
+    void persistProject({ selectedVariantId: id });
+    window.location.href = "/editor/variant";
+  }
+
+  async function renderVariant(id: string) {
+    if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
+    const variant = variants.find((item) => item.id === id);
+    const transcript = studioState.transcript;
+    if (!variant || !transcript || !inputPath) return;
+    busy = true;
+    try {
+      const plan = variant.plan ?? studioState.plans[`variant:${id}`] ?? createEditorStateFromVariant(transcript, variant).plan;
+      variant.plan = plan;
+      const output = await save({ defaultPath: `${variant.title.replace(/[^\\w-]+/g, "_") || "variant"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
+      if (!output) return;
+      await invoke<string>("render_video", { input: inputPath, output, start: plan.ranges[0].start, duration: plan.ranges[0].end - plan.ranges[0].start, aspectRatio: plan.aspectRatio, ranges: plan.ranges, plan });
+      outputPath = output; message = `Rendered ${variant.title}: ${output}`;
+      const renders = [...(projects.find((item) => item.id === projectId)?.renders ?? []), { output, status: "completed", highlightId: `variant:${id}` }];
+      await persistProject({ renders });
+    } catch (error) { message = `Render failed for ${variant.title}: ${String(error)}`; }
+    finally { busy = false; }
   }
 
   function chooseCandidate(id: string) {
@@ -290,7 +469,7 @@
         const output = await save({ defaultPath: `${candidate.title.replace(/[^\\w-]+/g, "_") || "short"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
         if (!output) break;
         try {
-          await invoke<string>("render_video", { input: inputPath, output, start: range.start, duration: range.end - range.start, aspectRatio: plan.aspectRatio, plan });
+          await invoke<string>("render_video", { input: inputPath, output, start: range.start, duration: range.end - range.start, aspectRatio: plan.aspectRatio, ranges: plan.ranges, plan });
           renders.push({ output, status: "completed", highlightId: id });
           outputPath = output;
           message = `Rendered ${candidate.title}: ${output}`;
@@ -317,7 +496,7 @@
 
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   onMount(() => {
-    void refreshRuntime(); void reconnectJobs(); void refreshProjects();
+    void refreshRuntime(); void reconnectJobs(); void refreshProjects(); void refreshDiarizationStatus();
     if (isTauri()) invoke<string>("preview_origin").then((base) => previewBase = base).catch(() => {});
     const unlisten = getCurrentWindow().onDragDropEvent((event) => {
       const payload = event.payload;
@@ -432,6 +611,44 @@
 
     {#if currentStep === 4}
     {#if highlights.length}
+      <div class="card speaker-face-match">
+        <div class="spread"><div><div class="section-title">Experimental · Match speakers to faces</div><p class="hint">Assign a face sample to each anonymous speaker label. Samples stay temporary; no identity recognition is performed.</p></div><span class="badge" class:ok={speakerMatchesConfirmed}>{speakerMatchesConfirmed ? "confirmed" : "not confirmed"}</span></div>
+        {#if inputPath.startsWith("http")}
+          <p class="hint">Speaker diarization and local face sampling are available for local video sources only.</p>
+        {:else if !studioState.transcript?.words.some((word) => word.speakerId)}
+          <div class="stack"><div class="field-row"><button class="btn btn-sm btn-primary" disabled={diarizationBusy || !hfTokenPresent || !diarizationInstalled} onclick={runDiarization}>{diarizationBusy ? "Analyzing speakers…" : "Run local diarization"}</button><span class="note">Requires the optional local runtime and a Hugging Face token for the gated pyannote model.</span></div><p class="hint">Setup: <a href="/settings">Settings</a> → Local diarization. The model's access terms must be accepted on Hugging Face.</p></div>
+        {:else}
+          <div class="field-row"><button class="btn btn-sm" disabled={faceSamplesBusy} onclick={sampleFaces}>{faceSamplesBusy ? "Sampling frames…" : "Sample faces from video"}</button><button class="btn btn-sm btn-quiet" onclick={cancelSpeakerMatches}>Cancel changes</button></div>
+          <div class="speaker-grid">
+            {#each transcriptSpeakerIds(studioState.transcript) as speakerId}
+              {@const example = speakerExamples(studioState.transcript).find((item) => item.speakerId === speakerId)}
+              <section class="speaker-row"><strong>{speakerId}</strong><p class="note">{example?.text ?? "Speaker turn"}</p><label class="field"><span class="field-label">Matching face sample</span><select value={speakerMatches[speakerId] ?? ""} onchange={(event) => { speakerMatches = { ...speakerMatches, [speakerId]: event.currentTarget.value }; speakerMatchesConfirmed = false; studioState.speakerFaceConfirmed = false; }}><option value="">Unknown / no match</option>{#each faceSamples.filter((sample) => sample.speakerId === speakerId) as sample}<option value={sample.id}>Sample at {clock(sample.time)}</option>{/each}</select></label></section>
+            {/each}
+          </div>
+          {#if faceSamples.length}<div class="face-samples">{#each faceSamples as sample}<figure><img src={speakerFaceDataUrl(sample.thumbnail)} alt={`Detected face sample near ${clock(sample.time)}`} /><figcaption>{sample.speakerId} · {clock(sample.time)}</figcaption></figure>{/each}</div>{/if}
+          <button class="btn btn-primary" disabled={!transcriptSpeakerIds(studioState.transcript).length} onclick={confirmSpeakerMatches}>Confirm speaker matches</button>
+        {/if}
+        {#if !hfTokenPresent}<p class="hint">Add a Hugging Face read token in Settings and accept access to pyannote/speaker-diarization-3.1 before running diarization.</p>{/if}
+      </div>
+      {#if studioState.transcript}
+        <div class="card">
+          <div class="spread"><div><div class="section-title">Experimental · Transcript edit variants</div><p class="hint">AI suggests ordered source ranges from the transcript. Compare a version, edit it, then export that version only.</p></div><button class="cta small" disabled={variantsBusy || busy} onclick={generateVariants}>{#if variantsBusy}<span class="spinner"></span>{/if}{variantsBusy ? "Generating…" : variants.length ? "Generate again" : "Generate variants"}</button></div>
+          {#if variants.length}
+            <div class="variant-grid">
+              {#each variants as variant}
+                {@const plan = variant.plan ?? studioState.plans[`variant:${variant.id}`]}
+                {@const duration = (plan?.ranges ?? variant.ranges).reduce((sum, range) => sum + range.end - range.start, 0)}
+                <article class="variant-card" class:selected={selectedVariantId === variant.id}>
+                  <div class="variant-select" aria-current={selectedVariantId === variant.id ? "true" : undefined}><button class="variant-choice" aria-pressed={selectedVariantId === variant.id} onclick={() => chooseVariant(variant.id)}><strong>{variant.title}</strong><span>{variant.reason ?? "Transcript-selected moments"}</span><small>{variant.ranges.length} ranges · {clock(duration)}</small></button>
+                    <ol>{#each variant.ranges as range, index}<li><span>{index + 1}. {clock(range.start)}–{clock(range.end)}</span><small>{(studioState.transcript?.segments ?? []).filter((segment) => segment.end > range.start && segment.start < range.end).map((segment) => segment.text).join(" ")}</small></li>{/each}</ol>
+                  </div>
+                  <div class="field-row"><button class="btn btn-sm" onclick={() => editVariant(variant.id)}>Edit in Editor</button><button class="btn btn-sm btn-primary" disabled={busy} onclick={() => renderVariant(variant.id)}>Export this version</button></div>
+                </article>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
       <div class="card">
         <div class="section-title">Shorts Showcase</div>
         {#if collections.length}
@@ -503,5 +720,18 @@
       <span>Device: {runtimeStore.device === "cuda" ? "GPU (CUDA)" : "CPU"} · Model: {runtimeStore.model} · License: {runtimeStore.licenseMessage}</span>
       <span title="Safe cleanup only: inspect caches and old renders before removing anything.">Storage: {runtimeStore.storageMessage}</span>
     </div>
+    </div>
   </section>
+  <style>
+    .variant-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:.75rem; margin-top:.8rem; }
+    .variant-card { border:1px solid var(--line-soft); border-radius:14px; padding:.8rem; background:var(--panel); }
+    .variant-card.selected { border-color:var(--volt); box-shadow:0 0 0 1px var(--volt); }
+    .variant-select { display:flex; flex-direction:column; align-items:flex-start; gap:.45rem; width:100%; text-align:left; color:inherit; }
+    .variant-choice { display:flex; flex-direction:column; align-items:flex-start; gap:.45rem; width:100%; text-align:left; color:inherit; background:none; border:0; padding:0; cursor:pointer; }
+    .variant-choice > span,.variant-choice > small { color:var(--ink-2); }
+    .variant-select ol { padding-left:1.25rem; margin:.25rem 0; width:100%; }
+    .variant-select li { margin:.35rem 0; }
+    .variant-select li small { display:block; color:var(--ink-2); }
+    .variant-card .field-row { margin-top:.6rem; }
+  </style>
 </main>

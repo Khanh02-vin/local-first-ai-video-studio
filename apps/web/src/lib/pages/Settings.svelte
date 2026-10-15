@@ -25,6 +25,10 @@ let llmSetupBusy = $state(false);
 let smallBusy = $state(false);
 let smallProgress = $state<Progress | null>(null);
 let smallPresent = $state(false);
+let hfToken = $state("");
+let diarizationInstalled = $state(false);
+let hfTokenPresent = $state(false);
+let diarizationBusy = $state(false);
 
 async function setupWhisper() {
   if (!isTauri()) { message = "Whisper setup runs in the desktop app only."; return; }
@@ -52,6 +56,26 @@ async function pollLocalLlm() {
     message = status.progress.error ? `Local LLM setup error: ${status.progress.error}` : "Local LLM runtime and model are ready.";
   }
 }
+async function refreshDiarization() {
+  if (!isTauri()) return;
+  try {
+    const status = await invoke<{ installed: boolean; hasToken: boolean }>("diarization_setup_status");
+    diarizationInstalled = status.installed; hfTokenPresent = status.hasToken;
+  } catch { diarizationInstalled = false; hfTokenPresent = false; }
+}
+async function saveHfToken() {
+  if (!isTauri() || hfToken.trim().length < 10) return;
+  try { await invoke("save_diarization_token", { token: hfToken }); hfToken = ""; await refreshDiarization(); message = "Hugging Face token saved locally."; }
+  catch (error) { message = `Token save failed: ${String(error)}`; }
+}
+async function setupDiarization() {
+  if (!isTauri() || diarizationBusy) return;
+  if (!confirm("Install optional pyannote.audio and OpenCV into the app's local Python environment? This downloads packages from the internet and may use several GB of disk space.")) return;
+  diarizationBusy = true;
+  try { await invoke("install_diarization_runtime"); await refreshDiarization(); message = "Local diarization runtime installed."; }
+  catch (error) { message = `Diarization setup failed: ${String(error)}`; }
+  finally { diarizationBusy = false; }
+}
 async function reloadSetupState() {
   try {
     whisperProgress = await invoke<Progress>("whisper_bootstrap_status");
@@ -59,6 +83,7 @@ async function reloadSetupState() {
     modelProgress = status.progress; llamaRuntimePresent = status.runtimePresent; modelPresent = status.modelPresent;
     const small = await invoke<{ progress: Progress | null; modelPresent: boolean }>("whisper_model_download_status");
     smallProgress = small.progress; smallPresent = small.modelPresent;
+    await refreshDiarization();
   } catch { /* browser dev: ignore */ }
 }
 async function downloadSmall() {
@@ -183,6 +208,16 @@ $effect(() => {
             <span class="note" style="margin:0;">Local LLM — optional llama.cpp runtime and Qwen2.5-3B GGUF model (~2.2 GB total); downloads on request and verifies checksums.</span><button class="btn btn-sm" disabled={llmSetupBusy || (modelPresent && llamaRuntimePresent)} onclick={setupLocalLlm}>{modelPresent && llamaRuntimePresent ? "Ready ✓" : llmSetupBusy ? "Installing…" : "Install Local LLM"}</button>
           </div>
           {#if modelProgress}<p class="hint" aria-live="polite">{modelProgress.message}{modelProgress.error ? ` — ${modelProgress.error}` : ""}</p>{:else}<p class="note">Runtime: {llamaRuntimePresent ? "installed" : "not installed"} · Model: {modelPresent ? "downloaded" : "not downloaded"}. Only needed for the Local LLM highlight strategy.</p>{/if}
+        </div>
+
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Local diarization &amp; face matching</span><span class="badge" class:ok={diarizationInstalled && hfTokenPresent}>{diarizationInstalled && hfTokenPresent ? "ready" : "optional"}</span></div>
+          <p class="note">Speaker diarization runs locally with pyannote.audio. Face samples use local OpenCV detection only; no identity recognition or face embeddings are created.</p>
+          <label class="field"><span class="field-label">Hugging Face read token {hfTokenPresent ? "(saved locally)" : ""}</span><input type="password" autocomplete="new-password" bind:value={hfToken} placeholder={hfTokenPresent ? "Token saved — enter a new one to replace" : "hf_…"} /></label>
+          <button class="btn btn-sm" disabled={hfToken.trim().length < 10} onclick={saveHfToken}>Save token locally</button>
+          <p class="hint">Before use, visit the <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noreferrer">pyannote/speaker-diarization-3.1 model page</a> and accept its access conditions. The token is kept in this app's local runtime settings and passed only to the local diarization process.</p>
+          <div class="spread"><span class="note">Runtime: {diarizationInstalled ? "installed" : "not installed"} · Token: {hfTokenPresent ? "saved" : "not saved"}</span><button class="btn btn-sm" disabled={diarizationBusy || diarizationInstalled} onclick={setupDiarization}>{diarizationInstalled ? "Installed ✓" : diarizationBusy ? "Installing…" : "Install optional runtime"}</button></div>
+          {#if !runtimeStore.components.whisper}<p class="hint">Set up the app's Python/Whisper environment first.</p>{/if}
         </div>
 
         <div class="panel">

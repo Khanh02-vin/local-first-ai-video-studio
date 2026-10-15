@@ -2,11 +2,14 @@ import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
+import type { EditVariant } from "../../packages/contracts/render-plan.ts";
+export { GeminiTranscriptVariantProvider, LlamaCppTranscriptVariantProvider } from "./variants.ts";
 
 export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript>; }
 /** choose() may receive window bounds (seconds) so callers control how a long transcript
  *  is sliced per LLM call; omit them for the shared defaults. */
 export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; }
+export interface TranscriptVariantProvider { generate(input: { transcript: Transcript; signal?: AbortSignal }): Promise<EditVariant[]>; }
 
 export class OpenAITranscriptionProvider implements TranscriptionProvider {
   private readonly apiKey: string;

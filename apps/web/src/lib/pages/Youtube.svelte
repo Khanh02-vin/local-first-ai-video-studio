@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { isTauri, invoke } from "@tauri-apps/api/core";
   import Icon from "../icons.svelte";
   type Playlist = { id: string; playlistId: string; playlistUrl: string; title: string | null; status: string; createdAt: string; updatedAt: string };
@@ -18,6 +19,46 @@
   let loading = $state(false);
   let adding = $state(false);
   let showIngest = $state(false);
+  let ingestDialog = $state<HTMLDivElement>();
+  let ingestTrigger = $state<HTMLButtonElement>();
+  async function openIngest() {
+    showIngest = true;
+    await tick();
+    ingestDialog?.querySelector<HTMLElement>("input, textarea, button")?.focus();
+  }
+  function closeIngest() {
+    showIngest = false;
+    void tick().then(() => ingestTrigger?.focus());
+  }
+  function trapIngestFocus(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeIngest();
+      return;
+    }
+    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      closeIngest();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = ingestDialog;
+    if (!dialog) return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')];
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
   let showFilters = $state(false);
   let ingestUrl = $state("");
   let ingestTitle = $state("");
@@ -131,7 +172,7 @@
   async function ingest() {
     if (!ingestUrl.trim() || !ingestText.trim()) return;
     statusKind = "ingest";
-    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await rag("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; showIngest = false; } catch (error) { status = String(error); }
+    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await rag("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; closeIngest(); } catch (error) { status = String(error); }
   }
   initRag().then(loadPlaylists);
   refreshYtConnection();
@@ -198,16 +239,16 @@
       </div>
     </div>
     <div class="stage-foot">
-      <button class="stage-foot-link" onclick={() => showIngest = true}>+ Paste a transcript manually</button>
+      <button class="stage-foot-link" bind:this={ingestTrigger} onclick={openIngest}>+ Paste a transcript manually</button>
       <span title="This workspace indexes public YouTube knowledge only — no channel, analytics, uploads, or private videos.">ⓘ</span>
     </div>
   </div></section>
 
   <!-- manual ingest: modal render có điều kiện (tránh hydration claim lệch với modal luôn-tồn-tại ở root) -->
   {#if showIngest}
-    <div class="modal-back open" role="dialog" aria-modal="true" onclick={(event) => { if (event.target === event.currentTarget) showIngest = false; }}>
-      <div class="modal">
-        <div class="panel-head"><strong>Paste a transcript manually</strong><button class="btn btn-sm btn-quiet" aria-label="Close manual transcript" onclick={() => showIngest = false}><Icon name="x" size={14} /></button></div>
+      <div class="modal-back open" role="presentation" onpointerdown={(event) => { if (event.target === event.currentTarget) closeIngest(); }}>
+        <div class="modal" bind:this={ingestDialog} role="dialog" aria-modal="true" aria-labelledby="manual-ingest-title" tabindex="-1" onkeydown={trapIngestFocus}>
+        <div class="panel-head"><strong id="manual-ingest-title">Paste a transcript manually</strong><button class="btn btn-sm btn-quiet" aria-label="Close manual transcript" onclick={closeIngest}><Icon name="x" size={14} /></button></div>
         <p class="note" style="margin:0;">Bring your own ordered segments when a source is not in a crawlable playlist.</p>
         <label class="field"><span class="field-label">Video URL</span><input placeholder="https://youtube.com/watch?v=…" bind:value={ingestUrl} /></label>
         <label class="field"><span class="field-label">Title</span><input placeholder="Video title" bind:value={ingestTitle} /></label>
