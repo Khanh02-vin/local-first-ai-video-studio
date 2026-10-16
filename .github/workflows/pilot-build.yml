@@ -130,3 +130,53 @@ jobs:
             dist/windows/SHA256SUMS-msi.txt
           if-no-files-found: error
           retention-days: 14
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf libwebkit2gtk-4.1-dev
+      - name: Fetch bundled resources
+        run: bash scripts/fetch-bundled-assets.sh
+      - name: Build Debian package
+        run: |
+          cd apps/web && npm ci && npm run build
+          cd ../desktop && npm ci && npx tauri build --bundles deb
+      - name: Prepare package and provenance
+        run: |
+          set -euo pipefail
+          mkdir -p dist/linux
+          package=$(find apps/desktop/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print -quit)
+          test -n "$package"
+          cp "$package" "dist/linux/Local-first AI Video Studio_0.1.0_amd64.deb"
+          cd dist/linux
+          sha256sum 'Local-first AI Video Studio_0.1.0_amd64.deb' > SHA256SUMS-linux.txt
+          printf 'Source revision: %s\nApp version: 0.1.0\nPackage: Debian amd64 (.deb)\n' "$GITHUB_SHA" > BUILD-INFO-linux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pilot-linux-deb
+          path: |
+            dist/linux/*.deb
+            dist/linux/BUILD-INFO-linux.txt
+            dist/linux/SHA256SUMS-linux.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish Linux package to pilot prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist/linux
+          sha256sum -c SHA256SUMS-linux.txt
+          gh release upload v0.1.1-pilot.1 \
+            'Local-first AI Video Studio_0.1.0_amd64.deb' \
+            SHA256SUMS-linux.txt BUILD-INFO-linux.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
