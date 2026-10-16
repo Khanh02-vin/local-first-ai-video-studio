@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "dev": "WEB_ADAPTER=node vite dev",
     "build": "vite build",
     "build:node": "node build-node.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"

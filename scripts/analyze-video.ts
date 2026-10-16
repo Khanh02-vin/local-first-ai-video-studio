@@ -4,6 +4,7 @@ import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 
 const [mediaPath, sourceArtifactId, durationText, rangeStartText, rangeEndText, jobId, statePath] = process.argv.slice(2);
 const duration = Number(durationText);
@@ -70,11 +71,15 @@ try {
   if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
   // Free tier: only the top 3 highlights, CPU + tiny already enforced by start_analysis.
   if (process.env.LICENSE_TIER !== "pro") result.highlights = result.highlights.slice(0, 3);
+  // Collections group the final (post-tier) highlight set, so every item points at
+  // a highlight the UI actually received. projectId falls back to the source
+  // artifact id — swap in a real project id once a local project store exists.
+  const payload = { ...result, collections: await groupHighlightsIntoCollections(result.highlights, { projectId: sourceArtifactId, sourceArtifactId }) };
   store?.update(jobId!, { phase: "rank", progress: 0.9 });
-  const resultPath = store ? await persistResult(result) : null;
+  const resultPath = store ? await persistResult(payload) : null;
   store?.update(jobId!, { status: "completed", phase: "completed", progress: 1, resultPath, error: null });
   store?.close();
-  process.stdout.write(JSON.stringify(result));
+  process.stdout.write(JSON.stringify(payload));
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   store?.update(jobId!, { status: interrupted ? "queued" : "failed", phase: interrupted ? "queued" : "failed", error: message });

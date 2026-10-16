@@ -2,11 +2,14 @@ import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
+import type { EditVariant } from "../../packages/contracts/render-plan.ts";
+export { GeminiTranscriptVariantProvider, LlamaCppTranscriptVariantProvider } from "./variants.ts";
 
 export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript>; }
 /** choose() may receive window bounds (seconds) so callers control how a long transcript
  *  is sliced per LLM call; omit them for the shared defaults. */
 export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; }
+export interface TranscriptVariantProvider { generate(input: { transcript: Transcript; signal?: AbortSignal }): Promise<EditVariant[]>; }
 
 export class OpenAITranscriptionProvider implements TranscriptionProvider {
   private readonly apiKey: string;
@@ -122,10 +125,9 @@ export class GeminiHighlightProvider implements HighlightProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly endpoint: string;
+  private readonly circuitBreaker = new CircuitBreaker(5, 30_000);
   constructor(apiKey: string, model = "gemini-2.0-flash", endpoint = "https://generativelanguage.googleapis.com/v1beta/models") { this.apiKey = apiKey; this.model = model; this.endpoint = endpoint; }
   async choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> {
-    // Long videos exceed a single comfortable LLM context, so split the transcript into
-    // windows, get per-window proposals, then merge and de-overlap into the final 3-5.
     const windows = highlightWindows(input.transcript, input.windowSeconds ?? 180, input.overlapSeconds ?? 30);
     const perWindow: Highlight[][] = [];
     for (let i = 0; i < windows.length; i++) {
@@ -138,14 +140,14 @@ export class GeminiHighlightProvider implements HighlightProvider {
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
-    const prompt = highlightPrompt(transcript);
-    // Structured output: the API guarantees a valid JSON body matching the schema,
-    // so no fence-stripping or truncation repair is needed on this path.
-    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal });
-    if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
-    const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-    const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
-    return mapWordRangeProposals(transcript, extractHighlightProposals(JSON.parse(text.replace(/^```json\s*|\s*```$/g, ""))));
+    return this.circuitBreaker.execute(async () => {
+      const prompt = highlightPrompt(transcript);
+      const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal });
+      if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
+      const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+      const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
+      return mapWordRangeProposals(transcript, extractHighlightProposals(JSON.parse(text.replace(/^```json\s*|\s*```$/g, ""))));
+    });
   }
 }
 
@@ -195,13 +197,13 @@ export function mergeWindowHighlights(perWindow: Highlight[][], source: Transcri
 export class LlamaCppHighlightProvider implements HighlightProvider {
   private readonly baseUrl: string;
   private readonly model: string;
+  private readonly circuitBreaker = new CircuitBreaker(5, 30_000);
   constructor(baseUrl = "http://127.0.0.1:8080", model = "qwen2.5-3b-instruct") { this.baseUrl = baseUrl.replace(/\/+$/, ""); this.model = model; }
   private modelId?: string;
   private async resolvedModelId(signal?: AbortSignal): Promise<string> {
     if (this.modelId) return this.modelId;
     const response = await fetch(`${this.baseUrl}/v1/models`, { signal });
     if (!response.ok) throw new Error(`LLAMA_CPP_MODELS_${response.status}`);
-    // OpenAI shape is data[0].id; llama-server also serves models[0].name.
     const raw = await response.json() as { data?: Array<{ id?: string }>; models?: Array<{ name?: string }> };
     const id = raw.data?.[0]?.id ?? raw.models?.[0]?.name;
     if (!id) throw new Error("LLAMA_CPP_NO_MODEL_LOADED");
@@ -219,34 +221,31 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
-    const modelId = await this.resolvedModelId(signal);
-    const prompt = highlightPrompt(transcript);
-    // Local CPU inference can take minutes per window; give it room without letting a
-    // hung server block forever.
-    const timeout = AbortSignal.timeout(15 * 60_000);
-    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-    // Constrained decoding: llama-server enforces the JSON schema, so the reply parses.
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object", schema: HIGHLIGHT_OUTPUT_SCHEMA }, messages: [{ role: "user", content: prompt }] }), signal: combined });
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(`LLAMA_CPP_PROVIDER_${response.status}:${body.slice(0, 200)}`);
-    }
-    const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    const text = raw.choices?.[0]?.message?.content ?? "";
-    // Schema-constrained replies parse directly; the repair path stays as a safety net
-    // for older llama-server builds without response_format support.
-    let parsed: Array<Record<string, unknown>>;
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
-    const start = fenced.search(/[[{]/);
-    if (start === -1) throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`);
-    let candidate = fenced.slice(start);
-    try { parsed = extractHighlightProposals(JSON.parse(candidate)); }
-    catch {
-      const repaired = repairTruncatedJsonArray(candidate.trimEnd());
-      try { parsed = extractHighlightProposals(JSON.parse(repaired)); }
-      catch { throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`); }
-    }
-    return mapWordRangeProposals(transcript, parsed);
+    return this.circuitBreaker.execute(async () => {
+      const modelId = await this.resolvedModelId(signal);
+      const prompt = highlightPrompt(transcript);
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object", schema: HIGHLIGHT_OUTPUT_SCHEMA }, messages: [{ role: "user", content: prompt }] }), signal: combined });
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new Error(`LLAMA_CPP_PROVIDER_${response.status}:${body.slice(0, 200)}`);
+      }
+      const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const text = raw.choices?.[0]?.message?.content ?? "";
+      let parsed: Array<Record<string, unknown>>;
+      const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
+      const start = fenced.search(/[[{]/);
+      if (start === -1) throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`);
+      let candidate = fenced.slice(start);
+      try { parsed = extractHighlightProposals(JSON.parse(candidate)); }
+      catch {
+        const repaired = repairTruncatedJsonArray(candidate.trimEnd());
+        try { parsed = extractHighlightProposals(JSON.parse(repaired)); }
+        catch { throw new Error(`LLAMA_CPP_BAD_JSON:${text.slice(0, 120)}`); }
+      }
+      return mapWordRangeProposals(transcript, parsed);
+    });
   }
 }
 
@@ -276,4 +275,48 @@ export function repairTruncatedJsonArray(input: string): string {
   out = out.replace(/([,{])\s*"[^"]*"\s*:?\s*$/, "$1").replace(/[:,\s]+$/, "");
   if (out === "[" || out === "") return "[]";
   return out + stack.reverse().join("");
+}
+
+/** Circuit breaker for LLM calls — prevents cascading failures.
+ *  State: CLOSED (normal) → OPEN (failure threshold) → HALF_OPEN (test recovery) → CLOSED */
+export class CircuitBreaker {
+  private state: "CLOSED" | "OPEN" | "HALF_OPEN" = "CLOSED";
+  private failures = 0;
+  private lastFailure = 0;
+  private readonly threshold: number;
+  private readonly timeoutMs: number;
+  private readonly halfOpenRequests: number;
+  constructor(threshold = 5, timeoutMs = 30_000, halfOpenRequests = 1) {
+    this.threshold = threshold;
+    this.timeoutMs = timeoutMs;
+    this.halfOpenRequests = halfOpenRequests;
+  }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "OPEN") {
+      if (Date.now() - this.lastFailure > this.timeoutMs) {
+        this.state = "HALF_OPEN";
+      } else {
+        throw new Error("CIRCUIT_BREAKER_OPEN");
+      }
+    }
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+  private onSuccess(): void {
+    this.failures = 0;
+    if (this.state === "HALF_OPEN") this.state = "CLOSED";
+  }
+  private onFailure(): void {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.threshold) this.state = "OPEN";
+  }
+  getState(): string { return this.state; }
+  reset(): void { this.state = "CLOSED"; this.failures = 0; }
 }

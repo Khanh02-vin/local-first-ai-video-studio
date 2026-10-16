@@ -4,6 +4,7 @@ import { generateSemanticHighlights, SemanticProviderAdapter, type SemanticHighl
 import { GeminiHighlightProvider, LlamaCppHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { transcriptFromCaptions, type CaptionPayload } from "../services/ai-pipeline/youtube-transcript.ts";
+import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
@@ -84,7 +85,9 @@ try {
   // Free tier: only the top 3 highlights.
   if (process.env.LICENSE_TIER !== "pro") highlights = highlights.slice(0, 3);
   store.update(jobId, { phase: "rank", progress: 0.9 });
-  const result = { transcript, highlights, videoId: payload.videoId };
+  // Collections group the final highlight set the UI receives. The video id is a
+  // stable project identity for the YouTube path.
+  const result = { transcript, highlights, videoId: payload.videoId, collections: await groupHighlightsIntoCollections(highlights, { projectId: payload.videoId, sourceArtifactId: transcript.sourceArtifactId }) };
   const resultPath = await persistResult(result);
   store.update(jobId, { status: "completed", phase: "completed", progress: 1, resultPath, error: null });
   store.close();

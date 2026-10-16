@@ -6,7 +6,10 @@ fn main() {
     // real content is produced by beforeBuildCommand / the fetch step before
     // anything is actually bundled.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for dir in [manifest.join("../../web/build-node"), manifest.join("resources/node")] {
+    for dir in [
+        manifest.join("../../web/build-node"),
+        manifest.join("resources/node"),
+    ] {
         if !dir.exists() {
             let _ = std::fs::create_dir_all(dir);
         }

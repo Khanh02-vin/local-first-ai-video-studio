@@ -1,6 +1,7 @@
 import type { RequestHandler } from "@sveltejs/kit";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
+import { rankCandidates } from "../../../../../../packages/media-engine/related-videos/index.ts";
 
 /**
  * Local YouTube knowledge base, served entirely from the client's machine.
@@ -46,6 +47,7 @@ type VideoDoc = {
   durationSeconds: number;
   segments: Segment[];
   indexedAt: string;
+  idempotencyKey?: string;
 };
 type PlaylistDoc = {
   id: string;
@@ -94,7 +96,10 @@ function loadIndex(): Record<string, Record<string, number>> {
   return JSON.parse(readFileSync(file, "utf8")) as Record<string, Record<string, number>>;
 }
 
-function rebuildIndex(): void {
+// ponytail: full scan on every ingest — O(n) blocking sync I/O. Async version avoids blocking
+// the SvelteKit request thread, but still rebuilds everything. Consider incremental index update
+// (append-only segment merge) when ingest frequency grows.
+async function rebuildIndex(): Promise<void> {
   const index: Record<string, Record<string, number>> = {};
   const dir = dataDir() + "/videos";
   for (const name of readdirSync(dir)) {
@@ -268,7 +273,7 @@ export const POST: RequestHandler = async ({ request }) => {
   if (pathname === "/api/rag/ingest") {
     let body: unknown;
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
-    const { videoUrl, title, segments } = body as { videoUrl?: string; title?: string; segments?: Segment[] };
+    const { videoUrl, title, segments, idempotencyKey } = body as { videoUrl?: string; title?: string; segments?: Segment[]; idempotencyKey?: string };
     if (typeof videoUrl !== "string") return jsonError(400, "VIDEO_URL_REQUIRED");
     const videoId = parseVideoIdFromUrl(videoUrl);
     if (!videoId || !isValidVideoId(videoId)) return jsonError(400, "UNPARSEABLE_VIDEO_ID");
@@ -276,6 +281,13 @@ export const POST: RequestHandler = async ({ request }) => {
     for (const segment of segments) {
       if (typeof segment?.start !== "number" || typeof segment?.end !== "number" || typeof segment?.text !== "string" || segment.end <= segment.start) {
         return jsonError(400, "INVALID_SEGMENT");
+      }
+    }
+    // Idempotency: check if video with same idempotencyKey already exists
+    if (idempotencyKey) {
+      const existing = loadVideo(videoId);
+      if (existing?.idempotencyKey === idempotencyKey) {
+        return Response.json({ videoId, segments: existing.segments.length, embedded: 0, idempotent: true });
       }
     }
     const now = new Date().toISOString();
@@ -287,11 +299,26 @@ export const POST: RequestHandler = async ({ request }) => {
       durationSeconds: Math.max(...segments.map((s) => s.end)),
       segments,
       indexedAt: now,
+      idempotencyKey,
     });
-    rebuildIndex();
+    // ponytail: index rebuild is async, run without blocking ingest response.
+    void rebuildIndex();
     // Best-effort vector indexing: 0 when the local LLM is down (TF-IDF still works).
     const embedded = await embedVideoSegments(videoId, segments);
-    return Response.json({ videoId, segments: segments.length, embedded });
+    return Response.json({ videoId, segments: segments.length, embedded, idempotent: false });
+  }
+
+  if (pathname === "/api/rag/related-rank") {
+    let body: unknown;
+    try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
+    const { source, candidates } = body as { source?: string; candidates?: Array<{ videoId?: string; title?: string; thumbnail?: string; url?: string }> };
+    if (typeof source !== "string" || !source.trim() || source.length > 20_000) return jsonError(400, "INVALID_SOURCE_TEXT");
+    if (!Array.isArray(candidates) || candidates.length > 8 || candidates.some((video) => typeof video?.title !== "string" || typeof video?.videoId !== "string")) return jsonError(400, "INVALID_CANDIDATES");
+    const response = await embedTexts([source.slice(0, 4000), ...candidates.map((video) => video.title!.slice(0, 500))]);
+    if (!response || response.vectors.length !== candidates.length + 1) return Response.json({ videos: candidates, ranked: false });
+    const [sourceVector, ...titleVectors] = response.vectors;
+    const ranked = rankCandidates(sourceVector, titleVectors, candidates.map((video) => ({ videoId: video.videoId!, title: video.title!, thumbnail: video.thumbnail ?? "", url: video.url ?? "" })));
+    return Response.json({ videos: ranked, ranked: true });
   }
 
   if (pathname === "/api/rag/query") {

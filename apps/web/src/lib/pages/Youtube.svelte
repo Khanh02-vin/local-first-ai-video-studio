@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { isTauri, invoke } from "@tauri-apps/api/core";
+  import Icon from "../icons.svelte";
   type Playlist = { id: string; playlistId: string; playlistUrl: string; title: string | null; status: string; createdAt: string; updatedAt: string };
   type Result = { score: number; video_id: string; video_url: string; text: string; start_seconds: number; end_seconds: number; timestampUrl: string; playlist_id?: string; topic?: string };
   let playlistUrl = $state("");
@@ -17,6 +19,46 @@
   let loading = $state(false);
   let adding = $state(false);
   let showIngest = $state(false);
+  let ingestDialog = $state<HTMLDivElement>();
+  let ingestTrigger = $state<HTMLButtonElement>();
+  async function openIngest() {
+    showIngest = true;
+    await tick();
+    ingestDialog?.querySelector<HTMLElement>("input, textarea, button")?.focus();
+  }
+  function closeIngest() {
+    showIngest = false;
+    void tick().then(() => ingestTrigger?.focus());
+  }
+  function trapIngestFocus(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeIngest();
+      return;
+    }
+    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      closeIngest();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = ingestDialog;
+    if (!dialog) return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')];
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
   let showFilters = $state(false);
   let ingestUrl = $state("");
   let ingestTitle = $state("");
@@ -130,7 +172,7 @@
   async function ingest() {
     if (!ingestUrl.trim() || !ingestText.trim()) return;
     statusKind = "ingest";
-    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await rag("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; showIngest = false; } catch (error) { status = String(error); }
+    try { const segments = ingestText.split(/\n+/).map((line) => { const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*\|\s*(.+)$/); return match ? { start: Number(match[1]), end: Number(match[2]), text: match[3] } : null; }).filter((item): item is { start: number; end: number; text: string } => item !== null); if (!segments.length) throw new Error("Use one segment per line: 12-18 | spoken text"); const response = await rag("/api/rag/ingest", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ videoUrl: ingestUrl, title: ingestTitle || undefined, segments }) }); if (!response.ok) throw new Error((await response.json()).message ?? "Ingest failed"); status = `Indexed ${segments.length} transcript segments.`; closeIngest(); } catch (error) { status = String(error); }
   }
   initRag().then(loadPlaylists);
   refreshYtConnection();
@@ -149,7 +191,7 @@
           {#if !ytVideos.length}<p class="note">Kênh chưa có video nào.</p>{/if}
           {#each ytVideos as v}
             <div class="doc-item">
-              <div class="spread"><strong>{v.title}</strong><button class="btn btn-sm btn-quiet" disabled={ytIngestId === v.videoId} onclick={() => ingestOwn(v)}>{ytIngestId === v.videoId ? "Đang lấy…" : "📄 Lấy transcript"}</button></div>
+              <div class="spread"><strong>{v.title}</strong><button class="btn btn-sm btn-quiet" disabled={ytIngestId === v.videoId} onclick={() => ingestOwn(v)}>{#if ytIngestId === v.videoId}Đang lấy…{:else}<Icon name="caption" size={14} /> Lấy transcript{/if}</button></div>
               <span class="note">{v.publishedAt.slice(0, 10)}</span>
             </div>
           {/each}
@@ -159,7 +201,7 @@
       {#if ytStatus}<div class="status-inline" aria-live="polite">{ytStatus}</div>{/if}
     </div>
     <div class="panel"><div class="panel-title"><span class="eyebrow">Add playlist</span></div><label class="field"><span class="field-label">Playlist URL</span><input aria-label="YouTube playlist URL" placeholder="https://youtube.com/playlist?..." bind:value={playlistUrl} /></label><button class="btn btn-primary btn-wide" disabled={adding || !playlistUrl.trim()} onclick={addPlaylist}>{adding ? "Queueing…" : "Queue crawl"}</button>{#if statusKind === "crawl"}<div class="status-inline" aria-live="polite">{status}</div>{/if}</div>
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<div class="doc-item playlist-item" class:on={playlist.id === playlistId}><button class="playlist-select" onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button><button class="playlist-delete" class:confirm={confirmDeleteId === playlist.id} aria-label={confirmDeleteId === playlist.id ? `Confirm delete ${playlist.title || playlist.playlistId}` : `Delete ${playlist.title || playlist.playlistId}`} onclick={(event) => { event.stopPropagation(); deletePlaylist(playlist.id); }}>{confirmDeleteId === playlist.id ? "Xóa?" : "✕"}</button></div>{/each}{/if}</div></div>
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<div class="doc-item playlist-item" class:on={playlist.id === playlistId}><button class="playlist-select" onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button><button class="playlist-delete" class:confirm={confirmDeleteId === playlist.id} aria-label={confirmDeleteId === playlist.id ? `Confirm delete ${playlist.title || playlist.playlistId}` : `Delete ${playlist.title || playlist.playlistId}`} onclick={(event) => { event.stopPropagation(); deletePlaylist(playlist.id); }}>{#if confirmDeleteId === playlist.id}Xóa?{:else}<Icon name="x" size={14} />{/if}</button></div>{/each}{/if}</div></div>
   </aside>
 
   <!-- Cột 2: search + filters gọn + kết quả -->
@@ -173,10 +215,10 @@
 
       <!-- filters: toggle + chips thay vì panel phơi ra -->
       <div class="filters-row">
-        <button class="btn btn-sm btn-quiet" onclick={() => showFilters = !showFilters}>⚙ Filters{#if filterCount}&nbsp;·&nbsp;{filterCount} active{/if}</button>
-        {#if videoId.trim()}<span class="chip">Video: {videoId.trim()}<button aria-label="Clear video filter" onclick={() => videoId = ""}>✕</button></span>{/if}
-        {#if playlistId.trim()}<span class="chip">Playlist: {playlistId.trim()}<button aria-label="Clear playlist filter" onclick={() => playlistId = ""}>✕</button></span>{/if}
-        {#if topic.trim()}<span class="chip">Topic: {topic.trim()}<button aria-label="Clear topic filter" onclick={() => topic = ""}>✕</button></span>{/if}
+        <button class="btn btn-sm btn-quiet" onclick={() => showFilters = !showFilters}><Icon name="settings" size={14} /> Filters{#if filterCount}&nbsp;·&nbsp;{filterCount} active{/if}</button>
+        {#if videoId.trim()}<span class="chip">Video: {videoId.trim()}<button aria-label="Clear video filter" onclick={() => videoId = ""}><Icon name="x" size={12} /></button></span>{/if}
+        {#if playlistId.trim()}<span class="chip">Playlist: {playlistId.trim()}<button aria-label="Clear playlist filter" onclick={() => playlistId = ""}><Icon name="x" size={12} /></button></span>{/if}
+        {#if topic.trim()}<span class="chip">Topic: {topic.trim()}<button aria-label="Clear topic filter" onclick={() => topic = ""}><Icon name="x" size={12} /></button></span>{/if}
       </div>
       {#if showFilters}
         <div class="drawer">
@@ -197,16 +239,16 @@
       </div>
     </div>
     <div class="stage-foot">
-      <button class="stage-foot-link" onclick={() => showIngest = true}>+ Paste a transcript manually</button>
+      <button class="stage-foot-link" bind:this={ingestTrigger} onclick={openIngest}>+ Paste a transcript manually</button>
       <span title="This workspace indexes public YouTube knowledge only — no channel, analytics, uploads, or private videos.">ⓘ</span>
     </div>
   </div></section>
 
   <!-- manual ingest: modal render có điều kiện (tránh hydration claim lệch với modal luôn-tồn-tại ở root) -->
   {#if showIngest}
-    <div class="modal-back open" role="dialog" aria-modal="true" onclick={(event) => { if (event.target === event.currentTarget) showIngest = false; }}>
-      <div class="modal">
-        <div class="panel-head"><strong>Paste a transcript manually</strong><button class="btn btn-sm btn-quiet" aria-label="Close manual transcript" onclick={() => showIngest = false}>✕</button></div>
+      <div class="modal-back open" role="presentation" onpointerdown={(event) => { if (event.target === event.currentTarget) closeIngest(); }}>
+        <div class="modal" bind:this={ingestDialog} role="dialog" aria-modal="true" aria-labelledby="manual-ingest-title" tabindex="-1" onkeydown={trapIngestFocus}>
+        <div class="panel-head"><strong id="manual-ingest-title">Paste a transcript manually</strong><button class="btn btn-sm btn-quiet" aria-label="Close manual transcript" onclick={closeIngest}><Icon name="x" size={14} /></button></div>
         <p class="note" style="margin:0;">Bring your own ordered segments when a source is not in a crawlable playlist.</p>
         <label class="field"><span class="field-label">Video URL</span><input placeholder="https://youtube.com/watch?v=…" bind:value={ingestUrl} /></label>
         <label class="field"><span class="field-label">Title</span><input placeholder="Video title" bind:value={ingestTitle} /></label>

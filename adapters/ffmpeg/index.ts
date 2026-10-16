@@ -37,7 +37,8 @@ export async function render(options: RenderOptions): Promise<void> {
   await mkdir(dirname(options.output), { recursive: true });
   const ratio = options.aspectRatio ?? "9:16";
   const crop = ratio === "9:16" ? "crop=ih*9/16:ih:(iw-ih*9/16)/2:0" : ratio === "1:1" ? "crop=ih:ih:(iw-ih)/2:0" : "crop=iw:iw*9/16:0:(ih-iw*9/16)/2";
-  const args = ["-y", "-nostdin", "-progress", "pipe:1", "-nostats", "-ss", options.start.toFixed(3), "-t", options.duration.toFixed(3), "-i", options.input, "-vf", `${crop},scale=1080:1920`, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", options.output];
+  const dimensions = ratio === "9:16" ? "1080:1920" : ratio === "1:1" ? "1080:1080" : "1920:1080";
+  const args = ["-y", "-nostdin", "-progress", "pipe:1", "-nostats", "-ss", options.start.toFixed(3), "-t", options.duration.toFixed(3), "-i", options.input, "-vf", `${crop},scale=${dimensions}`, "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", options.output];
   await run(options.ffmpegPath, args, options.timeoutMs ?? 10 * 60_000, "RENDER", options.signal, (line) => {
     const match = /^out_time_ms=(\d+)$/.exec(line);
     if (match) options.onProgress?.(Math.max(0, Math.min(1, Number(match[1]) / 1_000_000 / options.duration)));

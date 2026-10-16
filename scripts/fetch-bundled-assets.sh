@@ -5,27 +5,21 @@
 #   - resources/node/      (Node dist — dir must exist)
 #   - resources/ffmpeg     resources/ffprobe  (static builds or host copies)
 #   - resources/models/*.pt                (Whisper weights)
-#   - resources/models/llama/*.gguf        (Qwen2.5 LLM)
-#   - resources/llama/      (llama.cpp — committed; re-fetched if missing)
 #
-# Modes:
-#   LIGHTWEIGHT=1  only create the PATHS that tauri-build validates (empty
-#                  placeholders). Enough for `cargo test`, which never executes
-#                  the binaries — keeps CI test jobs fast.
-#   (default)      download real binaries for the host platform; prefers copying
-#                  an ffmpeg already installed on the host.
+# Default builds never fetch llama.cpp or GGUF. The app installs both only after
+# the user explicitly opts in from Settings.
+# LIGHTWEIGHT=1 only creates the paths tauri-build validates (empty placeholders).
+# Default mode downloads core binaries and Whisper weights for the host platform.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RES="$ROOT/apps/desktop/src-tauri/resources"
-LLAMA_VERSION="${LLAMA_VERSION:-b11160}"
 NODE_VERSION="${NODE_VERSION:-v24.21.0}"
-MODEL_NAME="${LLM_MODEL_NAME:-qwen2.5-3b-instruct-q4_k_m}"
 WHISPER_MODELS="${WHISPER_MODELS:-tiny base}"
 ARCH="$(uname -m)"
 OS="$(uname -s)"
 
-mkdir -p "$RES/models/llama" "$RES/llama"
+mkdir -p "$RES/models"
 
 # --- extract_zip: try unzip, then python3, then python, then tar --------------
 extract_zip() {
@@ -175,67 +169,7 @@ for model in $WHISPER_MODELS; do
   curl -L --fail --retry 3 -o "$final" "$url"
 done
 
-# --- llama.cpp binaries (Linux binaries committed to git; fetched elsewhere) ---
-# Skip only on Linux, where the committed llama-server IS the right binary. On
-# macOS the -x test on that committed Linux ELF would wrongly skip and ship a
-# non-runnable binary; on Windows the exec bit is not preserved (core.filemode)
-# so the old check only passed by accident. Non-Linux therefore always fetches
-# (hosted runners are fresh checkouts anyway).
-if [[ "$OS" == "Linux" && -x "$RES/llama/llama-server" ]]; then
-  echo "==> llama.cpp binaries already present"
-else
-  case "$OS" in
-    Linux)  case "$ARCH" in
-              x86_64) asset="llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz" ;;
-              aarch64) asset="llama-${LLAMA_VERSION}-bin-ubuntu-arm64.tar.gz" ;;
-              *) echo "unsupported linux arch $ARCH" >&2; exit 1 ;;
-            esac ;;
-    Darwin) case "$ARCH" in
-              arm64) asset="llama-${LLAMA_VERSION}-bin-macos-arm64.tar.gz" ;;
-              *) asset="llama-${LLAMA_VERSION}-bin-macos-x64.tar.gz" ;;
-            esac ;;
-    MINGW*|MSYS*|CYGWIN*) asset="llama-${LLAMA_VERSION}-bin-win-cpu-x64.zip" ;;
-    *) echo "unsupported OS $OS" >&2; exit 1 ;;
-  esac
-  echo "==> llama.cpp: fetching $asset"
-  tmp="$(mktemp -d)"
-  curl -L --fail --retry 3 -o "$tmp/llama.pkg" "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${asset}"
-  if [[ "$asset" == *.zip ]]; then
-    mkdir -p "$tmp/x"
-    extract_zip "$tmp/llama.pkg" "$tmp/x"
-  else
-    mkdir -p "$tmp/x"
-    tar xzf "$tmp/llama.pkg" -C "$tmp/x" --strip-components=1
-  fi
-  find "$tmp/x" -maxdepth 3 -type f \( -name 'llama-server*' -o -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/llama/" \;
-  chmod +x "$RES/llama/llama-server" 2>/dev/null || true
-  rm -rf "$tmp"
-fi
-
-# --- local-LLM GGUF -----------------------------------------------------------
-# Model name và repo được lấy từ MODEL_NAME env.
-# CI builds dùng Qwen 0.5B để tránh vượt quá giới hạn kích thước bundle
-# (Windows MSI/light.exe và Linux linuxdeploy đều fail với model ~2GB).
-dest="$RES/models/llama/${MODEL_NAME}.gguf"
-if [[ -f "$dest" ]]; then
-  echo "==> Local LLM model already present"
-else
-  # Derive repo name from MODEL_NAME: qwen2.5-3b → Qwen2.5-3B-Instruct-GGUF
-  case "$MODEL_NAME" in
-    qwen2.5-0.5b*) model_repo="Qwen2.5-0.5B-Instruct-GGUF" ;;
-    qwen2.5-1.5b*) model_repo="Qwen2.5-1.5B-Instruct-GGUF" ;;
-    qwen2.5-3b*)   model_repo="Qwen2.5-3B-Instruct-GGUF" ;;
-    qwen2.5-7b*)   model_repo="Qwen2.5-7B-Instruct-GGUF" ;;
-    *) echo "unknown model pattern: $MODEL_NAME" >&2; exit 1 ;;
-  esac
-  echo "==> Local LLM model: $MODEL_NAME (from $model_repo)"
-  curl -L --fail --retry 3 -o "$dest" "https://huggingface.co/Qwen/${model_repo}/resolve/main/${MODEL_NAME}.gguf"
-fi
-if [[ "$MODEL_NAME" == "qwen2.5-3b-instruct-q4_k_m" ]]; then
-  EXPECTED="626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d"
-  ACTUAL="$(sha256sum "$dest" | awk '{print $1}')"
-  [[ "$ACTUAL" == "$EXPECTED" ]] || { echo "checksum mismatch: $ACTUAL" >&2; exit 1; }
-fi
+# --- no local-LLM assets are staged in default builds -------------------------
 
 echo "==> Assets ready:"
-du -sh "$RES/node" "$RES/ffmpeg" "$RES/llama" "$RES/models" 2>/dev/null || true
+du -sh "$RES/node" "$RES/ffmpeg" "$RES/models" 2>/dev/null || true

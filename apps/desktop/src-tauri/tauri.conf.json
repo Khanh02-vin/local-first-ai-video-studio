@@ -39,6 +39,7 @@
     ],
     "resources": {
       "../../../scripts": "scripts",
+      "../../../scripts/detect-face-boxes.py": "scripts/detect-face-boxes.py",
       "../../../adapters": "adapters",
       "../../../packages": "packages",
       "../../../services": "services",
@@ -46,9 +47,7 @@
       "./resources/node": "node",
       "./resources/ffmpeg*": "",
       "./resources/ffprobe*": "",
-      "./resources/llama": "llama",
-      "./resources/models": "models",
-      "./resources/models/llama": "models/llama"
+      "./resources/models/*.pt": "models/"
     },
     "createUpdaterArtifacts": false
   }

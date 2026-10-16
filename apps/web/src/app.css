@@ -261,6 +261,8 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   display: grid; place-items: center; color: var(--volt);
   border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2);
 }
+.browse { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
+.browse svg { flex: 0 0 auto; }
 .drop h2 { margin-bottom: 0.25rem; }
 .drop p { margin: 0.2rem 0; color: var(--muted); font-size: 0.85rem; }
 
@@ -348,6 +350,8 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .transport-track { flex: 1; height: 4px; border-radius: 4px; background: var(--bg); overflow: hidden; border: 1px solid var(--line-soft); }
 .transport-track span { display: block; height: 100%; background: var(--volt); }
 .timeline { display: flex; flex-direction: column; gap: 0.4rem; }
+.timeline-help { margin: 0; font-size: 0.72rem; line-height: 1.4; color: var(--muted); }
+.save-toast { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 30; display: flex; align-items: center; gap: 0.45rem; padding: 0.65rem 0.85rem; color: var(--ok); background: var(--surface-2); border: 1px solid rgba(125,220,154,.35); border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0,0,0,.35); }
 .timeline-label { font: 500 9px/1 var(--mono); letter-spacing: 0.12em; color: var(--faint); }
 .tl-ruler { position: relative; height: 18px; cursor: crosshair; }
 .tl-tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line-soft); }
@@ -446,7 +450,9 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   background: var(--warn); color: #201a08;
   font: 600 12px/1.4 var(--font);
   padding: .4rem .9rem; text-align: center;
+  display: flex; align-items: center; justify-content: center; gap: .45rem;
 }
+.preview-banner svg { flex: 0 0 auto; }
 .app.with-banner { padding-top: 1.9rem; }
 
 /* bench-duo (2-column pages): at narrow widths collapse to one column with
