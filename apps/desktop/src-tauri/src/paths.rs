@@ -466,7 +466,10 @@ pub(crate) fn ffprobe_bin(app: &tauri::AppHandle) -> PathBuf {
 /// bare name resolvable via PATH. Guards stale runtime.env entries like `whisper` when
 /// whisper is not installed system-wide.
 pub(crate) fn whisper_usable(cmd: &str) -> bool {
-    if cmd.contains('/') {
+    // Native separators: Windows writes absolute paths with backslashes, so both
+    // separators mark "this is a path" — otherwise a valid C:\…\whisper.exe would
+    // be misrouted to a PATH lookup and the bootstrap would reinstall over it.
+    if cmd.contains('/') || cmd.contains('\\') {
         Path::new(cmd).is_file()
     } else {
         command_ready(cmd)
@@ -626,7 +629,9 @@ pub(crate) fn probe_duration(app: &tauri::AppHandle, input: &Path) -> Result<f64
 }
 
 pub(crate) fn command_ready(command: &str) -> bool {
-    if command.contains('/') {
+    // Same native-separator rule as whisper_usable: a Windows absolute path uses
+    // backslashes and must be probed as a file, not via `which`.
+    if command.contains('/') || command.contains('\\') {
         return Path::new(command).is_file();
     }
     tool("which")

@@ -1106,6 +1106,27 @@ use std::sync::{Arc, Mutex};
         assert!(text.contains("HF_TOKEN=hf-preserved-token"), "{text}");
     }
 
+    /// A native-separator absolute path must be probed as a file, not via PATH:
+    /// Windows writes runtime.env paths with backslashes, and the misroute made the
+    /// bootstrap ignore an existing whisper and start pip (the first Windows CI run
+    /// caught exactly that).
+    #[test]
+    fn whisper_usable_accepts_native_separators() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new("usable-native");
+        let fake = guard.dir.join("whisper-bin");
+        std::fs::write(&fake, b"stub").unwrap();
+        let native = fake.to_string_lossy().into_owned();
+        assert!(
+            whisper_usable(&native),
+            "a native-separator path to an existing file must be usable: {native}"
+        );
+        assert!(
+            !whisper_usable("definitely-not-a-real-whisper-binary"),
+            "a bare name that is on no PATH must not be usable"
+        );
+    }
+
     #[test]
     fn bootstrap_fast_path_adopts_existing_whisper_without_installing() {
         let _lock = ENV_LOCK.lock().unwrap();
