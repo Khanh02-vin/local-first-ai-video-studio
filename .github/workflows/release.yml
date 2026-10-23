@@ -262,8 +262,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
-          name: Local-first AI Video Studio v0.1.0
+          tag_name: v0.1.1
+          name: Local-first AI Video Studio v0.1.1
           body: |
             Desktop builds (local-first, offline).
 
