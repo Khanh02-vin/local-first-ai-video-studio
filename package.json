@@ -11,6 +11,7 @@
     "test:local": "node --experimental-strip-types tests/local/local-runtime.test.ts",
     "test:render-engine": "node --experimental-strip-types tests/local/render-engine.test.ts",
     "bench:ffmpeg": "node --experimental-strip-types tests/local/ffmpeg-benchmark.ts",
+    "bench:concat-ab": "node --experimental-strip-types tests/local/concat-ab.ts",
     "test:pipeline": "node --experimental-strip-types tests/pipeline-e2e/mvp-pipeline.test.ts",
     "test:local-mvp": "node --experimental-strip-types tests/pipeline-e2e/local-mvp.test.ts",
     "test:security": "node --experimental-strip-types tests/security/platform-boundaries.test.ts && node --experimental-strip-types tests/security/playlist-url.test.ts",
