@@ -47,7 +47,12 @@ if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
   mkdir -p "$RES/node"
   [[ -e "$RES/ffmpeg" ]]    || : > "$RES/ffmpeg"
   [[ -e "$RES/ffprobe" ]]   || : > "$RES/ffprobe"
-  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe)"
+  # tauri-build validates the ./resources/models/*.pt glob: an empty models dir
+  # fails it, so the glob needs at least one file (a placeholder is fine — the
+  # real weights are only needed when Whisper actually runs).
+  mkdir -p "$RES/models"
+  [[ -e "$RES/models/tiny.pt" ]] || : > "$RES/models/tiny.pt"
+  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models)"
   exit 0
 fi
 
