@@ -704,10 +704,118 @@ pub fn render_segments(
     }
     let parent = output_path.parent().ok_or("OUTPUT_PARENT_MISSING")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("OUTPUT_DIR:{e}"))?;
+    let expected_dimensions = match ratio.as_str() {
+        "1:1" => (1080, 1080),
+        "16:9" => (1920, 1080),
+        _ => (1080, 1920),
+    };
+    let partial = join_segments(
+        ffmpeg,
+        ffprobe,
+        &segments,
+        has_audio,
+        total_duration,
+        expected_dimensions,
+        &temp,
+        on_progress,
+    )?;
+    std::fs::copy(&partial, &output_path).map_err(|e| format!("OUTPUT_COPY:{e}"))?;
+    on_progress.report(RenderProgress { percent: 100.0, phase: "completed".into() });
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+/// Joins the encoded segments and returns the joined file inside the temp dir.
+///
+/// Fast path: concat demuxer with `-c copy` — every segment comes from this same
+/// encode run (same `-r`/`-crf`/`pix_fmt`/audio settings), so a stream copy joins
+/// them without the second full encode the filter path performs. On the ADR-007
+/// benchmark that is ~180x faster on the join step and one less crf22 generation
+/// on the output.
+///
+/// The copy result is validated (duration + stream shape) and *any* mismatch — or
+/// any copy failure at all — falls back to the filter re-encode, so the rendered
+/// output never regresses below what the filter path produced.
+#[allow(clippy::too_many_arguments)]
+pub fn join_segments(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    segments: &[PathBuf],
+    has_audio: bool,
+    total_duration: f64,
+    expected_dimensions: (u32, u32),
+    temp: &TemporaryRenderDir,
+    on_progress: &dyn ProgressSink,
+) -> Result<PathBuf, String> {
+    let copy = temp.0.join("joined-copy.mp4");
+    let copied = join_segments_copy(ffmpeg, segments, has_audio, &copy, on_progress)
+        .and_then(|_| {
+            validate_joined_output(
+                ffprobe,
+                &copy,
+                has_audio,
+                expected_dimensions,
+                total_duration,
+                segments.len(),
+            )
+        });
+    match copied {
+        Ok(()) => Ok(copy),
+        Err(copy_error) => {
+            // The filter path re-encodes, so it tolerates whatever the stream copy
+            // could not preserve. If it fails too, report both causes.
+            let _ = std::fs::remove_file(&copy);
+            join_segments_filter(ffmpeg, segments, has_audio, total_duration, temp, on_progress)
+                .map_err(|filter_error| {
+                    format!("JOIN_COPY:{copy_error}; JOIN_FILTER:{filter_error}")
+                })
+        }
+    }
+}
+
+/// Stream-copy join via the concat demuxer.
+fn join_segments_copy(
+    ffmpeg: &Path,
+    segments: &[PathBuf],
+    has_audio: bool,
+    output: &Path,
+    on_progress: &dyn ProgressSink,
+) -> Result<(), String> {
+    let list = output.with_file_name("joined-copy-list.txt");
+    let mut listing = String::new();
+    for segment in segments {
+        let quoted = segment.to_string_lossy().replace('\'', "'\\''");
+        listing.push_str(&format!("file '{quoted}'\n"));
+    }
+    std::fs::write(&list, listing).map_err(|e| format!("JOIN_LIST:{e}"))?;
+    let mut cmd = tool(ffmpeg);
+    cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"])
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-c", "copy", "-movflags", "+faststart"]);
+    if !has_audio {
+        // Segments always carry an audio track (a generated silent one when the
+        // source has none); the filter join drops it, so the copy must too or the
+        // output gains a stream the old path never had.
+        cmd.arg("-an");
+    }
+    let result = run_render_child(cmd.arg(output), on_progress, (90.0, 98.0), 0.0, "joining");
+    let _ = std::fs::remove_file(&list);
+    result
+}
+
+/// The previous join: concat filter with a full re-encode. Kept as the fallback.
+fn join_segments_filter(
+    ffmpeg: &Path,
+    segments: &[PathBuf],
+    has_audio: bool,
+    total_duration: f64,
+    temp: &TemporaryRenderDir,
+    on_progress: &dyn ProgressSink,
+) -> Result<PathBuf, String> {
     let partial = temp.0.join("joined.mp4");
     let mut cmd = tool(ffmpeg);
     cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"]);
-    for segment in &segments {
+    for segment in segments {
         cmd.arg("-i").arg(segment);
     }
     let count = segments.len();
@@ -745,9 +853,88 @@ pub fn render_segments(
         cmd.args(["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]);
     }
     run_render_child(cmd.arg(&partial), on_progress, (90.0, 98.0), total_duration, "joining")?;
-    std::fs::copy(&partial, &output_path).map_err(|e| format!("OUTPUT_COPY:{e}"))?;
-    on_progress.report(RenderProgress { percent: 100.0, phase: "completed".into() });
-    Ok(output_path.to_string_lossy().into_owned())
+    Ok(partial)
+}
+
+/// Checks the stream-copied join before it is trusted: it must have the same shape
+/// the filter path would produce (video at the expected dimensions, audio present
+/// iff the source has audio) and cover the requested duration. Anything else sends
+/// the render back to the filter re-encode.
+pub fn validate_joined_output(
+    ffprobe: &Path,
+    joined: &Path,
+    has_audio: bool,
+    expected_dimensions: (u32, u32),
+    total_duration: f64,
+    segment_count: usize,
+) -> Result<(), String> {
+    let output = tool(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,width,height,duration:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(joined)
+        .output()
+        .map_err(|e| format!("JOIN_PROBE_SPAWN:{e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "JOIN_PROBE:{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let probe: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("JOIN_PROBE_JSON:{e}"))?;
+    let streams = probe["streams"]
+        .as_array()
+        .ok_or("JOIN_PROBE_NO_STREAMS")?;
+    // Segment durations round to the frame grid independently, so the join may
+    // drift by up to half a frame per boundary; beyond that is real breakage.
+    let tolerance = 0.25 + 0.05 * segment_count as f64;
+    let video = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .ok_or("JOIN_COPY_NO_VIDEO")?;
+    let width = video["width"].as_u64().ok_or("JOIN_COPY_NO_WIDTH")?;
+    let height = video["height"].as_u64().ok_or("JOIN_COPY_NO_HEIGHT")?;
+    if (width, height) != (u64::from(expected_dimensions.0), u64::from(expected_dimensions.1)) {
+        return Err(format!("JOIN_COPY_SHAPE:{width}x{height}"));
+    }
+    let video_duration = video["duration"]
+        .as_str()
+        .and_then(|d| d.parse::<f64>().ok())
+        .or_else(|| {
+            probe["format"]["duration"]
+                .as_str()
+                .and_then(|d| d.parse().ok())
+        })
+        .ok_or("JOIN_COPY_NO_DURATION")?;
+    if (video_duration - total_duration).abs() > tolerance {
+        return Err(format!(
+            "JOIN_COPY_DURATION:{video_duration} vs {total_duration}"
+        ));
+    }
+    let audio = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "audio");
+    if has_audio {
+        let audio = audio.ok_or("JOIN_COPY_NO_AUDIO")?;
+        let audio_duration = audio["duration"]
+            .as_str()
+            .and_then(|d| d.parse::<f64>().ok())
+            .ok_or("JOIN_COPY_NO_AUDIO_DURATION")?;
+        if (audio_duration - video_duration).abs() > 0.1 {
+            return Err(format!(
+                "JOIN_COPY_AV_DRIFT:{audio_duration} vs {video_duration}"
+            ));
+        }
+    } else if audio.is_some() {
+        return Err("JOIN_COPY_UNEXPECTED_AUDIO".into());
+    }
+    Ok(())
 }
 
 pub fn ass_timestamp(seconds: f64) -> String {

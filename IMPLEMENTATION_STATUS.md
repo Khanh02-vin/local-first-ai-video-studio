@@ -116,6 +116,17 @@ Deferred until measured demand:
   duration clamp, the scene loop still stopping at 360 scenes). The preview cache now
   evicts oldest-first (`*.mp4` only) under a 5 GiB cap after each publish — previously
   nothing ever deleted a preview, so the disk leak grew with every imported video.
+- **Join step via stream copy with validation + fallback** (ADR-007): the render join
+  no longer re-encodes the whole output a second time. Segments share one encoder
+  profile, so `join_segments` first tries the concat demuxer with `-c copy` (`-an` when
+  the source has no audio, keeping the output shape identical), validates the result
+  with ffprobe (video dimensions from the aspect ratio, duration within a frame-grid
+  tolerance, audio present/absent as expected, audio-video drift ≤ 0.1s), and falls
+  back to the previous concat-filter re-encode on any mismatch or failure — the output
+  never regresses below the filter path. Baseline benchmark `bench:concat-ab` measured
+  the join at 16.3s (filter) vs 0.09s (copy) for a 24s output with no audible drift and
+  no DTS warnings; the render-success E2E on the new path is green (export decodes
+  clean, 1080x1920 + audio) and the scenario dropped from ~154s to ~126s.
 - Local Faster-Whisper CLI adapter with cleanup, timeout and transcript validation.
 - Deterministic heuristic highlight selector using sentence completeness, length and hook keywords.
 - Semantic highlight strategy + Gemini BYOK provider wired into the analysis worker (`HIGHLIGHT_STRATEGY`/`GEMINI_API_KEY` in runtime.env, `SemanticProviderAdapter` bridges the LLM provider into the pipeline); deterministic heuristic/content selector is the offline default and the automatic fallback when the provider errors or no key is set.

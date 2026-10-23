@@ -415,6 +415,181 @@ use std::sync::{Arc, Mutex};
         SilentProgress
     }
 
+    /// Builds one engine-style segment (h264/aac, CFR 30) for the join tests.
+    fn build_segment(dir: &Path, name: &str, codec: &str) -> PathBuf {
+        let segment = dir.join(name);
+        let video_codec_args: &[&str] = if codec == "mpeg4" {
+            &["-c:v", "mpeg4", "-q:v", "5"]
+        } else {
+            &["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
+        };
+        let fixture = Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=2",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=2",
+                "-shortest",
+                "-vf", "scale=160:120,setsar=1", "-r", "30", "-pix_fmt", "yuv420p",
+            ])
+            .args(video_codec_args)
+            .args(["-c:a", "aac", "-b:a", "128k"])
+            .arg(&segment)
+            .status()
+            .unwrap();
+        assert!(fixture.success(), "segment fixture {name} failed");
+        segment
+    }
+
+    /// The stream-copy join must reproduce the shape the filter path produced, and
+    /// the validation must reject the ways it could go wrong.
+    #[test]
+    fn joined_copy_validates_shape_duration_and_audio_presence() {
+        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ffmpeg = Path::new("ffmpeg");
+        let ffprobe = Path::new("ffprobe");
+        if Command::new(ffmpeg).arg("-version").output().is_err()
+            || Command::new(ffprobe).arg("-version").output().is_err()
+        {
+            eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let dir = create_temporary_render_dir().unwrap();
+        let segments = vec![
+            build_segment(&dir.0, "seg-a.mp4", "h264"),
+            build_segment(&dir.0, "seg-b.mp4", "h264"),
+        ];
+        let sink = silent_progress();
+        let joined = render_engine::engine::join_segments(
+            ffmpeg,
+            ffprobe,
+            &segments,
+            true,
+            4.0,
+            (160, 120),
+            &dir,
+            &sink,
+        )
+        .expect("a uniform copy join must succeed");
+        render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
+            .expect("a correct copy join must validate");
+
+        // Wrong expected dimensions, wrong duration, wrong audio expectation: each
+        // must be rejected so the render falls back instead of shipping a bad file.
+        for (dims, total, has_audio, code) in [
+            ((1920u32, 1080u32), 4.0, true, "JOIN_COPY_SHAPE"),
+            ((160, 120), 9.0, true, "JOIN_COPY_DURATION"),
+            ((160, 120), 4.0, false, "JOIN_COPY_UNEXPECTED_AUDIO"),
+        ] {
+            let error = render_engine::engine::validate_joined_output(
+                ffprobe,
+                &joined,
+                has_audio,
+                dims,
+                total,
+                2,
+            )
+            .expect_err("the doctored expectation must be rejected");
+            assert!(error.contains(code), "expected {code}, got {error}");
+        }
+    }
+
+    /// When the source has no audio the segments still carry the generated silent
+    /// track; the copy join must drop it (-an) so the output keeps the exact shape
+    /// the filter path produced.
+    #[test]
+    fn joined_copy_drops_the_generated_silent_track_when_source_has_no_audio() {
+        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ffmpeg = Path::new("ffmpeg");
+        let ffprobe = Path::new("ffprobe");
+        if Command::new(ffmpeg).arg("-version").output().is_err()
+            || Command::new(ffprobe).arg("-version").output().is_err()
+        {
+            eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let dir = create_temporary_render_dir().unwrap();
+        let segments = vec![
+            build_segment(&dir.0, "seg-a.mp4", "h264"),
+            build_segment(&dir.0, "seg-b.mp4", "h264"),
+        ];
+        let sink = silent_progress();
+        let joined = render_engine::engine::join_segments(
+            ffmpeg,
+            ffprobe,
+            &segments,
+            false,
+            4.0,
+            (160, 120),
+            &dir,
+            &sink,
+        )
+        .expect("the -an copy join must succeed");
+        render_engine::engine::validate_joined_output(ffprobe, &joined, false, (160, 120), 4.0, 2)
+            .expect("the audio-less shape must validate");
+        // And the file really has no audio stream.
+        let probe = Command::new(ffprobe)
+            .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+            .arg(&joined)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "video");
+    }
+
+    /// If the stream copy cannot preserve the streams (mixed codecs across segments),
+    /// the orchestrator must fall back to the filter re-encode and still produce a
+    /// correct h264 output — the rendered file never regresses.
+    #[test]
+    fn join_falls_back_to_filter_when_copy_cannot_preserve_the_streams() {
+        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ffmpeg = Path::new("ffmpeg");
+        let ffprobe = Path::new("ffprobe");
+        if Command::new(ffmpeg).arg("-version").output().is_err()
+            || Command::new(ffprobe).arg("-version").output().is_err()
+        {
+            eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let dir = create_temporary_render_dir().unwrap();
+        // seg-b is mpeg4: the copy demuxer cannot stream-copy a mixed-codec join.
+        let segments = vec![
+            build_segment(&dir.0, "seg-a.mp4", "h264"),
+            build_segment(&dir.0, "seg-b.mp4", "mpeg4"),
+        ];
+        let sink = silent_progress();
+        let joined = render_engine::engine::join_segments(
+            ffmpeg,
+            ffprobe,
+            &segments,
+            true,
+            4.0,
+            (160, 120),
+            &dir,
+            &sink,
+        )
+        .expect("the fallback must produce a valid join");
+        render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
+            .expect("the fallback output must validate");
+        let probe = Command::new(ffprobe)
+            .args([
+                "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,width,height:format=duration",
+                "-of", "json",
+            ])
+            .arg(&joined)
+            .output()
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let video = metadata["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["codec_type"] == "video")
+            .unwrap();
+        assert_eq!(video["codec_name"], "h264", "the fallback re-encodes to h264");
+        let duration = metadata["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap();
+        assert!((duration - 4.0).abs() < 0.3, "unexpected fallback duration: {duration}");
+    }
+
     /// Cancelling must take down the worker *and* its children. This starts a shell
     /// that spawns a grandchild, then kills only the worker's process group.
     #[cfg(unix)]
@@ -662,26 +837,21 @@ use std::sync::{Arc, Mutex};
             &silent_progress(),
         )
         .unwrap();
+        // Compare the decoded video frame at 0.8s (inside the caption cue) directly:
+        // seek to the display position and hash only the video stream. Taking the
+        // last framemd5 row of a full decode is not robust — the row order
+        // interleaves audio, whose content is identical between the two renders.
         let frame_hash = |path: &Path| {
             let output = Command::new(ffmpeg)
-                .args(["-v", "error", "-i"])
+                .args(["-v", "error", "-ss", "0.8", "-i"])
                 .arg(path)
-                .args([
-                    "-vf",
-                    "select='eq(n,24)'",
-                    "-vsync",
-                    "0",
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "framemd5",
-                    "-",
-                ])
+                .args(["-map", "0:v:0", "-frames:v", "1", "-f", "framemd5", "-"])
                 .output()
                 .unwrap();
             assert!(output.status.success());
             String::from_utf8_lossy(&output.stdout)
                 .lines()
+                .filter(|line| !line.starts_with('#'))
                 .last()
                 .unwrap_or("")
                 .to_owned()
