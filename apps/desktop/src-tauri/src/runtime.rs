@@ -10,9 +10,10 @@ use std::thread;
 use tauri::Manager;
 
 use crate::paths::{
-    command_ready, ensure_bundled_whisper_model, ffmpeg_bin, ffprobe_bin, node_bin, python_binary,
-    runtime_env, data_dir, cache_dir, tool, whisper_command, whisper_usable, whisper_venv_bin,
-    whisper_venv_dir, write_runtime_settings,
+    command_ready, ensure_bundled_whisper_model, ffmpeg_bin, ffprobe_bin, free_loopback_port,
+    node_bin, python_binary, runtime_env, data_dir, cache_dir, session_token, tool,
+    whisper_command, whisper_usable, whisper_venv_bin, whisper_venv_dir,
+    write_runtime_settings,
 };
 use crate::youtube::prepare_youtube_venv;
 use crate::{license_tier, run_status_script};
@@ -59,19 +60,25 @@ pub(crate) fn ensure_llama_server<R: tauri::Runtime>(
     state: &LlamaState,
     app: &tauri::AppHandle<R>,
     port: u16,
+    api_key: Option<&str>,
 ) -> Result<(), String> {
-    // If a llama-server is already answering on this port, reuse it.
+    // If a llama-server is already answering on this port, reuse it. The key is sent
+    // when we have one: a server started with --api-key refuses unlabelled requests.
     let health_url = format!("http://127.0.0.1:{port}/health");
-    if tool("curl")
-        .args([
-            "-s",
-            "-f",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &health_url,
-        ])
+    let mut health = tool("curl");
+    health.args([
+        "-s",
+        "-f",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+    ]);
+    if let Some(key) = api_key {
+        health.args(["-H", &format!("Authorization: Bearer {key}")]);
+    }
+    if health
+        .arg(&health_url)
         .output()
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200")
@@ -107,8 +114,13 @@ pub(crate) fn ensure_llama_server<R: tauri::Runtime>(
         // mean pooling lets the same server embed RAG segments and still chat.
         .arg("--embeddings")
         .arg("--pooling")
-        .arg("mean")
-        .stdout(std::process::Stdio::null())
+        .arg("mean");
+    // A per-session key keeps drive-by web pages from using the model API over
+    // loopback: without it, any page in any browser tab could POST /v1/chat/completions.
+    if let Some(key) = api_key {
+        cmd.arg("--api-key").arg(key);
+    }
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let spawned = cmd.spawn().map_err(|e| format!("LLAMA_SPAWN:{e}"))?;
     let pid = spawned.id();
@@ -118,16 +130,13 @@ pub(crate) fn ensure_llama_server<R: tauri::Runtime>(
     let mut ready = false;
     for _ in 0..60 {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if tool("curl")
-            .args([
-                "-s",
-                "-f",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                &health_url,
-            ])
+        let mut probe = tool("curl");
+        probe.args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}"]);
+        if let Some(key) = api_key {
+            probe.args(["-H", &format!("Authorization: Bearer {key}")]);
+        }
+        if probe
+            .arg(&health_url)
             .output()
             .ok()
             .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "200")
@@ -148,14 +157,45 @@ pub(crate) fn ensure_llama_server<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Extracts the port of a loopback URL ("http://127.0.0.1:8123") — the URL host was
+/// already validated to loopback by `valid_local_llm_url`.
+fn loopback_port_of(url: &str) -> Option<u16> {
+    url.rsplit(':').next()?.parse().ok()
+}
+
 #[tauri::command]
 pub(crate) fn start_local_llm(
     app: tauri::AppHandle,
     state: tauri::State<'_, LlamaState>,
 ) -> Result<String, String> {
-    let port: u16 = 8080;
-    ensure_llama_server(&state, &app, port)?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let file = runtime_env();
+    // Reuse a server that already answers on the configured endpoint — a leftover
+    // managed instance from a crashed session, or an external server the user points
+    // at. Nothing is rewritten in this branch.
+    if let Some(url) = file
+        .get("LOCAL_LLM_BASE_URL")
+        .filter(|u| u.starts_with("http://127.0.0.1") || u.starts_with("http://localhost"))
+    {
+        if let Some(port) = loopback_port_of(url) {
+            let key = file.get("LOCAL_LLM_API_KEY").cloned();
+            if ensure_llama_server(&state, &app, port, key.as_deref()).is_ok() {
+                return Ok(url.clone());
+            }
+        }
+    }
+    // Spawn the bundled server on an ephemeral port with a per-session key, then
+    // record the endpoint in runtime.env so the Node helpers and the RAG sidecar
+    // reach the same server (helper_env forwards those entries to every worker).
+    let port = free_loopback_port().ok_or("NO_FREE_PORT: cannot bind an ephemeral port")?;
+    let api_key = session_token();
+    ensure_llama_server(&state, &app, port, Some(&api_key))?;
+    let url = format!("http://127.0.0.1:{port}");
+    let mut settings = runtime_env();
+    settings.insert("LOCAL_LLM_BASE_URL".into(), url.clone());
+    settings.insert("LOCAL_LLM_API_KEY".into(), api_key);
+    settings.insert("LOCAL_LLM_MANAGED".into(), "1".into());
+    write_runtime_settings(&settings)?;
+    Ok(url)
 }
 
 #[tauri::command]
@@ -191,7 +231,42 @@ pub(crate) fn nix_kill(pid: u32) -> std::io::Result<()> {
 #[derive(Clone, Default)]
 pub(crate) struct RagState(pub(crate) Arc<Mutex<Option<u32>>>); // pid of the detached RAG sidecar, if running
 
-pub(crate) const RAG_PORT: u16 = 4733;
+/// The endpoint handed to the webview: base URL plus the per-session token every
+/// sidecar request must carry.
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct RagEndpoint {
+    pub(crate) base: String,
+    pub(crate) token: String,
+}
+
+/// Session record for a leftover sidecar: after a crash the app cannot know the
+/// ephemeral port or the token any other way, so they are persisted (data dir,
+/// 0600) and verified before reuse.
+fn rag_session_file() -> PathBuf {
+    data_dir().join("rag-session.json")
+}
+
+fn rag_load_session() -> Option<RagEndpoint> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rag_session_file()).ok()?).ok()?;
+    let port = value["port"].as_u64()? as u16;
+    let token = value["token"].as_str()?.to_string();
+    if token.is_empty() {
+        return None;
+    }
+    Some(RagEndpoint { base: format!("http://127.0.0.1:{port}"), token })
+}
+
+fn rag_save_session(endpoint: &RagEndpoint) {
+    let port = endpoint.base.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    let Some(port) = port else { return };
+    let body = serde_json::json!({ "port": port, "token": endpoint.token });
+    let _ = crate::paths::write_private_file(&rag_session_file(), body.to_string().as_bytes());
+}
+
+fn rag_clear_session() {
+    let _ = std::fs::remove_file(rag_session_file());
+}
 
 /// Where the bundled adapter-node RAG server entry lives (web/build-node/index.js
 /// bundled as the `build-node` resource). Falls back to the dev-tree build so a
@@ -212,42 +287,70 @@ pub(crate) fn rag_entry(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Err("RAG_SERVER_MISSING: web/build-node/index.js not found in resources or dev tree (run: npm run build:node)".into())
 }
 
-/// True when the RAG sidecar is already answering on this port (GET playlists is 200).
-pub(crate) fn rag_healthy(port: u16) -> bool {
+/// True when the RAG sidecar is answering on this port with this token.
+pub(crate) fn rag_healthy(port: u16, token: &str) -> bool {
     let url = format!("http://127.0.0.1:{port}/api/rag/playlists");
     tool("curl")
-        .args(["-s", "-f", "-o", "/dev/null", "-w", "%{http_code}", &url])
+        .args([
+            "-s",
+            "-f",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            &url,
+        ])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "200")
         .unwrap_or(false)
 }
 
-/// Idempotently spawn the RAG sidecar (bundled node + build-node entry) on
-/// 127.0.0.1:RAG_PORT and wait until it answers; reuses an instance already
-/// healthy. Returns the base URL the static webview should call via plugin-http.
-pub(crate) fn ensure_rag_server(state: &RagState, app: &tauri::AppHandle) -> Result<String, String> {
-    let base = format!("http://127.0.0.1:{RAG_PORT}");
-    if rag_healthy(RAG_PORT) {
-        return Ok(base);
+/// Idempotently spawn the RAG sidecar (bundled node + build-node entry) on a free
+/// loopback port and wait until it answers. Reuses a healthy leftover from the
+/// session file (a crashed app cannot otherwise be reattached to its sidecar).
+/// Returns the base URL plus the per-session token the static webview must send
+/// on every request via plugin-http.
+pub(crate) fn ensure_rag_server(
+    state: &RagState,
+    app: &tauri::AppHandle,
+) -> Result<RagEndpoint, String> {
+    // Reuse a leftover whose token we still hold and that still answers.
+    if let Some(session) = rag_load_session() {
+        if rag_healthy(
+            session.base.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0),
+            &session.token,
+        ) {
+            return Ok(session);
+        }
+        rag_clear_session();
     }
     let entry = rag_entry(app)?;
+    let port = free_loopback_port().ok_or("NO_FREE_PORT: cannot bind an ephemeral port")?;
+    let token = session_token();
     // Point the sidecar at the local LLM so ingest/query can use embeddings +
     // answer synthesis; the sidecar falls back to TF-IDF when it is not running.
-    let llama_url = runtime_env()
+    let env_file = runtime_env();
+    let llama_url = env_file
         .get("LOCAL_LLM_BASE_URL")
         .cloned()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let mut cmd = tool(node_bin(app));
     cmd.arg(&entry)
-        .env("PORT", RAG_PORT.to_string())
+        .env("PORT", port.to_string())
         .env("HOST", "127.0.0.1")
+        // The token gate: without the matching bearer the sidecar answers 401, so a
+        // drive-by web page gets nothing from loopback.
+        .env("LFAI_RAG_TOKEN", &token)
         .env(
             "LOCAL_FIRST_STATE_DIR",
             data_dir().to_string_lossy().into_owned(),
         )
         .env("LOCAL_LLM_BASE_URL", llama_url)
+        .env("LOCAL_LLM_API_KEY", env_file.get("LOCAL_LLM_API_KEY").cloned().unwrap_or_default())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let spawned = cmd.spawn().map_err(|e| format!("RAG_SPAWN:{e}"))?;
@@ -256,7 +359,7 @@ pub(crate) fn ensure_rag_server(state: &RagState, app: &tauri::AppHandle) -> Res
     let mut ready = false;
     for _ in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        if rag_healthy(RAG_PORT) {
+        if rag_healthy(port, &token) {
             ready = true;
             break;
         }
@@ -269,14 +372,16 @@ pub(crate) fn ensure_rag_server(state: &RagState, app: &tauri::AppHandle) -> Res
     if let Ok(mut guard) = state.0.lock() {
         let _ = guard.insert(pid);
     }
-    Ok(base)
+    let endpoint = RagEndpoint { base: format!("http://127.0.0.1:{port}"), token };
+    rag_save_session(&endpoint);
+    Ok(endpoint)
 }
 
 #[tauri::command]
 pub(crate) fn rag_server_url(
     app: tauri::AppHandle,
     state: tauri::State<'_, RagState>,
-) -> Result<String, String> {
+) -> Result<RagEndpoint, String> {
     ensure_rag_server(state.inner(), &app)
 }
 
@@ -442,7 +547,7 @@ pub(crate) fn write_runtime_env(whisper_path: &str, model: &str) -> Result<(), S
         .ok()
         .unwrap_or_else(|| "cpu".into());
     let fp16 = if device == "cuda" { "True" } else { "False" };
-    let mut settings = file;
+    let mut settings = file.clone();
     settings.insert("WHISPER_COMMAND".into(), whisper_path.into());
     settings.insert("WHISPER_MODEL".into(), model.into());
     settings.insert("WHISPER_DEVICE".into(), device);
@@ -452,6 +557,14 @@ pub(crate) fn write_runtime_env(whisper_path: &str, model: &str) -> Result<(), S
     settings.insert("LOCAL_LLM_BASE_URL".into(), llama_url);
     settings.insert("LOCAL_LLM_MODEL".into(), llama_model);
     settings.insert("HF_TOKEN".into(), hf_token);
+    // The bundled server's per-session endpoint and key must survive a bootstrap
+    // rewrite, or the running llama-server becomes unreachable for the helpers.
+    if let Some(key) = file.get("LOCAL_LLM_API_KEY") {
+        settings.insert("LOCAL_LLM_API_KEY".into(), key.clone());
+    }
+    if let Some(managed) = file.get("LOCAL_LLM_MANAGED") {
+        settings.insert("LOCAL_LLM_MANAGED".into(), managed.clone());
+    }
     write_runtime_settings(&settings)
 }
 
@@ -1177,5 +1290,8 @@ pub(crate) fn stop_sidecars(llama: &LlamaState, rag: &RagState) {
             }
         }
     }
+    // The sidecar is gone; a stale session record must not point the next session
+    // at a dead endpoint.
+    rag_clear_session();
 }
 

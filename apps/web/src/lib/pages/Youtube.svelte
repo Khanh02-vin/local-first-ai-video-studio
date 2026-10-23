@@ -104,6 +104,7 @@
   // whose HTTP runs in Rust and bypasses webview CSP/CORS. Standalone (plain
   // browser served by the adapter-node build) keeps same-origin relative fetch.
   let ragBase = "";
+  let ragToken = "";
   let tauriFetch: typeof globalThis.fetch | null = null;
 
   async function initRag(): Promise<void> {
@@ -111,7 +112,11 @@
     try {
       const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
       tauriFetch = tFetch as typeof globalThis.fetch;
-      ragBase = await invoke<string>("rag_server_url"); // spawns the sidecar if needed
+      // Spawns the sidecar if needed and hands back the per-session token every
+      // request must carry — the sidecar answers 401 to drive-by web pages.
+      const endpoint = await invoke<{ base: string; token: string }>("rag_server_url");
+      ragBase = endpoint.base;
+      ragToken = endpoint.token;
     } catch (error) {
       status = String(error);
       statusKind = "crawl";
@@ -120,7 +125,9 @@
 
   async function rag(path: string, init?: RequestInit): Promise<Response> {
     const doFetch = tauriFetch ?? globalThis.fetch;
-    return doFetch(ragBase + path, init);
+    const headers = new Headers(init?.headers);
+    if (ragToken) headers.set("authorization", `Bearer ${ragToken}`);
+    return doFetch(ragBase + path, { ...init, headers });
   }
 
   async function loadPlaylists() {

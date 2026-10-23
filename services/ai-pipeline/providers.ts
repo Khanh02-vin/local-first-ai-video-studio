@@ -197,12 +197,18 @@ export function mergeWindowHighlights(perWindow: Highlight[][], source: Transcri
 export class LlamaCppHighlightProvider implements HighlightProvider {
   private readonly baseUrl: string;
   private readonly model: string;
+  // The desktop app starts llama-server with a per-session --api-key (forwarded
+  // here via LOCAL_LLM_API_KEY); an external server without a key stays keyless.
+  private readonly apiKey = process.env.LOCAL_LLM_API_KEY ?? "";
   private readonly circuitBreaker = new CircuitBreaker(5, 30_000);
   constructor(baseUrl = "http://127.0.0.1:8080", model = "qwen2.5-3b-instruct") { this.baseUrl = baseUrl.replace(/\/+$/, ""); this.model = model; }
   private modelId?: string;
+  private authHeaders(): Record<string, string> {
+    return this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {};
+  }
   private async resolvedModelId(signal?: AbortSignal): Promise<string> {
     if (this.modelId) return this.modelId;
-    const response = await fetch(`${this.baseUrl}/v1/models`, { signal });
+    const response = await fetch(`${this.baseUrl}/v1/models`, { headers: this.authHeaders(), signal });
     if (!response.ok) throw new Error(`LLAMA_CPP_MODELS_${response.status}`);
     const raw = await response.json() as { data?: Array<{ id?: string }>; models?: Array<{ name?: string }> };
     const id = raw.data?.[0]?.id ?? raw.models?.[0]?.name;
@@ -226,7 +232,7 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
       const prompt = highlightPrompt(transcript);
       const timeout = AbortSignal.timeout(15 * 60_000);
       const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object", schema: HIGHLIGHT_OUTPUT_SCHEMA }, messages: [{ role: "user", content: prompt }] }), signal: combined });
+      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", ...this.authHeaders() }, body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object", schema: HIGHLIGHT_OUTPUT_SCHEMA }, messages: [{ role: "user", content: prompt }] }), signal: combined });
       if (!response.ok) {
         const body = await response.text().catch(() => "");
         throw new Error(`LLAMA_CPP_PROVIDER_${response.status}:${body.slice(0, 200)}`);

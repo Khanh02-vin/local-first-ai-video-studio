@@ -503,7 +503,7 @@ pub(crate) fn youtube_ingest_captions(
     if segments.is_empty() {
         return Err("CAP_PARSE_EMPTY: phụ đề tải về rỗng hoặc định dạng lạ".into());
     }
-    let base = ensure_rag_server(&RagState::default(), &app)?;
+    let endpoint = ensure_rag_server(&RagState::default(), &app)?;
     let body = serde_json::json!({ "videoUrl": format!("https://www.youtube.com/watch?v={video_id}"), "segments": segments });
     let body_str = body.to_string();
     let out = tool("curl")
@@ -517,9 +517,11 @@ pub(crate) fn youtube_ingest_captions(
             "POST",
             "-H",
             "content-type: application/json",
+            "-H",
+            &format!("Authorization: Bearer {}", endpoint.token),
             "-d",
             &body_str,
-            &format!("{base}/api/rag/ingest"),
+            &format!("{}/api/rag/ingest", endpoint.base),
         ])
         .output()
         .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
@@ -693,6 +695,16 @@ pub(crate) fn start_youtube_analysis(
 // gives it a normal http://localhost Referer, which YouTube accepts.
 pub(crate) const YT_PREVIEW_PORT: u16 = 14872;
 
+/// Per-session token every /preview request must carry. The preview shim proxies a
+/// YouTube embed on loopback; without the token, a web page in the user's browser
+/// could make the shim do that too. The port stays fixed because the webview CSP
+/// allow-lists it statically (tauri.conf.json frame-src).
+static PREVIEW_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn preview_session_token() -> String {
+    PREVIEW_TOKEN.get_or_init(crate::paths::session_token).clone()
+}
+
 /// Parses the shim's query into (videoId, start, end); anything else is rejected
 /// so the served page is only ever built from validated pieces.
 pub(crate) fn preview_query(query: &str) -> Option<(String, u32, u32)> {
@@ -730,10 +742,11 @@ pub(crate) fn preview_page(video_id: &str, start: u32, end: u32) -> String {
     )
 }
 
-pub(crate) fn preview_serve(listener: std::net::TcpListener) {
+pub(crate) fn preview_serve(listener: std::net::TcpListener, token: String) {
     use std::io::{Read, Write};
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        let token = token.clone();
         thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
             let mut request: Vec<u8> = Vec::new();
@@ -753,12 +766,16 @@ pub(crate) fn preview_serve(listener: std::net::TcpListener) {
             let text = String::from_utf8_lossy(&request);
             let target = text.split_whitespace().nth(1).unwrap_or("");
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            // Every /preview request must carry this session's token; /health stays
+            // open because it answers a constant string and nothing else.
+            let authorized = query.split('&').any(|pair| pair == format!("token={token}").as_str());
             let (status, body) = match path {
                 "/health" => ("200 OK", "yt-preview".to_string()),
-                "/preview" => match preview_query(query) {
+                "/preview" if authorized => match preview_query(query) {
                     Some((id, start, end)) => ("200 OK", preview_page(&id, start, end)),
                     None => ("400 Bad Request", "bad preview request".to_string()),
                 },
+                "/preview" => ("403 Forbidden", "missing or wrong preview token".to_string()),
                 _ => ("404 Not Found", "not found".to_string()),
             };
             let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
@@ -769,9 +786,13 @@ pub(crate) fn preview_serve(listener: std::net::TcpListener) {
 
 /// Returns the loopback base URL for the YouTube preview iframe, starting the
 /// shim on first use (reuses an instance already serving after a reload).
+/// Returns the loopback /preview URL prefix, session token included, starting the
+/// shim on first use (reuses an instance already serving after a reload). The UI
+/// appends `&id=…&start=…&end=…` to this prefix.
 #[tauri::command]
 pub(crate) fn preview_origin() -> Result<String, String> {
-    let base = format!("http://localhost:{YT_PREVIEW_PORT}");
+    let token = preview_session_token();
+    let prefix = format!("http://localhost:{YT_PREVIEW_PORT}/preview?token={token}");
     if let Ok(mut probe) = std::net::TcpStream::connect(("localhost", YT_PREVIEW_PORT)) {
         use std::io::{Read, Write};
         let _ = probe.set_read_timeout(Some(std::time::Duration::from_secs(2)));
@@ -780,14 +801,14 @@ pub(crate) fn preview_origin() -> Result<String, String> {
         let mut reply = String::new();
         let _ = probe.read_to_string(&mut reply);
         if reply.starts_with("HTTP/1.1 200") && reply.contains("yt-preview") {
-            return Ok(base);
+            return Ok(prefix);
         }
         return Err(format!("PREVIEW_PORT_BUSY:{YT_PREVIEW_PORT}"));
     }
     let listener = std::net::TcpListener::bind(("127.0.0.1", YT_PREVIEW_PORT))
         .map_err(|e| format!("PREVIEW_PORT_BUSY:{e}"))?;
-    thread::spawn(move || preview_serve(listener));
-    Ok(base)
+    thread::spawn(move || preview_serve(listener, token));
+    Ok(prefix)
 }
 
 pub(crate) fn valid_playlist_url(value: &str) -> bool {
@@ -838,8 +859,8 @@ pub(crate) fn run_yt_crawler(
         serde_json::from_slice(&output.stdout).map_err(|e| format!("CRAWLER_JSON:{e}"))?;
 
     // Ingest each result via the running RAG sidecar (bundled curl — no new HTTP dep).
-    let base = ensure_rag_server(&RagState::default(), app)?;
-    let ingest_url = format!("{base}/api/rag/ingest");
+    let endpoint = ensure_rag_server(&RagState::default(), app)?;
+    let ingest_url = format!("{}/api/rag/ingest", endpoint.base);
     let mut indexed = 0usize;
     for video in &videos {
         let body = serde_json::json!({

@@ -137,6 +137,17 @@ function llmBase(): string {
   return (process.env.LOCAL_LLM_BASE_URL ?? "http://127.0.0.1:8080").replace(/\/+$/, "");
 }
 
+// The desktop app spawns this sidecar with a per-session token (LFAI_RAG_TOKEN) and
+// hands the same token to the webview, so a web page in the user's browser gets 401
+// instead of the user's playlists. Standalone/dev runs set no token and stay open.
+const RAG_TOKEN = process.env.LFAI_RAG_TOKEN ?? "";
+
+function authorized(request: Request): boolean {
+  if (!RAG_TOKEN) return true;
+  const header = request.headers.get("authorization") ?? "";
+  return header === `Bearer ${RAG_TOKEN}`;
+}
+
 type EmbeddingStore = { version: 1; model: string; dim: number; vectors: Record<string, number[]> };
 
 function loadEmbeddings(): EmbeddingStore | null {
@@ -158,7 +169,7 @@ async function embedTexts(texts: string[]): Promise<{ dim: number; vectors: numb
   try {
     const response = await fetch(`${llmBase()}/v1/embeddings`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(process.env.LOCAL_LLM_API_KEY ? { authorization: `Bearer ${process.env.LOCAL_LLM_API_KEY}` } : {}) },
       body: JSON.stringify({ model: "local", input: texts }),
       signal: AbortSignal.timeout(60_000),
     });
@@ -213,7 +224,7 @@ async function synthesizeAnswer(question: string, top: Array<{ videoId: string; 
   try {
     const response = await fetch(`${llmBase()}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(process.env.LOCAL_LLM_API_KEY ? { authorization: `Bearer ${process.env.LOCAL_LLM_API_KEY}` } : {}) },
       body: JSON.stringify({ model: "local", temperature: 0.2, max_tokens: 300, messages: [{ role: "user", content: prompt }] }),
       signal: AbortSignal.timeout(90_000),
     });
@@ -233,7 +244,8 @@ function deterministicAnswer(top: Array<{ videoId: string; segment: Segment; sco
 
 // --- endpoints ---
 
-export const GET: RequestHandler = async ({ url }) => {
+export const GET: RequestHandler = async ({ url, request }) => {
+  if (!authorized(request)) return jsonError(401, "UNAUTHORIZED");
   // The [...rest] route (src/routes/api/[...rest]) dispatches any /api/* path
   // to this module. Match the exact /api/rag/* sub-paths only, so an unrelated
   // /api/foo request still gets a JSON 404 instead of the SPA HTML fallback.
@@ -251,6 +263,7 @@ export const GET: RequestHandler = async ({ url }) => {
 };
 
 export const POST: RequestHandler = async ({ request }) => {
+  if (!authorized(request)) return jsonError(401, "UNAUTHORIZED");
   const { pathname } = new URL(request.url);
 
   if (pathname === "/api/rag/playlists") {
@@ -441,7 +454,8 @@ export const POST: RequestHandler = async ({ request }) => {
   return jsonError(404, "UNKNOWN_ENDPOINT");
 };
 
-export const DELETE: RequestHandler = async ({ url }) => {
+export const DELETE: RequestHandler = async ({ url, request }) => {
+  if (!authorized(request)) return jsonError(401, "UNAUTHORIZED");
   const match = url.pathname.match(/^\/api\/rag\/playlists\/(pl-[\w-]+)$/);
   if (!match) return jsonError(404, "UNKNOWN_ENDPOINT");
   const doc = loadPlaylist(match[1]);

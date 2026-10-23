@@ -183,6 +183,44 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Generates a per-session secret for the loopback sidecars (RAG, llama, preview).
+///
+/// The threat is a web page in the user's browser probing localhost: an
+/// unauthenticated sidecar would happily answer drive-by requests to its HTTP API
+/// (playlists, embeddings, YouTube-backed ranking). The token only has to be
+/// unguessable for the lifetime of a page, so std's per-process `RandomState`
+/// (seeded from OS entropy) mixed with clock, pid and an ASLR address is enough —
+/// this is not a defence against local malware running as the same user.
+pub(crate) fn session_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let marker = 0u8;
+    let mut hasher = RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    (&marker as *const u8 as usize).hash(&mut hasher);
+    format!(
+        "{:016x}{:016x}",
+        hasher.finish(),
+        RandomState::new().build_hasher().finish()
+    )
+}
+
+/// Picks a free loopback port by binding an ephemeral listener and releasing it.
+///
+/// A tiny TOCTOU window remains (another process could claim the port before the
+/// sidecar binds it); the sidecar's health-wait turns that into a clean timeout
+/// error instead of a silent cross-talk with a stranger's server.
+pub(crate) fn free_loopback_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    listener.local_addr().ok().map(|addr| addr.port())
+}
+
 pub(crate) fn jobs_path() -> PathBuf {
     data_dir().join("analysis.sqlite")
 }
@@ -821,7 +859,7 @@ pub(crate) fn io_error(code: &str, message: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::{migrate_legacy_state_into, platform_dir, DirKind};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     fn get<'a>(mapping: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name: &str| {
@@ -917,6 +955,24 @@ mod tests {
         assert_eq!(std::fs::read(data.join("runtime.env")).unwrap(), b"WHISPER_MODEL=base");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sidecar tokens are unguessable per session and differ between calls.
+    #[test]
+    fn session_token_is_hex_and_varies() {
+        let first = super::session_token();
+        let second = super::session_token();
+        assert_eq!(first.len(), 32, "128-bit token as 32 hex chars");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second, "two tokens in one process must differ");
+    }
+
+    #[test]
+    fn free_loopback_port_returns_a_usable_port() {
+        let port = super::free_loopback_port().expect("an ephemeral port must be bindable");
+        assert_ne!(port, 0);
+        // The port came from the OS, so rebinding it right away normally works —
+        // but never assert on a race; only assert the shape.
     }
 
     /// A project database already living in the data directory must never be replaced

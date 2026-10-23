@@ -7,6 +7,7 @@
   let { initialQuery = "", sourceText = "" }: { initialQuery?: string; sourceText?: string } = $props();
   let query = $state("");
   let ragBase = "";
+  let ragToken = "";
   let tauriFetch: typeof globalThis.fetch | null = null;
   let videos = $state<Video[]>([]);
   let busy = $state(false);
@@ -17,14 +18,18 @@
     try {
       const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
       tauriFetch = tFetch as typeof globalThis.fetch;
-      ragBase = await invoke<string>("rag_server_url");
+      const endpoint = await invoke<{ base: string; token: string }>("rag_server_url");
+      ragBase = endpoint.base;
+      ragToken = endpoint.token;
     } catch { /* retain YouTube's original ranking */ }
   }
 
   const searchRank = (source: string, candidates: Video[]) => {
     if (!source.trim() || !candidates.length) return Promise.resolve(candidates);
     const doFetch = tauriFetch ?? globalThis.fetch;
-    return doFetch(ragBase + "/api/rag/related-rank", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ source, candidates }) })
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (ragToken) headers["authorization"] = `Bearer ${ragToken}`;
+    return doFetch(ragBase + "/api/rag/related-rank", { method: "POST", headers, body: JSON.stringify({ source, candidates }) })
       .then(async (response) => {
         if (!response.ok) return candidates;
         const data = await response.json() as { videos?: Video[] };

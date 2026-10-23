@@ -97,6 +97,16 @@ Deferred until measured demand:
   `KILL_ON_JOB_CLOSE` on Windows — so cancel works on Windows (`taskkill /F /T`) and a
   crashed app can no longer orphan its whisper/ffmpeg tree there; six new Rust tests pin
   the OS-path resolution and the migration semantics.
+- **Loopback sidecar auth + ephemeral ports** (ADR-005): llama-server, the RAG sidecar
+  and the preview shim no longer bind hardcoded ports (8080/4733/14872 for llama/RAG) —
+  the first two resolve a free port at spawn, and every sidecar now answers 401 to
+  requests without a per-session 128-bit token (llama via `--api-key` recorded in
+  runtime.env, RAG via `LFAI_RAG_TOKEN` gate on every handler, preview via a token in
+  the iframe URL). The webview receives `{base, token}` from `rag_server_url` and sends
+  the bearer on every call. A crash leftover is reattached through a session file
+  instead of a fixed port. Verified live (401/401/200) and pinned by wiring tests;
+  the preview shim keeps its fixed port because the webview CSP allow-lists it
+  statically, and the OAuth callback port is an external registration constraint.
 - Local Faster-Whisper CLI adapter with cleanup, timeout and transcript validation.
 - Deterministic heuristic highlight selector using sentence completeness, length and hook keywords.
 - Semantic highlight strategy + Gemini BYOK provider wired into the analysis worker (`HIGHLIGHT_STRATEGY`/`GEMINI_API_KEY` in runtime.env, `SemanticProviderAdapter` bridges the LLM provider into the pipeline); deterministic heuristic/content selector is the offline default and the automatic fallback when the provider errors or no key is set.

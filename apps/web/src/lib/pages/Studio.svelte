@@ -859,7 +859,7 @@
             title="YouTube clip preview"
             style="width:100%;aspect-ratio:16/9;border:0;border-radius:12px;background:#000;"
             src={previewBase
-              ? `${previewBase}/preview?id=${youtubeVideoId}&start=${Math.floor(selectedCandidate.start)}&end=${Math.ceil(selectedCandidate.end)}`
+              ? `${previewBase}&id=${youtubeVideoId}&start=${Math.floor(selectedCandidate.start)}&end=${Math.ceil(selectedCandidate.end)}`
               : `https://www.youtube.com/embed/${youtubeVideoId}?start=${Math.floor(selectedCandidate.start)}&end=${Math.ceil(selectedCandidate.end)}&rel=0`}
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
             allowfullscreen
