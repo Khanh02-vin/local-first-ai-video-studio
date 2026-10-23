@@ -1,0 +1,12 @@
+[package]
+name = "render-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The contract structs carry the typeshare attribute, so the TypeScript contract is
+# generated from these declarations. A regular dependency: the attribute lives on the
+# structs, so a release build needs the macro too.
+typeshare = "1.0.5"

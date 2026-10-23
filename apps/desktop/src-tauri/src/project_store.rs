@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -30,6 +30,8 @@ pub struct Project {
     pub speaker_face_matches: Option<Value>,
     pub renders: Vec<Value>,
     pub updated_at: String,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 fn validate_id(id: &str) -> Result<(), String> {
@@ -72,9 +74,13 @@ fn open(dir: &Path) -> Result<Connection, String> {
     db.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("PROJECT_DB:{e}"))?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
-        CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, record_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, record_json TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS projects_updated_at ON projects(updated_at DESC);")
         .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    if db.prepare("SELECT revision FROM projects LIMIT 0").is_err() {
+        db.execute_batch("ALTER TABLE projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    }
     import_json_projects(&db, dir)?;
     Ok(db)
 }
@@ -108,9 +114,10 @@ fn import_json_projects(db: &Connection, dir: &Path) -> Result<(), String> {
         if !exists {
             let record =
                 serde_json::to_string(&project).map_err(|e| format!("PROJECT_JSON:{e}"))?;
+            let revision = i64::try_from(project.revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
             db.execute(
-                "INSERT INTO projects(id,record_json,updated_at) VALUES(?1,?2,?3)",
-                params![project.id, record, project.updated_at],
+                "INSERT INTO projects(id,record_json,updated_at,revision) VALUES(?1,?2,?3,?4)",
+                params![project.id, record, project.updated_at, revision],
             )
             .map_err(|e| format!("PROJECT_DB:{e}"))?;
         }
@@ -132,14 +139,33 @@ fn read_project(db: &Connection, id: &str) -> Result<Option<Project>, String> {
 
 pub fn save(dir: &Path, mut project: Project) -> Result<Project, String> {
     validate_project(&project)?;
-    let db = open(dir)?;
+    let mut db = open(dir)?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    let current: Option<i64> = tx
+        .query_row("SELECT revision FROM projects WHERE id=?1", [&project.id], |row| row.get(0))
+        .optional()
+        .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    let expected = i64::try_from(project.revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
+    match current {
+        Some(revision) if revision != expected => return Err("PROJECT_REVISION_CONFLICT".into()),
+        None if expected != 0 => return Err("PROJECT_REVISION_CONFLICT".into()),
+        _ => {}
+    }
+    let next_revision = expected
+        .checked_add(1)
+        .ok_or("PROJECT_REVISION_OVERFLOW")?;
+    project.revision = u64::try_from(next_revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
     project.updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("CLOCK:{e}"))?
         .as_secs()
         .to_string();
     let record = serde_json::to_string(&project).map_err(|e| format!("PROJECT_JSON:{e}"))?;
-    db.execute("INSERT INTO projects(id,record_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json,updated_at=excluded.updated_at", params![project.id, record, project.updated_at]).map_err(|e| format!("PROJECT_DB:{e}"))?;
+    tx.execute("INSERT INTO projects(id,record_json,updated_at,revision) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json,updated_at=excluded.updated_at,revision=excluded.revision WHERE projects.revision=?5", params![project.id, record, project.updated_at, project.revision, expected])
+        .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    tx.commit().map_err(|e| format!("PROJECT_DB:{e}"))?;
     Ok(project)
 }
 
@@ -166,6 +192,7 @@ pub fn list(dir: &Path) -> Result<Vec<Project>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -196,6 +223,7 @@ mod tests {
             speaker_face_matches: None,
             renders: vec![],
             updated_at: String::new(),
+            revision: 0,
         }
     }
     #[test]
@@ -229,6 +257,7 @@ mod tests {
         assert_eq!(list(&dir).unwrap(), vec![saved.clone()]);
         assert_eq!(get(&dir, "project-1").unwrap(), saved);
         let mut updated = sample("project-1");
+        updated.revision = saved.revision;
         updated.title = "Edited".into();
         let saved = save(&dir, updated).unwrap();
         assert_eq!(get(&dir, "project-1").unwrap(), saved);
@@ -257,8 +286,8 @@ mod tests {
         let source = folder.join("legacy-1.json");
         let bytes = serde_json::to_vec(&project).unwrap();
         fs::write(&source, &bytes).unwrap();
-        assert_eq!(list(&dir).unwrap(), vec![project.clone()]);
-        assert_eq!(list(&dir).unwrap(), vec![project]);
+        assert_eq!(list(&dir).unwrap(), vec![Project { revision: 0, ..project.clone() }]);
+        assert_eq!(list(&dir).unwrap(), vec![Project { revision: 0, ..project.clone() }]);
         assert_eq!(fs::read(source).unwrap(), bytes);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -288,6 +317,28 @@ mod tests {
         assert_eq!(reopened.selected_variant_id.as_deref(), Some("variant-1"));
         assert!(reopened.plans.get("highlight-1").is_some());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_stale_project_revision_without_overwriting_newer_record() {
+        let dir = temp();
+        let first = save(&dir, sample("revision-project")).unwrap();
+        let mut stale = get(&dir, "revision-project").unwrap();
+        let mut current = first.clone();
+        current.title = "Current".into();
+        let saved = save(&dir, current).unwrap();
+        stale.title = "Stale".into();
+        assert_eq!(save(&dir, stale).unwrap_err(), "PROJECT_REVISION_CONFLICT");
+        assert_eq!(get(&dir, "revision-project").unwrap(), saved);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepts_legacy_project_json_without_revision() {
+        let mut value = serde_json::to_value(sample("legacy-revision")).unwrap();
+        value.as_object_mut().unwrap().remove("revision");
+        let project: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(project.revision, 0);
     }
 
     #[test]

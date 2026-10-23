@@ -8,8 +8,7 @@
     "./probe": "./probe/index.ts",
     "./transcript": "./transcript/index.ts",
     "./reframe": "./reframe/index.ts",
-    "./subtitles": "./subtitles/index.ts",
-    "./render-plan": "./render-plan/index.ts",
+    "./reframe/crop-keyframes": "./reframe/crop-keyframes.ts",
     "./validation": "./validation/index.ts"
   }
 }

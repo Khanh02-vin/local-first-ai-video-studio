@@ -277,6 +277,59 @@ export function repairTruncatedJsonArray(input: string): string {
   return out + stack.reverse().join("");
 }
 
+/**
+ * Generic OpenAI-compatible chat provider (POST {baseUrl}/chat/completions).
+ * Covers OpenAI, DeepSeek, Qwen, Kimi, GLM, and Gemini's OpenAI-compat
+ * endpoint — the model runs wherever the base URL points. Same window +
+ * merge strategy as the other LLM providers; no /v1/models lookup, the
+ * configured model name is sent verbatim.
+ */
+export class OpenAIChatHighlightProvider implements HighlightProvider {
+  private readonly baseUrl: string;
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly circuitBreaker = new CircuitBreaker(5, 30_000);
+  constructor(baseUrl: string, apiKey: string, model: string) { this.baseUrl = baseUrl.replace(/\/+$/, ""); this.apiKey = apiKey; this.model = model; }
+  async choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> {
+    // See GeminiHighlightProvider.choose: no word timings means no prompt.
+    if (!input.transcript.words.length) throw new Error("SEMANTIC_REQUIRES_WORD_TIMESTAMPS: the transcript has no word-level timings");
+    const windows = highlightWindows(input.transcript, input.windowSeconds ?? 180, input.overlapSeconds ?? 30);
+    const perWindow: Highlight[][] = [];
+    for (let i = 0; i < windows.length; i++) {
+      const { from, window } = windows[i];
+      const local = await this.chooseTranscript(window, input.signal);
+      perWindow.push(local.map((item, index) => ({ ...item, id: `h-${i}-${index}`, start: from + item.start, end: from + item.end })));
+    }
+    const highlights = mergeWindowHighlights(perWindow, input.transcript);
+    validateHighlights(highlights, input.transcript.duration); return highlights;
+  }
+  async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
+    return this.circuitBreaker.execute(async () => {
+      const prompt = highlightPrompt(transcript);
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
+      const response = await fetch(`${this.baseUrl}/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: this.model, temperature: 0.2, max_tokens: 800, response_format: { type: "json_object" }, messages: [{ role: "user", content: prompt }] }), signal: combined });
+      if (!response.ok) throw new Error(`OPENAI_CHAT_PROVIDER_${response.status}`);
+      const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const text = raw.choices?.[0]?.message?.content ?? "";
+      let parsed: Array<Record<string, unknown>>;
+      const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
+      const start = fenced.search(/[[{]/);
+      if (start === -1) throw new Error(`OPENAI_CHAT_BAD_JSON:${text.slice(0, 120)}`);
+      const candidate = fenced.slice(start);
+      try { parsed = extractHighlightProposals(JSON.parse(candidate)); }
+      catch {
+        const repaired = repairTruncatedJsonArray(candidate.trimEnd());
+        try { parsed = extractHighlightProposals(JSON.parse(repaired)); }
+        catch { throw new Error(`OPENAI_CHAT_BAD_JSON:${text.slice(0, 120)}`); }
+      }
+      return mapWordRangeProposals(transcript, parsed);
+    });
+  }
+}
+
 /** Circuit breaker for LLM calls — prevents cascading failures.
  *  State: CLOSED (normal) → OPEN (failure threshold) → HALF_OPEN (test recovery) → CLOSED */
 export class CircuitBreaker {

@@ -5,6 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalRunner } from "../../adapters/local/runner.ts";
+import { resolveEnginePath } from "../../adapters/local/engine.ts";
 import { LocalStore } from "../../adapters/local/store.ts";
 import { AnalysisStore } from "../../adapters/local/analysis-store.ts";
 import { chunkCacheKey, sourceFingerprint } from "../../adapters/local/analysis-cache.ts";
@@ -16,6 +17,7 @@ const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "idempotency-gaps-"));
 const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
 const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
+const enginePath = resolveEnginePath();
 
 function assertFixed(name: string, fact: boolean, description: string): void {
   assert.ok(fact, `${name}: ${description}`);
@@ -35,7 +37,7 @@ try {
   const input = join(root, "input.mp4");
   const output = join(root, "output.mp4");
   await makeMp4(input, 2);
-  const runner = new LocalRunner({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
+  const runner = new LocalRunner({ enginePath, ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
   const click1 = runner.enqueue({ input, output, aspectRatio: "9:16" });
   const click2 = runner.enqueue({ input, output, aspectRatio: "9:16" });
   assertFixed("GAP-1", click1.id === click2.id && runner.store.list().length === 1,
@@ -51,12 +53,25 @@ try {
   const analysis = AnalysisStore.open(analysisDb);
   analysis.create("an-1", "vid.mp4", 60);
   analysis.update("an-1", { status: "running", phase: "transcribe", progress: 0.2 });
+  analysis.createChunks("an-1", [{ chunkIndex: 0, start: 0, end: 30, cacheKey: "chunk-0" }]);
+  analysis.updateChunk("an-1", 0, { status: "running" });
+  analysis.cancel("an-1");
+  analysis.update("an-1", { status: "queued", phase: "queued", error: "late worker update" });
+  assertFixed("GAP-2c", analysis.get("an-1")?.status === "cancelled" && analysis.chunksOf("an-1")[0]?.status === "queued",
+    "cancellation is atomic and a late worker update cannot resurrect a stopped job");
+  analysis.update("an-1", { status: "completed", phase: "completed", progress: 1 });
+  assertFixed("GAP-2d", analysis.get("an-1")?.status === "cancelled",
+    "a terminal cancellation remains terminal even after a late completion");
   const store = LocalStore.open(jobsDb, analysisDb);
-  store.create({ id: "r-1", input: "vid.mp4", output: "out.mp4", start: null, end: null, aspectRatio: "9:16", analysisJobId: "an-1" });
+  // A second job that can complete normally: an-1 is terminally cancelled above,
+  // so only a live job can prove the claim gate opens on completion.
+  analysis.create("an-2", "vid.mp4", 60);
+  analysis.update("an-2", { status: "running", phase: "transcribe", progress: 0.2 });
+  store.create({ id: "r-1", input: "vid.mp4", output: "out.mp4", start: null, end: null, aspectRatio: "9:16", analysisJobId: "an-2" });
   const whileRunning = store.claim();
   assertFixed("GAP-2", whileRunning === undefined,
     "claim() refuses to start a render whose analysis job has not completed");
-  analysis.update("an-1", { status: "completed" });
+  analysis.update("an-2", { status: "completed" });
   const afterCompletion = store.claim();
   assertFixed("GAP-2b", afterCompletion?.id === "r-1" && afterCompletion.status === "running",
     "the render is claimed only after the analysis it depends on is completed");

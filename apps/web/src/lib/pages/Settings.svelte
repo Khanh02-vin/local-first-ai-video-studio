@@ -11,10 +11,19 @@ let { active = true }: { active?: boolean } = $props();
 let modelBusy = $state(false);
 let message = $state("");
 let strategy = $state("heuristic");
-let geminiKey = $state("");
-let localLlmUrl = $state("http://127.0.0.1:8080");
-let localLlmModel = $state("qwen2.5-3b-instruct");
-let strategyBusy = $state(false);
+  let localLlmUrl = $state("http://127.0.0.1:8080");
+  let localLlmModel = $state("qwen2.5-3b-instruct");
+  let strategyBusy = $state(false);
+  type AiProvider = { id: string; name: string; baseUrl: string; model: string; hasKey: boolean };
+  let providers = $state<AiProvider[]>([]);
+  let activeProviderId = $state("");
+  let providerFormOpen = $state(false);
+  let editingProviderId = $state("");
+  let providerName = $state("");
+  let providerBaseUrl = $state("");
+  let providerApiKey = $state("");
+  let providerModel = $state("");
+  const suggestedModels = ["gemini-2.0-flash", "gemini-2.5-flash", "gpt-4o-mini", "gpt-4.1-mini", "deepseek-chat", "qwen-plus", "kimi-k2"];
 type Progress = { phase: string; message: string; done: boolean; error?: string | null };
 let whisperProgress = $state<Progress | null>(null);
 let whisperBusy = $state(false);
@@ -103,25 +112,42 @@ async function pollSmall() {
     await refreshRuntime(true);
   }
 
-  async function saveStrategy(next: string, key: string, llamaUrl: string, llamaModel: string) {
-    if (!isTauri()) { message = "Strategy changes apply in the desktop app only."; return; }
-    if (next === "semantic-local" && !(modelPresent && llamaRuntimePresent)) {
-      message = "Install the Local LLM runtime and model below before selecting this strategy.";
-      return;
-    }
+  async function loadAiProviders() {
+    if (!isTauri()) return;
+    try { const result = await invoke<{providers: AiProvider[]; activeProviderId: string | null}>("list_ai_providers"); providers = result.providers; activeProviderId = result.activeProviderId ?? ""; }
+    catch (error) { message = `Provider list failed: ${String(error)}`; }
+  }
+  function openProviderForm(provider?: AiProvider) {
+    editingProviderId = provider?.id ?? ""; providerName = provider?.name ?? ""; providerBaseUrl = provider?.baseUrl ?? "https://api.openai.com/v1"; providerApiKey = ""; providerModel = provider?.model ?? ""; providerFormOpen = true;
+  }
+  async function saveProvider() {
     strategyBusy = true;
     try {
-      strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: key, localLlmBaseUrl: llamaUrl, localLlmModel: llamaModel });
-      if (next === "semantic-gemini") { geminiKey = key; localLlmUrl = ""; localLlmModel = ""; }
-      else if (next === "semantic-local") { localLlmUrl = llamaUrl; localLlmModel = llamaModel; geminiKey = ""; }
-      else { geminiKey = ""; localLlmUrl = ""; localLlmModel = ""; }
+      const id = await invoke<string>("save_ai_provider", { id: editingProviderId || null, name: providerName, baseUrl: providerBaseUrl, apiKey: providerApiKey, model: providerModel });
+      await loadAiProviders(); providerFormOpen = false; providerApiKey = ""; message = "Provider saved locally.";
+      if (!activeProviderId) await activateProvider(id);
+    } catch (error) { message = `Provider save failed: ${String(error)}`; }
+    finally { strategyBusy = false; }
+  }
+  async function activateProvider(id: string) {
+    strategyBusy = true;
+    try { activeProviderId = await invoke<string>("activate_ai_provider", { id }); strategy = "semantic-openai"; await loadAiProviders(); await refreshRuntime(true); message = "Cloud provider activated."; }
+    catch (error) { message = `Provider activation failed: ${String(error)}`; }
+    finally { strategyBusy = false; }
+  }
+  async function removeProvider(provider: AiProvider) {
+    if (!confirm(`Delete provider “${provider.name}”?`)) return;
+    try { await invoke("delete_ai_provider", { id: provider.id }); if (activeProviderId === provider.id) { activeProviderId = ""; strategy = "heuristic"; } await loadAiProviders(); await refreshRuntime(true); message = "Provider deleted."; }
+    catch (error) { message = `Provider delete failed: ${String(error)}`; }
+  }
+  async function saveStrategy(next: string, _key: string, llamaUrl: string, llamaModel: string) {
+    if (!isTauri()) { message = "Strategy changes apply in the desktop app only."; return; }
+    if (next === "semantic-local" && !(modelPresent && llamaRuntimePresent)) { message = "Install the Local LLM runtime and model below before selecting this strategy."; return; }
+    strategyBusy = true;
+    try {
+      strategy = await invoke<string>("set_highlight_strategy", { strategy: next, geminiApiKey: "", localLlmBaseUrl: llamaUrl, localLlmModel: llamaModel });
       await refreshRuntime(true);
-      const labels: Record<string, string> = {
-        "heuristic": "Heuristic strategy saved — offline, deterministic, no cost.",
-        "semantic-gemini": "Semantic (Gemini) strategy saved — API key stored locally in runtime.env.",
-        "semantic-local": "Local LLM strategy saved — runs offline on this machine (llama.cpp), no API key.",
-      };
-      message = labels[next] ?? "Strategy saved.";
+      message = next === "heuristic" ? "Heuristic strategy saved — offline, deterministic, no cost." : "Local LLM strategy saved — runs offline on this machine (llama.cpp), no API key.";
     } catch (error) { message = `Strategy change failed: ${String(error)}`; }
     finally { strategyBusy = false; }
   }
@@ -137,13 +163,13 @@ async function pollSmall() {
   async function readStrategy() {
   try {
     const status = await invoke<{ strategy?: string; hasKey?: boolean; hasLocalUrl?: boolean }>("highlight_strategy_status");
-    strategy = status.strategy === "semantic-gemini" ? "semantic-gemini" : status.strategy === "semantic-local" ? "semantic-local" : "heuristic";
-    geminiKey = status.hasKey ? "••••••••" : "";
+    strategy = status.strategy === "semantic-openai" ? "semantic-openai" : status.strategy === "semantic-local" ? "semantic-local" : "heuristic";
     localLlmUrl = status.hasLocalUrl ? localLlmUrl : "http://127.0.0.1:8080";
   } catch { /* not in Tauri (browser dev): keep defaults */ }
 }
 onMount(refresh);
 onMount(readStrategy);
+onMount(loadAiProviders);
 onMount(() => { void reloadSetupState(); });
 $effect(() => {
   const setupBusy = whisperBusy || llmSetupBusy || smallBusy;
@@ -165,7 +191,7 @@ $effect(() => {
       <span class="badge" class:ok={runtimeStore.ready}>{runtimeStore.ready ? "all systems ready" : "engine incomplete"}</span>
     </div>
     <div class="stage-body">
-      <div class="settings-wrap stack">
+      <div class="stack">
 
         <div class="panel">
           <div class="panel-title"><span class="eyebrow">Runtime</span></div>
@@ -223,27 +249,41 @@ $effect(() => {
         <div class="panel">
           <div class="panel-title"><span class="eyebrow">Highlight strategy</span></div>
           <div class="stack">
-            <button class="strategy-card" class:on={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "", "", "")}>
+            <button class="strategy-card" class:on={strategy === "heuristic"} disabled={strategyBusy} onclick={() => saveStrategy("heuristic", "", localLlmUrl, localLlmModel)}>
               <span class="spread"><strong>Heuristic (offline)</strong>{#if strategy === "heuristic"}<span class="badge ok">active</span>{/if}</span>
               <p>Score segments by speech density + keywords. No API key, works offline.</p>
             </button>
-            <button class="strategy-card" class:on={strategy === "semantic-gemini"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>
-              <span class="spread"><strong>Semantic (Gemini BYOK)</strong>{#if strategy === "semantic-gemini"}<span class="badge ok">active</span>{/if}</span>
-              <p>Use your Gemini API key to rank segments semantically.</p>
-            </button>
-            <button class="strategy-card" class:on={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>
+            <div class="strategy-card" class:on={strategy === "semantic-openai"}>
+              <span class="spread"><strong>Cloud provider (OpenAI-compatible)</strong>{#if strategy === "semantic-openai"}<span class="badge ok">active</span>{/if}</span>
+              <p>Use a provider endpoint and model of your choice. API keys are stored locally and never displayed.</p>
+              {#each providers as provider (provider.id)}
+                <div class="spread" style="border-top:1px solid var(--line-soft);padding:.55rem 0;">
+                  <button class="btn btn-sm btn-quiet" disabled={strategyBusy || activeProviderId === provider.id} onclick={() => activateProvider(provider.id)}>{activeProviderId === provider.id ? "Active ✓" : "Activate"}</button>
+                  <span class="note" style="margin:0;flex:1;"><strong>{provider.name}</strong> · {provider.model} · {provider.baseUrl} · {provider.hasKey ? "key saved" : "no key"}</span>
+                  <button class="btn btn-sm btn-quiet" disabled={strategyBusy} onclick={() => openProviderForm(provider)}>Edit</button>
+                  <button class="btn btn-sm btn-quiet" disabled={strategyBusy} onclick={() => removeProvider(provider)}>Delete</button>
+                </div>
+              {/each}
+              <button class="btn btn-sm" onclick={() => openProviderForm()}>+ Add provider</button>
+            </div>
+            <button class="strategy-card" class:on={strategy === "semantic-local"} disabled={strategyBusy} onclick={() => saveStrategy("semantic-local", "", localLlmUrl, localLlmModel)}>
               <span class="spread"><strong>Local LLM (offline)</strong>{#if strategy === "semantic-local"}<span class="badge ok">active</span>{/if}</span>
               <p>Rank with the locally installed Qwen model via llama.cpp — no key. Runtime and model are optional and must be installed above first.</p>
             </button>
           </div>
-          {#if strategy === "semantic-gemini"}
-            <label class="field"><span class="field-label">Gemini API key</span><input type="password" value={geminiKey} oninput={(e) => geminiKey = e.currentTarget.value} placeholder="AIza..." /></label>
-            <button class="btn btn-sm" disabled={strategyBusy || geminiKey.length < 10} onclick={() => saveStrategy("semantic-gemini", geminiKey, localLlmUrl, localLlmModel)}>Save key</button>
+          {#if providerFormOpen}
+            <div class="stack" style="border-top:1px solid var(--line-soft);padding-top:.8rem;margin-top:.8rem;">
+              <label class="field"><span class="field-label">Name</span><input bind:value={providerName} placeholder="My provider" /></label>
+              <label class="field"><span class="field-label">Base URL</span><input bind:value={providerBaseUrl} placeholder="https://api.openai.com/v1" /></label>
+              <label class="field"><span class="field-label">API Key</span><input type="password" autocomplete="new-password" bind:value={providerApiKey} placeholder={editingProviderId && providers.find(p => p.id === editingProviderId)?.hasKey ? "Key saved — enter a new one to replace" : "API key"} /></label>
+              <label class="field"><span class="field-label">Model</span><input bind:value={providerModel} list="provider-model-suggestions" placeholder="model-name" /><datalist id="provider-model-suggestions">{#each suggestedModels as model}<option value={model}></option>{/each}</datalist></label>
+              <div class="field-row"><button class="btn btn-sm" disabled={strategyBusy || !providerName.trim() || !providerBaseUrl.trim() || !providerModel.trim() || (!editingProviderId && providerApiKey.trim().length < 10)} onclick={saveProvider}>{strategyBusy ? "Saving…" : "Save provider"}</button><button class="btn btn-sm btn-quiet" onclick={() => { providerFormOpen = false; providerApiKey = ""; }}>Cancel</button></div>
+            </div>
           {/if}
           {#if strategy === "semantic-local"}
-            <label class="field"><span class="field-label">Local LLM URL</span><input type="text" value={localLlmUrl} oninput={(e) => localLlmUrl = e.currentTarget.value} placeholder="http://127.0.0.1:8080" /></label>
-            <label class="field"><span class="field-label">Model</span><input type="text" value={localLlmModel} oninput={(e) => localLlmModel = e.currentTarget.value} placeholder="qwen2.5-3b-instruct" /></label>
-            <button class="btn btn-sm" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", geminiKey, localLlmUrl, localLlmModel)}>Save</button>
+            <label class="field"><span class="field-label">Local LLM URL</span><input type="text" bind:value={localLlmUrl} placeholder="http://127.0.0.1:8080" /></label>
+            <label class="field"><span class="field-label">Model</span><input type="text" bind:value={localLlmModel} placeholder="qwen2.5-3b-instruct" /></label>
+            <button class="btn btn-sm" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", "", localLlmUrl, localLlmModel)}>Save</button>
           {/if}
         </div>
 

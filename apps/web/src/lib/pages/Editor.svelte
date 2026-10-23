@@ -1,12 +1,14 @@
 <script lang="ts">
   import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
   import { onDestroy } from "svelte";
+  import { enqueueProjectSave } from "../project-save-queue.ts";
   import { studioState } from "../studio-state.svelte.ts";
   import Icon from "../icons.svelte";
   import { addRange, captionsFromTranscript, createEditorState, createEditorStateFromVariant, loadTranscriptCaptions, moveRange, removeCaption, removeRange, setCropKeyframes, setSceneLayouts, setSpeakerMap, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../packages/editor-core/index.ts";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
   import type { Caption, CropKeyframe, SceneLayout } from "../../../../../packages/contracts/render-plan.ts";
-  import { cropCenterAt, trackFacePath } from "../../../../../packages/media-engine/reframe/index.ts";
+  import { cropCenterAt } from "../../../../../packages/media-engine/reframe/index.ts";
+  import { cropKeyframesFromPath } from "../../../../../packages/media-engine/reframe/crop-keyframes.ts";
 
   // Keep-alive mounted by +layout.svelte: re-read the Studio state whenever
   // this page becomes visible, so analysis results show up after navigation.
@@ -21,9 +23,14 @@
   let state: EditorState = createEditorState("demo-source", 60, fallback);
   let saved = false;
   let saveError = "";
+  let projectRevision = 0;
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let powered = false;
   let playing = false;
+  let videoError = "";
+  let previewPath = "";
+  let previewBusy = false;
+  let previewFallbackTried = false;
   let currentTime = 1;
   let video: HTMLVideoElement;
   let activeCaptionId = "";
@@ -153,11 +160,12 @@
     const intervals = transcript.segments.filter((segment) => segment.speakerId).map((segment) => ({ start: segment.start, end: segment.end, speakerId: segment.speakerId }));
     cropBusy = true; cropMessage = "Analyzing local frames…";
     try {
-      const raw = await invoke<Array<{ time: number; centerX: number; centerY: number; speakerId?: string; faceIndex: number; confidence: number; sourceArtifactId: string; sceneId: number }>>("analyze_crop_path", { path: sourcePath, duration: Math.min(sourceDuration, 1800), speakerIntervals: intervals, faceMapping: { confirmed: studioState.speakerFaceConfirmed, sourceArtifactId: transcript.sourceArtifactId, matches: studioState.speakerFaceMatches }, sourceArtifactId: state.plan.sourceArtifactId });
-      const frames = raw.map((item) => ({ time: item.time, detections: [{ time: item.time, x: item.centerX - 0.05, y: item.centerY - 0.05, width: 0.1, height: 0.1, confidence: item.confidence }] }));
-      const tracked = trackFacePath(frames);
+      const raw = await invoke<Array<{ time: number; centerX: number; centerY: number; speakerId: string | null; faceIndex: number; confidence: number; sourceArtifactId: string; sceneId: number }>>("analyze_crop_path", { path: sourcePath, duration: Math.min(sourceDuration, 1800), speakerIntervals: intervals, faceMapping: { confirmed: studioState.speakerFaceConfirmed, sourceArtifactId: transcript.sourceArtifactId, matches: studioState.speakerFaceMatches }, sourceArtifactId: state.plan.sourceArtifactId });
+      // The Rust command already tracked and smoothed the path; map it onto the
+      // contract as-is. Re-tracking here would smooth the path a second time and
+      // drift the crop away from the subject.
       const confirmedMapping = studioState.speakerFaceConfirmed && studioState.transcript?.sourceArtifactId === state.plan.sourceArtifactId && Object.keys(studioState.speakerFaceMatches).length > 0;
-      const keys: CropKeyframe[] = tracked.points.map((point) => { const item = raw.find((value) => value.time === point.time); const mapped = !!item?.speakerId && confirmedMapping && !!studioState.speakerFaceMatches[item.speakerId]; return { time: point.time, centerX: Math.max(0, Math.min(1, point.x + point.width / 2)), centerY: Math.max(0, Math.min(1, point.y + point.height / 2)), speakerId: mapped ? item?.speakerId : undefined, sourceFaceId: mapped ? studioState.speakerFaceMatches[item!.speakerId!] : undefined, sourceArtifactId: state.plan.sourceArtifactId, sceneId: item?.sceneId, confidence: mapped ? point.confidence : Math.min(0.49, point.confidence), confirmed: false }; });
+      const keys: CropKeyframe[] = cropKeyframesFromPath(raw, { speakerFaceMatches: studioState.speakerFaceMatches, mappingConfirmed: confirmedMapping, sourceArtifactId: state.plan.sourceArtifactId });
       state = setSpeakerMap(state, studioState.speakerFaceConfirmed && studioState.transcript?.sourceArtifactId === state.plan.sourceArtifactId ? { ...studioState.speakerFaceMatches } : {});
       state = setCropKeyframes(state, keys); savePlan(); trackingEnabled = false;
       cropMessage = keys.length ? `${keys.length} crop points ready for review. Approve tracking to use them in export.` : "No usable face path; export will use center crop.";
@@ -194,9 +202,32 @@
   function approveScenes() { state = setSceneLayouts(state, (state.plan.sceneLayouts ?? []).map((scene) => ({ ...scene, confirmed: true }))); savePlan(); }
   function disableScenes() { state = setSceneLayouts(state, []); savePlan(); }
 
+  function handleVideoError() {
+    if (video?.error?.code === 4 && !isRemoteSource(sourcePath) && !previewFallbackTried && isTauri()) {
+      previewFallbackTried = true;
+      previewBusy = true;
+      videoError = "Preparing a video preview compatible with Linux…";
+      void invoke<string>("prepare_video_preview", { path: sourcePath })
+        .then((path) => { previewPath = path; videoError = ""; })
+        .catch((error) => { videoError = `Could not prepare a compatible preview: ${String(error)}`; })
+        .finally(() => { previewBusy = false; });
+      return;
+    }
+    videoError = isRemoteSource(sourcePath)
+      ? "This online video cannot be previewed here. Render it from Studio or open a local video file."
+      : video?.error?.code === 4
+        ? "This video format or codec is not supported by the preview."
+        : "Could not load the source video. Check that the original file still exists and is readable.";
+  }
+  function isRemoteSource(path: string) { return path.startsWith("http://") || path.startsWith("https://"); }
   function loadFromStudio() {
     candidates = studioState.highlights.length ? studioState.highlights : [fallback];
     sourcePath = studioState.sourcePath;
+    projectRevision = studioState.projectRevision;
+    previewPath = sourcePath;
+    previewBusy = false;
+    previewFallbackTried = false;
+    videoError = "";
     sourceDuration = studioState.sourceDuration || 60;
     powered = sourcePath !== "";
     editingVariantId = studioState.editingVariantId;
@@ -250,23 +281,35 @@
     if (!isTauri() || !studioState.projectId || !selectedId) return;
     saved = false; saveError = "";
     try {
-      const project = await invoke<Record<string, unknown>>("project_get", { id: studioState.projectId });
-      if (editingVariantId) {
-        const variants = studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant);
-        const plans = { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan };
-        await invoke("project_save", { project: { ...project, variants, plans, selectedVariantId: editingVariantId } });
-        studioState.variants = variants; studioState.plans = plans;
-      } else {
-        const plans = { ...studioState.plans, [selectedId]: state.plan };
-        await invoke("project_save", { project: { ...project, selectedId, plans } });
+      await enqueueProjectSave(studioState.projectId, async () => {
+        const project = await invoke<Record<string, unknown>>("project_get", { id: studioState.projectId });
+        const plans = editingVariantId
+          ? { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan }
+          : { ...studioState.plans, [selectedId]: state.plan };
+        const variants = editingVariantId
+          ? studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant)
+          : studioState.variants;
+        const savedProject = await invoke<Record<string, unknown>>("project_save", {
+          project: {
+            ...project,
+            ...(editingVariantId ? { variants, selectedVariantId: editingVariantId } : { selectedId }),
+            plans,
+            revision: Number(project.revision ?? projectRevision),
+          },
+        });
+        projectRevision = Number(savedProject.revision ?? projectRevision);
+        studioState.projectRevision = projectRevision;
         studioState.plans = plans;
-      }
+        if (editingVariantId) studioState.variants = variants;
+      });
       studioState.plan = state.plan;
       saved = true;
       if (saveTimer) clearTimeout(saveTimer);
       saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600);
     } catch (error) {
-      saved = false; saveError = `Could not save render plan: ${String(error)}`;
+      saved = false; saveError = String(error).includes("PROJECT_REVISION_CONFLICT")
+        ? "This project changed in another view. Reload the project before saving again."
+        : `Could not save render plan: ${String(error)}`;
     }
   }
   onDestroy(() => { if (saveTimer) clearTimeout(saveTimer); });
@@ -302,7 +345,8 @@
       <dl class="kv"><dt>Duration</dt><dd class="tc">{clock(sourceDuration)}</dd><dt>Selected</dt><dd class="tc">{clock(range.start)}–{clock(range.end)}</dd><dt>Plan</dt><dd class="tc">v{state.plan.version}</dd></dl>
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
       {#if !isTauri()}<p class="note">Save and export are available in the installed desktop app.</p>{/if}
-      <button class="btn btn-primary btn-wide" onclick={save}>Save render plan</button>
+      <button class="btn btn-primary btn-wide" onclick={save}>Save edits</button>
+      <p class="note">Step 1: choose your clip. Step 2: adjust the preview and dates. Step 3: save edits. To create an MP4, return to Studio and choose Render.</p>
       {#if saveError}<div class="message" role="alert">{saveError}</div>{/if}
       {#if saved}<div class="save-toast" role="status" aria-live="polite"><Icon name="check" size={16} />Saved locally</div>{/if}
     </div>
@@ -313,7 +357,8 @@
       <div class="stage-head"><div class="stage-title"><span class="badge">cut / 01</span><span class="stage-name">{editingVariantId ? (studioState.variants.find((variant) => variant.id === editingVariantId)?.title ?? "Transcript variant") : (state.selected?.title ?? "Demo highlight")}</span></div><span class="badge ok">local timeline</span></div>
       <div class="stage-body">
         <div class="canvas-view">
-          {#if powered}<video bind:this={video} aria-label="Video preview" src={convertFileSrc(sourcePath)} ontimeupdate={syncTime} onplay={() => playing = true} onpause={() => playing = false} onloadedmetadata={() => { sourceDuration = video.duration || sourceDuration; seek(range.start); }}><track kind="captions" /></video>{:else}<div class="empty-canvas"><span class="eyebrow">Preview canvas</span><strong>Open Studio and analyze a source</strong><span class="note">The editor workspace is ready with a demo cut.</span></div>{/if}
+          {#if powered && isRemoteSource(sourcePath)}<div class="empty-canvas"><span class="eyebrow">Online video</span><strong>Preview in Studio</strong><span class="note">Local Editor preview works with video files saved on this device.</span></div>{:else if powered}<video bind:this={video} aria-label="Video preview" src={convertFileSrc(previewPath)} onerror={handleVideoError} ontimeupdate={syncTime} onplay={() => { playing = true; videoError = ""; }} onpause={() => playing = false} onloadedmetadata={() => { videoError = ""; sourceDuration = video.duration || sourceDuration; seek(range.start); }}><track kind="captions" /></video>{:else}<div class="empty-canvas"><span class="eyebrow">Preview canvas</span><strong>Open Studio and analyze a source</strong><span class="note">The editor workspace is ready with a demo cut.</span></div>{/if}
+          {#if previewBusy}<div class="message preview-error" role="status">Preparing a preview-friendly copy of the video. This may take a few minutes.</div>{:else if videoError}<div class="message error preview-error" role="alert">{videoError}</div>{/if}
           <div class="frame-guide {state.plan.aspectRatio === "9:16" ? "r916" : state.plan.aspectRatio === "1:1" ? "r11" : "r169"}"><i></i></div>
         </div>
         <div class="transport"><button class="btn btn-icon" aria-label={playing ? "Pause" : "Play"} onclick={togglePlay}><Icon name={playing ? "pause" : "play"} size={14} /></button><span class="tc">{clock(currentTime)}</span><span class="transport-track"><span style={`width:${pct(currentTime)}`}></span></span><span class="tc muted">{clock(sourceDuration)}</span></div>
@@ -345,23 +390,32 @@
   </section>
 
   <aside class="bench-right">
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Clip</span></span><span class="badge volt">active</span></div>
-        <div class="field-row"><label class="field"><span class="field-label">In</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">Out</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div>
+    <div class="panel">
+      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Clip · edit the selected video segment</span></span><span class="badge volt">active</span></div>
+      <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" min="0" max={range.end - 0.1} step="0.1" value={range.start} onchange={(event) => setRangeEdge("start", Number(event.currentTarget.value))} /></label><label class="field"><span class="field-label">End</span><input type="number" min={range.start + 0.1} max={sourceDuration} step="0.1" value={range.end} onchange={(event) => setRangeEdge("end", Number(event.currentTarget.value))} /></label></div>
       <div class="spread"><span class="note">Range {activeRangeIndex + 1} of {state.plan.ranges.length} · {clock(range.end - range.start)}</span><span class="note">Order is export order</span></div>
       <div class="field-row"><button class="btn btn-sm btn-quiet" onclick={addRangeAfter}>+ Add range</button><button class="btn btn-sm btn-quiet" disabled={activeRangeIndex === 0} onclick={() => reorderRange(-1)}>Move earlier</button><button class="btn btn-sm btn-quiet" disabled={activeRangeIndex === state.plan.ranges.length - 1} onclick={() => reorderRange(1)}>Move later</button><button class="btn btn-danger btn-sm" disabled={state.plan.ranges.length <= 1} onclick={deleteActiveRange}>Remove</button></div>{#each ["9:16", "1:1", "16:9"] as ratio}<button class="seg-item" class:on={state.plan.aspectRatio === ratio} onclick={() => setAspect(ratio as "9:16" | "1:1" | "16:9")}>{ratio}</button>{/each}
-      </div>
+    </div>
+    <details class="editor-disclosure">
+      <summary>Speaker framing · optional</summary>
       <div class="crop-review"><div class="panel-head"><span class="eyebrow">Speaker framing</span><span class="badge" class:ok={trackingEnabled}>{trackingEnabled ? "approved" : "center crop"}</span></div><p class="note">{cropMessage || "Local face path is used only after explicit review."}</p><div class="field-row"><button class="btn btn-sm" disabled={!powered || cropBusy || !studioState.transcript} onclick={analyzeCropPath}>{cropBusy ? "Analyzing…" : "Analyze local crop path"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.cropKeyframes?.length} onclick={() => setTracking(!trackingEnabled)}>{trackingEnabled ? "Use center crop" : "Approve tracking"}</button><button class="btn btn-sm btn-quiet" disabled={!trackingEnabled} onclick={adjustCropCenter}>Adjust center here</button></div><div class="field-row"><label>Crop X <input type="range" min="0" max="1" step="0.01" value={cropCenterAt(state.plan.cropKeyframes ?? [], currentTime).x} oninput={(event) => updateManualCropCenter(Number(event.currentTarget.value))} /></label></div></div>
       <p class="note">{clock(range.end - range.start)} selected · {trackingEnabled && state.plan.cropKeyframes?.some((key) => key.confirmed && key.confidence >= 0.5) ? "approved speaker tracking" : "center crop fallback"} · {state.plan.sceneLayouts?.some((scene) => scene.confirmed) ? "reviewed scene layout" : "static solo layout"}</p>
+    </details>
+    <details class="editor-disclosure">
+      <summary>Scene layouts · optional</summary>
       <div class="scene-review"><div class="panel-head"><span class="eyebrow">Scene layouts</span><button class="btn btn-sm" disabled={!powered || sceneBusy} onclick={analyzeScenes}>{sceneBusy ? "Analyzing…" : "Analyze scenes"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.sceneLayouts?.length} onclick={approveScenes}>Approve scenes</button><button class="btn btn-sm btn-quiet" onclick={disableScenes}>Disable</button></div><p class="note">{sceneMessage || "Local shot analysis is bounded; review each proposed layout before export."}</p>{#if state.plan.sceneLayouts?.length}{#each state.plan.sceneLayouts as scene, index}<div class="field-row"><span class="note">{clock(scene.start)}–{clock(scene.end)} · {Math.round(scene.confidence * 100)}%</span><select value={scene.layout} onchange={(event) => chooseLayout(index, event.currentTarget.value as SceneLayout["layout"])}><option value="solo">Solo</option><option value="side-by-side">Side by side</option></select></div>{/each}{:else}<p class="note">No reviewed scenes. Export keeps the static solo layout.</p>{/if}</div>
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Text &amp; hook</span></span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Caption</button></div>
+    </details>
+    <details class="panel editor-disclosure">
+      <summary>Captions &amp; hook · optional</summary>
+      <div class="panel-head"><span class="panel-title"><span class="eyebrow">Text &amp; hook</span></span><button class="btn btn-sm btn-quiet" onclick={addCaption}>+ Caption</button></div>
       {#if activeCaption}
         <textarea aria-label="Caption text" value={draftCaption} oninput={(event) => setCaptionText(event.currentTarget.value)}></textarea>
-        <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label></div>
+      <div class="field-row"><label class="field"><span class="field-label">Start</span><input type="number" step="0.1" value={activeCaption.start} onchange={(event) => { const next = { ...activeCaption, start: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label><label class="field"><span class="field-label">End</span><input type="number" step="0.1" value={activeCaption.end} onchange={(event) => { const next = { ...activeCaption, end: Number(event.currentTarget.value) }; try { state = upsertCaption(state, next); savePlan(); } catch { /* keep the last valid caption */ } }} /></label></div>
         <button class="btn btn-danger btn-wide btn-sm" onclick={deleteCaption}>Remove caption</button>
       {:else}<p class="note">No caption cue yet. Add one or load transcript cues.</p>{/if}
       <div class="panel" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
         {#if state.plan.hook}<div class="spread"><span class="eyebrow">Hook · first five seconds</span><span class="note tc" style="margin:0;">{clock(state.plan.hook.start)}–{clock(state.plan.hook.end)}</span></div><textarea aria-label="Hook text" value={state.plan.hook.text} oninput={(event) => updateHookText(event.currentTarget.value)}></textarea>{:else}<p class="note" style="margin:0;">No hook attached to this cut.</p>{/if}
       </div>
-    </div>
+    </details>
   </aside>
 </main>

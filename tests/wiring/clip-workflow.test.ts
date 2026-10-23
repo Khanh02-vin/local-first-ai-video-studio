@@ -1,21 +1,30 @@
 import { strict as assert } from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const studio = readFileSync(join(root, "apps/web/src/lib/pages/Studio.svelte"), "utf8");
 const editor = readFileSync(join(root, "apps/web/src/lib/pages/Editor.svelte"), "utf8");
-const bridge = readFileSync(join(root, "apps/desktop/src-tauri/src/main.rs"), "utf8");
+const rustDirs = [
+  join(root, "apps/desktop/src-tauri/src"),
+  join(root, "apps/desktop/src-tauri/crates/render-engine/src"),
+];
+// The Rust shell lives in modules now and the render path lives in the render engine
+// crate, so the bridge is read from both trees.
+const bridge = rustDirs
+  .flatMap((dir) => readdirSync(dir).filter((name) => name.endsWith(".rs")).map((name) => join(dir, name)))
+  .map((path) => readFileSync(path, "utf8"))
+  .join("\n");
 const store = readFileSync(join(root, "apps/desktop/src-tauri/src/project_store.rs"), "utf8");
 const ranking = readFileSync(join(root, "packages/media-engine/related-videos/index.ts"), "utf8");
 
 assert.match(studio, /selectedIds\s*=\s*\$state<string\[]>/, "Studio must support persisted multi-selection");
 assert.match(studio, /function toggleCandidate/, "candidate selection must be toggleable");
 assert.match(studio, /async function renderSelected/, "selected clips must render as a batch");
-assert.match(studio, /plan\s*\}\);/, "render must pass the selected RenderPlan");
+assert.match(studio, /request:\s*\{ input:\s*inputPath,\s*output,\s*plan\s*\}\s*satisfies\s*RenderRequest/, "render must pass input, output and the selected RenderPlan as one typed request");
 assert.match(studio, /selectedIds\s*,\s*plans:/, "multi-selection must be saved on the project");
-assert.match(bridge, /plan:\s*Option<serde_json::Value>/, "render command must accept an optional plan");
+assert.match(bridge, /fn render_video\([\s\S]*request:\s*RenderRequest[\s\S]*on_progress:\s*tauri::ipc::Channel<RenderProgress>/, "render command must take a typed request and a progress channel");
 assert.match(studio, /generate_transcript_variants/, "Studio must request AI transcript variants via Tauri");
 assert.match(studio, /async function renderVariant/, "each transcript variant must export independently");
 assert.match(editor, /createEditorStateFromVariant/, "Editor must build a RenderPlan from transcript variants");

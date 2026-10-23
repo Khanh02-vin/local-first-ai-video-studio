@@ -57,10 +57,43 @@
 
   // Crash report from the previous run (Rust panic hook → panic.log → last_panic).
   let crashLog = $state("");
+  // Titlebar window controls surface failures instead of swallowing them: a dead
+  // button that hides its own error is undiagnosable (Wayland can reject some
+  // GTK window requests). The banner clears itself after a few seconds.
+  let titlebarError = $state("");
 
-  async function minimize() { if (isTauri()) await getCurrentWindow().minimize().catch(() => {}); }
-  async function toggleMax() { if (isTauri()) await getCurrentWindow().toggleMaximize().catch(() => {}); }
-  async function closeWindow() { if (isTauri()) await getCurrentWindow().close().catch(() => {}); }
+  async function minimize() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().minimize();
+    } catch (error) {
+      console.error("[titlebar] minimize failed", error);
+      titlebarError = `Không thu nhỏ được cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
+
+  async function toggleMax() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().toggleMaximize();
+    } catch (error) {
+      console.error("[titlebar] toggleMaximize failed", error);
+      titlebarError = `Không đổi được kích thước cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
+
+  async function closeWindow() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().close();
+    } catch (error) {
+      console.error("[titlebar] close failed", error);
+      titlebarError = `Không đóng được cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
 
   onMount(() => {
     // Block the browser's default file-drop navigation once for the whole app
@@ -103,6 +136,9 @@
       </div>
     </div>
   {/if}
+  {#if titlebarError}
+    <div class="titlebar-error" role="alert"><span>{titlebarError}</span></div>
+  {/if}
   {#if crashLog}
     <div class="crash-banner" role="alert">
       <div class="crash-body">
@@ -122,6 +158,7 @@
       {#each items as item}
         <a class="rail-link" class:on={isOn(item)} href={item.href} title={item.label} aria-label={item.label}>
           <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : item.id === "project" ? "folder" : "studio"} />
+          <span>{item.label}</span>
         </a>
       {/each}
       <div class="rail-foot">

@@ -16,6 +16,7 @@
     transcript: unknown | null;
     highlights: Highlight[];
     selectedId: string | null;
+    selectedIds?: string[];
     plans: Record<string, RenderPlan>;
     renders: Array<{ output: string; status: string; highlightId: string }>;
     updatedAt: string;
@@ -42,6 +43,7 @@
       studioState.transcript = project.transcript as typeof studioState.transcript;
       studioState.highlights = project.highlights ?? [];
       studioState.selectedId = project.selectedId ?? project.highlights[0]?.id ?? "";
+      studioState.selectedIds = project.selectedIds?.length ? project.selectedIds : (studioState.selectedId ? [studioState.selectedId] : []);
       studioState.plans = project.plans ?? {};
       studioState.plan = studioState.plans[studioState.selectedId] ?? null;
       await goto("/");
@@ -59,24 +61,22 @@
         {:else if projects.length}
           <div class="stack">
             {#each projects as project (project.id)}
-              <article class="card project-row">
+              <article class="card preview-card">
                 <div class="preview-info">
                   <strong>{project.title || project.sourceName}</strong>
                   <span>{project.sourceName} · {project.highlights?.length ?? 0} clips · updated {new Date(Number(project.updatedAt) * 1000).toLocaleString()}</span>
                   <span class="note">{project.sourcePath}</span>
                 </div>
-                <button class="cta small" onclick={() => openProject(project.id)}>Open project</button>
+                <button class="btn btn-primary btn-sm" onclick={() => openProject(project.id)}>Open project</button>
               </article>
             {/each}
           </div>
-        {:else}<div class="card"><p class="hint">No projects saved yet. Load a local video in Studio to create one.</p><a class="cta" href="/">Open Studio</a></div>{/if}
+        {:else}<div class="card"><p class="hint">No projects saved yet. Load a local video in Studio to create one.</p><a class="btn btn-primary" href="/">Open Studio</a></div>{/if}
       </div>
     </div>
   </section>
 </main>
 
 <style>
-  .project-row { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
-  .project-row .preview-info { min-width:0; }
-  .project-row .note { overflow-wrap:anywhere; }
+  .preview-info .note { overflow-wrap: anywhere; }
 </style>

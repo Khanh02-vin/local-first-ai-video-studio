@@ -68,7 +68,7 @@
           {#if video.thumbnail}<img src={video.thumbnail} alt="" class="youtube-thumb" />{/if}
           <div class="preview-info"><strong>{video.title}</strong><span>{video.videoId}</span></div>
           <a class="btn btn-sm btn-quiet" href={video.url} target="_blank" rel="noreferrer">Open ↗</a>
-          <button class="ghost" type="button" onclick={() => copy(video.url)}>Copy URL</button>
+          <button class="btn btn-sm btn-quiet" type="button" onclick={() => copy(video.url)}>Copy URL</button>
         </div>
       {/each}
     </div>

@@ -6,18 +6,36 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[workspace]
+members = [".", "crates/render-engine", "crates/lfai-render"]
+
 [dependencies]
-tauri = { version = "2", features = [] }
+render-engine = { path = "crates/render-engine" }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+# Second launches hand their argv to the running instance and exit before the
+# GTK app id is claimed — without it, "open the app again" made the running
+# instance panic with "webview with label main already exists".
+tauri-plugin-single-instance = "2"
 # Lets the static webview (origin tauri://localhost) call the RAG sidecar on
 # http://127.0.0.1 — the HTTP runs in Rust, so webview CSP/CORS do not apply.
 tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
+# Spawns the analysis worker inside a process group (Unix) / a Job Object with
+# KILL_ON_JOB_CLOSE (Windows), so cancelling one pid takes down the whole tree —
+# the whisper and ffmpeg grandchildren — on every platform we ship.
+command-group = "5"
+# Typeshare marks the structs that cross the Rust → TypeScript IPC boundary, so the
+# TypeScript contract is generated from these declarations instead of hand-written.
+# A regular dependency, not a dev one: main.rs carries the attribute, so the release
+# build needs it too.
+typeshare = "1.0.5"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ed25519-dalek = { version = "2", features = ["std"] }
 base64 = "0.22"
 time = { version = "0.3", features = ["parsing", "macros"] }
+url = "2"
 
 [features]
 default = ["custom-protocol"]

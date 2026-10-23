@@ -12,7 +12,10 @@ export function rankCandidates(source: number[], vectors: number[][], candidates
   }).sort((a, b) => b.score - a.score).map(({ video }) => video);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Browser guard: `process` does not exist in a webview, and evaluating the
+// right-hand side at import time would crash hydration for every UI that
+// imports this module.
+if (typeof process !== "undefined" && process.argv && import.meta.url === `file://${process.argv[1]}`) {
   const videos = [{ videoId: "a", title: "a", thumbnail: "", url: "" }, { videoId: "b", title: "b", thumbnail: "", url: "" }];
   if (rankCandidates([1, 0], [[0, 1], [1, 0]], videos)[0].videoId !== "b") throw new Error("related ranking self-check failed");
 }

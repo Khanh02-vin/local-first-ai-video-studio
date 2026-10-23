@@ -88,7 +88,7 @@ packages/contracts
 packages/media-engine
 packages/editor-core
 adapters/local
-adapters/ffmpeg
+apps/desktop/src-tauri/crates/render-engine  # one final renderer (ADR-002)
 services/ai-pipeline
 ```
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { invoke, isTauri } from "@tauri-apps/api/core";
+  import { invoke, isTauri, Channel } from "@tauri-apps/api/core";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
@@ -9,19 +9,31 @@
   import { applySpeakerIntervals, transcriptSpeakerIds, speakerExamples } from "../../../../../services/ai-pipeline/diarization.ts";
   import type { EditVariant, RenderPlan } from "../../../../../packages/contracts/render-plan.ts";
   import { mapEditVariantProposals, VARIANT_PROMPT_VERSION } from "../../../../../services/ai-pipeline/variants.ts";
+  import { enqueueProjectSave } from "../project-save-queue.ts";
   import { studioState } from "../studio-state.svelte.ts";
   import { createEditorState, createEditorStateFromVariant } from "../../../../../packages/editor-core/index.ts";
   import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
   import Icon from "../icons.svelte";
   import RelatedYoutubeSearch from "../components/RelatedYoutubeSearch.svelte";
+  // Generated from the Rust declarations in apps/desktop/src-tauri/src/main.rs: if the
+  // wire contract changes, regenerate (`npm run contracts:generate`) and the drift test
+  // fails until both sides agree. Hand-written copies here caused the probe bug where
+  // TypeScript expected camelCase keys that ffprobe/Rust never sent.
+  import type { ProbeMetadata, RenderProgress } from "../../../../../packages/contracts/generated/generated.ts";
 
   // Keep-alive mounted by +layout.svelte: `active` tells this page it is the
   // visible one, so background polls only run while the user can see them.
   let { active = true }: { active?: boolean } = $props();
 
+  type AnalysisResult = { transcript?: Transcript; highlights?: Highlight[]; collections?: Collection[]; videoId?: string; title?: string; topic?: string };
+  type AnalysisJob = { status: string; phase: string; progress: number; chunkCompleted: number; chunkTotal: number; currentChunk?: number; result?: AnalysisResult; error?: string };
+  type RenderRequest = { input: string; output: string; plan: RenderPlan };
   type Meta = { name: string; duration: number; width: number; height: number };
+  const e2eVideo = import.meta.env.MODE === "desktop-e2e" && import.meta.env.VITE_DESKTOP_E2E === "1" ? import.meta.env.VITE_DESKTOP_E2E_VIDEO : "";
+  const e2eOutput = import.meta.env.MODE === "desktop-e2e" && import.meta.env.VITE_DESKTOP_E2E === "1" ? import.meta.env.VITE_DESKTOP_E2E_OUTPUT : "";
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
-  type Project = { id: string; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, RenderPlan>; variants?: EditVariant[]; selectedVariantId?: string | null; speakerFaceMatches?: { version: 1; sourceArtifactId: string; confirmed: boolean; matches: Record<string, string> } | null; renders: Array<{ output: string; status: string; highlightId: string }>; updatedAt: string };
+  type RenderRecord = { id?: string; output: string; status: "running" | "completed" | "failed" | "interrupted" | "cancelled"; highlightId: string; error?: string };
+  type Project = { id: string; revision: number; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, RenderPlan>; variants?: EditVariant[]; selectedVariantId?: string | null; speakerFaceMatches?: { version: 1; sourceArtifactId: string; confirmed: boolean; matches: Record<string, string> } | null; renders: RenderRecord[]; updatedAt: string };
 
   let projects = $state<Project[]>([]);
   let projectId = $state("");
@@ -33,12 +45,16 @@
   let message = $state("Drop a video to begin.");
   let busy = $state(false);
   let jobId = $state("");
+  let projectLinkWarning = $state(false);
   let phase = $state("");
   let progress = $state(0);
   let elapsedSeconds = $state(0);
+  let renderProgress = $state(0);
+  let rendering = $state(false);
   let timer: ReturnType<typeof setInterval> | undefined;
   let pollRun = 0;
   let watchStarted = false;
+  let watcherId = "";
   let timerStartedAt = 0;
   let highlights = $state<Highlight[]>([]);
   let collections = $state<Collection[]>([]);
@@ -80,12 +96,15 @@
   }
   let modelBusy = $state(false);
   let meta = $state<Meta | null>(null);
+  let sourceVerified = $state(false);
+  let probeError = $state("");
   let dragOver = $state(false);
   let resumableJobs = $state<JobRow[]>([]);
   let currentStep = $state<1 | 2 | 3 | 4>(1);
 
   async function choose() {
     if (!isTauri()) { message = "File dialogs only work in the desktop app — open the installed app to load a video."; return; }
+    if (e2eVideo) { await loadVideo(e2eVideo); return; }
     const path = await open({ multiple: false, directory: false, filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm"] }] });
     if (typeof path === "string") await loadVideo(path);
   }
@@ -198,30 +217,59 @@
     try { projects = await invoke<Project[]>("project_list"); } catch { projects = []; }
   }
 
-  async function persistProject(patch: Partial<Project> = {}) {
-    if (!isTauri() || !projectId) return;
-    const existing = projects.find((item) => item.id === projectId);
-    if (!existing) return;
-    const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, variants, selectedVariantId: selectedVariantId || null, speakerFaceMatches: speakerMatchesConfirmed && diarizedSourceId === (studioState.transcript?.sourceArtifactId ?? "") ? { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: speakerMatches } : null, ...patch };
+  async function persistProject(patch: Partial<Project> = {}): Promise<boolean> {
+    if (!isTauri() || !projectId) return false;
+    const saveProjectId = projectId;
+    return enqueueProjectSave(saveProjectId, async () => {
+      const existing = projects.find((item) => item.id === saveProjectId);
+      if (!existing) return false;
+      const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, variants, selectedVariantId: selectedVariantId || null, speakerFaceMatches: speakerMatchesConfirmed && diarizedSourceId === (studioState.transcript?.sourceArtifactId ?? "") ? { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: speakerMatches } : null, ...patch };
 
-    try {
-      const saved = await invoke<Project>("project_save", { project: next });
-      projects = [saved, ...projects.filter((item) => item.id !== saved.id)];
-    } catch (error) { message = `Project save failed: ${String(error)}`; }
+      try {
+        const saved = await invoke<Project>("project_save", { project: { ...next, revision: existing.revision } });
+        projects = [saved, ...projects.filter((item) => item.id !== saved.id)];
+        if (projectId === saveProjectId) studioState.projectRevision = saved.revision;
+        return true;
+      } catch (error) {
+        message = String(error).includes("PROJECT_REVISION_CONFLICT")
+          ? "Project changed elsewhere. Reload it before saving again."
+          : `Project save failed: ${String(error)}`;
+        return false;
+      }
+    });
+  }
+
+  async function persistRender(render: RenderRecord): Promise<boolean> {
+    const current = projects.find((item) => item.id === projectId)?.renders ?? [];
+    const renders = render.id ? current.map((item) => item.id === render.id ? render : item) : [...current, render];
+    if (render.id && !current.some((item) => item.id === render.id)) renders.push(render);
+    return persistProject({ renders });
+  }
+
+  function renderEntry(output: string, highlightId: string): RenderRecord {
+    return { id: crypto.randomUUID(), output, status: "running", highlightId };
   }
 
   async function openProject(id: string) {
     try {
       const project = await invoke<Project>("project_get", { id });
-      hydrateProject(project);
+      await hydrateProject(project);
     } catch (error) { message = `Could not open project: ${String(error)}`; }
   }
 
-  async function hydrateProject(project: Project) {
-    projectId = project.id; inputPath = project.sourcePath; meta = { name: project.sourceName, duration: project.sourceDuration, width: 0, height: 0 };
+  async function hydrateProject(loaded: Project) {
+    let project = loaded;
+    projects = [project, ...projects.filter((item) => item.id !== project.id)];
+    projectId = project.id; inputPath = project.sourcePath; sourceVerified = false; probeError = ""; studioState.projectRevision = project.revision; meta = { name: project.sourceName, duration: project.sourceDuration, width: 0, height: 0 };
+    const rendered = (project.renders ?? []).map((render) => render.status === "running" ? { ...render, status: "interrupted" as const } : render);
+    if (rendered.some((render, index) => render !== (project.renders ?? [])[index])) {
+      if (await persistProject({ renders: rendered })) project = projects.find((item) => item.id === project.id) ?? project;
+    }
+    applyDefaultRange(Number(project.sourceDuration ?? 0));
     await refreshDiarizationStatus();
     faceSamples = []; diarizationBusy = false; faceSamplesBusy = false;
-    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? ""; selectedIds = project.selectedIds ?? (selectedId ? [selectedId] : []);
+    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? ""; selectedIds = project.selectedIds?.length ? project.selectedIds : (selectedId ? [selectedId] : []);
+    studioState.selectedIds = selectedIds;
     studioState.projectId = project.id; studioState.sourcePath = project.sourcePath; studioState.sourceName = project.sourceName; studioState.sourceDuration = project.sourceDuration;
     studioState.highlights = highlights; studioState.transcript = project.transcript as typeof studioState.transcript; studioState.selectedId = selectedId;
     studioState.plans = project.plans ?? {}; studioState.variants = project.variants ?? []; studioState.selectedVariantId = project.selectedVariantId ?? ""; variants = studioState.variants; selectedVariantId = studioState.selectedVariantId;
@@ -234,8 +282,29 @@
     studioState.editingVariantId = ""; studioState.plan = studioState.plans[selectedId] ?? null;
     currentStep = highlights.length ? 4 : 2; message = "Project reopened.";
     if (project.sourcePath && !/^https?:\/\//i.test(project.sourcePath)) {
-      try { await invoke("probe_video", { path: project.sourcePath }); }
-      catch { message = "Source file is missing or unavailable. Re-link the original file to render."; }
+      try {
+        const probe = await invoke<ProbeMetadata>("probe_video", { path: project.sourcePath });
+        const stream = (probe.streams ?? []).find((item) => item.codec_type === "video");
+        const duration = Number(probe.format?.duration ?? 0);
+        if (!stream || !Number.isFinite(duration) || duration <= 0) throw new Error("MEDIA_NOT_VERIFIED: ffprobe returned no valid video stream or duration");
+        meta = { name: project.sourceName, duration, width: Number(stream.width ?? 0), height: Number(stream.height ?? 0) };
+        sourceVerified = true;
+        applyDefaultRange(duration);
+      } catch (error) { probeError = String(error); message = `Source could not be verified: ${probeError}`; }
+    } else sourceVerified = /^https?:\/\//i.test(project.sourcePath) && Number.isFinite(project.sourceDuration) && project.sourceDuration > 0;
+    if (!project.transcript || !project.highlights.length) {
+      if (project.analysisJobId) {
+      try {
+        const job = await invoke<AnalysisJob>("analysis_status", { id: project.analysisJobId });
+        if (job.status === "completed" && job.result) {
+          const result = job.result;
+          highlights = result.highlights ?? []; collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? ""; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : []; studioState.selectedIds = selectedIds;
+          studioState.highlights = highlights; studioState.selectedId = selectedId; studioState.transcript = result.transcript ?? null;
+          await persistProject({ analysisJobId: project.analysisJobId, transcript: result.transcript ?? null, highlights, selectedId });
+          message = highlights.length ? `${highlights.length} highlight candidates restored from analysis.` : "Analysis restored; no highlights found.";
+        } else if (job.status === "queued" || job.status === "running") void watch(project.analysisJobId, true);
+      } catch (error) { message = `Could not restore analysis job: ${String(error)}`; }
+      } else if (!project.transcript) message = "This project has no saved analysis result yet.";
     }
   }
 
@@ -248,24 +317,43 @@
     if (!isTauri() || projectId || !inputPath) return;
     try {
       const project = await invoke<Project>("project_create", { sourcePath: inputPath, sourceName: meta?.name ?? inputPath.split(/[\\\\/]/).pop() ?? inputPath, sourceDuration: meta?.duration ?? 0 });
-      projectId = project.id; studioState.projectId = project.id; projects = [project, ...projects];
+      projectId = project.id; studioState.projectId = project.id; studioState.projectRevision = project.revision; projects = [project, ...projects];
     } catch (error) { message = `Could not create project: ${String(error)}`; }
   }
 
+  /// Default analysis range: the whole video, capped at the 10-minute default.
+  /// The old hard-coded 600 s exceeded short videos and made the backend reject
+  /// "Start analysis" (INVALID_ANALYZE_RANGE) with no visible feedback.
+  function applyDefaultRange(duration: number) {
+    const seconds = Number.isFinite(duration) && duration > 0 ? Math.floor(duration) : 0;
+    analyzeStart = 0;
+    analyzeEnd = seconds > 0 ? Math.min(600, seconds) : 600;
+  }
+
   async function loadVideo(path: string) {
-    projectId = ""; studioState.projectId = ""; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
-    inputPath = path; highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; busy = false; meta = null; youtubeVideoId = "";
+    inputPath = path;
+    projectId = ""; sourceVerified = false; probeError = ""; studioState.projectId = ""; studioState.projectRevision = 0; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
+      jobId = ""; projectLinkWarning = false; busy = false; pollRun += 1; watchStarted = false; watcherId = ""; highlights = []; meta = null; youtubeVideoId = "";
+
     studioState.highlights = []; studioState.selectedId = "";
     await reconnectJobs(false);
     try {
-      const probe = JSON.parse(await invoke<string>("probe_video", { path }));
-      const stream = (probe.streams ?? []).find((s: { codec_type?: string }) => s.codec_type === "video");
-      meta = { name: path.split(/[\\/]/).pop() ?? path, duration: Number(probe.format?.duration ?? 0), width: Number(stream?.width ?? 0), height: Number(stream?.height ?? 0) };
-      studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; studioState.sourceDuration = Number(probe.format?.duration ?? 0);
-    } catch { meta = { name: path.split(/[\\/]/).pop() ?? path, duration: 0, width: 0, height: 0 }; studioState.sourcePath = path; studioState.sourceName = path.split(/[\\/]/).pop() ?? path; }
-    message = "Video loaded. Set the range and start analysis.";
-    await ensureProject();
-    await refreshProjects();
+      const probe = await invoke<ProbeMetadata>("probe_video", { path });
+        const stream = (probe.streams ?? []).find((item) => item.codec_type === "video");
+        const duration = Number(probe.format?.duration ?? 0);
+        if (!stream || !Number.isFinite(duration) || duration <= 0) throw new Error("MEDIA_NOT_VERIFIED: ffprobe returned no valid video stream or duration");
+        meta = { name: path.split(/[\\/]/).pop() ?? path, duration, width: Number(stream.width ?? 0), height: Number(stream.height ?? 0) };
+      studioState.sourcePath = path; studioState.sourceName = meta.name; studioState.sourceDuration = duration; sourceVerified = true;
+      applyDefaultRange(duration);
+      message = "Video loaded and verified. Set the range and start analysis.";
+      await ensureProject();
+      await refreshProjects();
+    } catch (error) {
+      probeError = String(error);
+      meta = { name: path.split(/[\\/]/).pop() ?? path, duration: 0, width: 0, height: 0 };
+      studioState.sourcePath = path; studioState.sourceName = meta.name; studioState.sourceDuration = 0;
+      message = `Video could not be verified: ${probeError}`;
+    }
   }
 
   function onDrop(event: DragEvent) {
@@ -320,18 +408,25 @@
 
   async function watch(id: string, resuming = true) {
     if (!active) { jobId = id; busy = true; return; }
-    if (watchStarted) return;
+    if (watchStarted && watcherId === id) return;
     watchStarted = true;
+    watcherId = id;
     const run = ++pollRun;
     jobId = id; busy = true; if (!resuming) { phase = "queued"; progress = 0; resetTimer(); timerStartedAt = Date.now(); } currentStep = 3; message = resuming ? "Resuming analysis…" : "Analyzing…";
     try {
+      let delay = 250;
+      let lastProgress = -1;
       while (busy && jobId === id && pollRun === run && active) {
-        const job = await invoke<{ status: string; phase: string; progress: number; chunkCompleted?: number; chunkTotal?: number; currentChunk?: number; result?: string; error?: string }>("analysis_status", { id });
+        const job = await invoke<AnalysisJob>("analysis_status", { id });
         if (!active || pollRun !== run || jobId !== id) break;
-        phase = job.chunkTotal ? `${job.phase} · chunk ${Math.min((job.currentChunk ?? job.chunkCompleted ?? 0) + 1, job.chunkTotal)}/${job.chunkTotal}` : job.phase;
+        // While a render runs, `busy` and the status line belong to the render: waiting
+        // here keeps a finished poll from clearing busy and hiding render progress.
+        if (rendering) { await new Promise((resolve) => setTimeout(resolve, 1000)); continue; }
+        phase = job.chunkTotal ? `${job.phase} · chunk ${Math.min((job.currentChunk ?? job.chunkCompleted) + 1, job.chunkTotal)}/${job.chunkTotal}` : job.phase;
         progress = job.progress;
         if (job.status === "completed") {
-          const result = JSON.parse(job.result ?? "{}"); highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : [];
+          const result = job.result ?? { highlights: [] };
+          highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : []; studioState.selectedIds = selectedIds;
           collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? ""; variants = []; selectedVariantId = "";
           if (result.videoId) youtubeVideoId = result.videoId;
           studioState.highlights = highlights; studioState.selectedId = selectedId; clearSpeakerState(); studioState.transcript = result.transcript ?? null; studioState.variants = []; studioState.selectedVariantId = ""; studioState.editingVariantId = "";
@@ -342,30 +437,50 @@
             await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId, variants: [], selectedVariantId: null });
           }
 
-          message = highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
+          message = projectLinkWarning ? `Analysis finished, but project recovery link is missing (${id}).` : highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
           currentStep = 4; busy = false; resetTimer(); break;
         }
-        if (job.status === "failed") { message = `Analyze failed: ${job.error ?? "unknown error"}`; busy = false; resetTimer(); break; }
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (job.status === "failed" || job.status === "cancelled" || job.status === "interrupted") {
+          message = job.status === "cancelled" ? "Analysis stopped." : `Analyze ${job.status}: ${job.error ?? "unknown error"}`;
+          busy = false; resetTimer(); break;
+        }
+        delay = job.progress !== lastProgress ? 250 : Math.min(2000, Math.round(delay * 1.5));
+        lastProgress = job.progress;
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    } catch (error) { if (pollRun === run) { message = `Resume failed: ${String(error)}`; busy = false; resetTimer(); } }
-    finally { if (pollRun === run) { watchStarted = false; await reconnectJobs(false); } }
+    } catch (error) {
+      if (pollRun === run) { message = `Resume failed: ${String(error)}`; busy = false; resetTimer(); }
+    } finally { if (pollRun === run) { watchStarted = false; watcherId = ""; await reconnectJobs(false); } }
   }
   $effect(() => {
     const visible = active;
     const id = jobId;
-    if (visible && busy && id && !watchStarted) void watch(id, true);
+    if (visible && busy && id && !watchStarted && !rendering) void watch(id, true);
   });
 
   async function analyze() {
     if (!isTauri()) { message = "Analysis runs in the desktop app only — this browser preview cannot transcribe."; return; }
-    if (!inputPath || !runtimeStore.ready) return;
+    if (!inputPath || !sourceVerified || !runtimeStore.ready) { message = sourceVerified ? "Choose a verified video and wait for the runtime to be ready." : "Load and verify a video before analysis."; return; }
+    // Clamp to the real duration before invoking: the backend rejects an
+    // out-of-range request before creating a job, which used to look like the
+    // button did nothing. Write the clamped values back so the fields match.
+    const duration = Number(meta?.duration ?? 0);
+    if (duration > 0) {
+      analyzeEnd = Math.min(Math.max(1, Math.floor(analyzeEnd)), Math.floor(duration));
+      analyzeStart = Math.min(Math.max(0, analyzeStart), analyzeEnd - 1);
+    }
     const existing = resumableJobs.find((job) => job.input === inputPath && (job.status === "queued" || job.status === "running") && Math.abs((job.rangeStart ?? 0) - analyzeStart) < 0.01 && Math.abs((job.rangeEnd ?? analyzeEnd) - analyzeEnd) < 0.01);
     if (existing && confirm("Continue existing analysis? Cancel = clear this setup and start fresh.")) { await watch(existing.id, true); return; }
     if (existing) await clearCache(existing.id);
     highlights = []; collections = []; selectedCollection = ""; selectedId = ""; clearSpeakerState(); variants = []; studioState.variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; message = "Analyzing…";
     try {
+      projectLinkWarning = false;
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
+      jobId = id;
+      if (projectId && !await persistProject({ analysisJobId: id })) {
+        projectLinkWarning = true;
+        message = `Analysis started (${id}), but its project link could not be saved. Keep this job ID to reconnect later.`;
+      }
       await watch(id, false);
     } catch (error) { message = `Analyze failed: ${String(error)}`; busy = false; resetTimer(); }
   }
@@ -382,9 +497,12 @@
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
       inputPath = url;
       meta = { name: info.title, duration: info.duration, width: 0, height: 0 };
+      sourceVerified = Number.isFinite(info.duration) && info.duration > 0;
+      if (!sourceVerified) throw new Error("MEDIA_NOT_VERIFIED: YouTube metadata has no valid duration");
       studioState.sourcePath = url; studioState.sourceName = info.title; studioState.sourceDuration = info.duration;
       const project = await invoke<Project>("project_create", { sourcePath: url, sourceName: info.title, sourceDuration: info.duration });
-      projectId = project.id; studioState.projectId = project.id; projects = [project, ...projects];
+      projectId = project.id; studioState.projectId = project.id; studioState.projectRevision = project.revision; projects = [project, ...projects];
+      if (!await persistProject({ analysisJobId: info.id })) projectLinkWarning = true;
       youtubeUrl = "";
       await watch(info.id, false);
     } catch (error) {
@@ -428,29 +546,42 @@
     if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
     const variant = variants.find((item) => item.id === id);
     const transcript = studioState.transcript;
-    if (!variant || !transcript || !inputPath) return;
+    if (!variant || !transcript || !inputPath || !sourceVerified) return;
     busy = true;
+    message = `Rendering ${variant.title}… Keep this window open; longer videos can take a while.`;
     try {
       const plan = variant.plan ?? studioState.plans[`variant:${id}`] ?? createEditorStateFromVariant(transcript, variant).plan;
       variant.plan = plan;
       const output = await save({ defaultPath: `${variant.title.replace(/[^\\w-]+/g, "_") || "variant"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
       if (!output) return;
-      await invoke<string>("render_video", { input: inputPath, output, start: plan.ranges[0].start, duration: plan.ranges[0].end - plan.ranges[0].start, aspectRatio: plan.aspectRatio, ranges: plan.ranges, plan });
-      outputPath = output; message = `Rendered ${variant.title}: ${output}`;
-      const renders = [...(projects.find((item) => item.id === projectId)?.renders ?? []), { output, status: "completed", highlightId: `variant:${id}` }];
-      await persistProject({ renders });
+      const render = renderEntry(output, `variant:${id}`);
+      if (!await persistRender(render)) return;
+      const channel = new Channel<RenderProgress>();
+      channel.onmessage = (update) => { renderProgress = Math.max(renderProgress, update.percent); message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(renderProgress)}%`; };
+      rendering = true; renderProgress = 0;
+      try {
+        await invoke<string>("render_video", { request: { input: inputPath, output, plan } satisfies RenderRequest, onProgress: channel });
+        outputPath = output;
+        if (!await persistRender({ ...render, status: "completed" })) message = `Rendered ${variant.title}, but the project status could not be saved: ${output}`;
+        else message = `Rendered ${variant.title}: ${output}`;
+      } catch (error) {
+        const cancelled = String(error).includes("RENDER_CANCELLED");
+        await persistRender({ ...render, status: cancelled ? "cancelled" : "failed", error: String(error) });
+        throw error;
+      } finally { rendering = false; }
     } catch (error) { message = `Render failed for ${variant.title}: ${String(error)}`; }
     finally { busy = false; }
   }
 
   function chooseCandidate(id: string) {
     selectedId = id; studioState.selectedId = id;
-    selectedIds = selectedIds.includes(id) ? selectedIds : [...selectedIds, id];
+    selectedIds = selectedIds.includes(id) ? selectedIds : [...selectedIds, id]; studioState.selectedIds = selectedIds;
     void persistProject({ selectedId: id, selectedIds });
   }
 
   function toggleCandidate(id: string) {
     selectedIds = selectedIds.includes(id) ? selectedIds.filter((selected) => selected !== id) : [...selectedIds, id];
+    studioState.selectedIds = selectedIds;
     selectedId = id; studioState.selectedId = id;
     void persistProject({ selectedId: id, selectedIds });
   }
@@ -458,28 +589,49 @@
   async function renderSelected() {
     if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
     const ids = selectedIds.filter((id) => highlights.some((item) => item.id === id));
-    if (!inputPath || !ids.length) return;
-    busy = true;
-    const renders = [...(projects.find((item) => item.id === projectId)?.renders ?? [])];
+    if (!inputPath || !sourceVerified || !ids.length) return;
+    // Mark the render before busy flips: busy=true is what re-arms the analysis watcher
+    // effect, and it must see a render in flight instead of resuming the finished job.
+    busy = true; rendering = true;
+    message = `Rendering ${ids.length} clip${ids.length === 1 ? "" : "s"}… Keep this window open; longer videos can take a while.`;
     try {
-      for (const id of ids) {
+      for (const [clipIndex, id] of ids.entries()) {
         const candidate = highlights.find((item) => item.id === id)!;
-        const plan = studioState.plans[id] ?? createEditorState(candidate.sourceArtifactId, meta?.duration ?? candidate.end, candidate).plan;
-        const range = plan.ranges[0] ?? { start: candidate.start, end: candidate.end };
-        const output = await save({ defaultPath: `${candidate.title.replace(/[^\\w-]+/g, "_") || "short"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
+        // A plan saved from the Editor keeps its own aspect ratio; for a fresh plan
+        // the export format chosen on this page applies (the fresh default "9:16"
+        // used to silently override the selection).
+        const storedPlan = studioState.plans[id];
+        const plan = storedPlan ?? { ...createEditorState(candidate.sourceArtifactId, meta?.duration ?? candidate.end, candidate).plan, aspectRatio: aspectRatio as "9:16" | "1:1" | "16:9" };
+        const output = e2eOutput || await save({ defaultPath: `${candidate.title.replace(/[^\\w-]+/g, "_") || "short"}.mp4`, filters: [{ name: "MP4", extensions: ["mp4"] }] });
         if (!output) break;
-        try {
-          await invoke<string>("render_video", { input: inputPath, output, start: range.start, duration: range.end - range.start, aspectRatio: plan.aspectRatio, ranges: plan.ranges, plan });
-          renders.push({ output, status: "completed", highlightId: id });
-          outputPath = output;
-          message = `Rendered ${candidate.title}: ${output}`;
-        } catch (error) {
-          renders.push({ output, status: `failed: ${String(error)}`, highlightId: id });
-          message = `Render failed for ${candidate.title}: ${String(error)}`;
-        }
-        await persistProject({ renders });
+        const render = renderEntry(output, id);
+        if (!await persistRender(render)) break;
+          const channel = new Channel<RenderProgress>();
+          // The backend reports this clip's own 0→100; scale it by batch position so the
+          // bar advances across the whole selection instead of restarting per clip.
+          channel.onmessage = (update) => {
+            const clipPercent = Math.max(renderProgress, update.percent);
+            renderProgress = clipPercent;
+            const overall = ((clipIndex + clipPercent / 100) / ids.length) * 100;
+            message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(overall)}%`;
+          };
+          rendering = true; renderProgress = 0;
+          try {
+            await invoke<string>("render_video", { request: { input: inputPath, output, plan } satisfies RenderRequest, onProgress: channel });
+            if (!await persistRender({ ...render, status: "completed" })) {
+              message = `Rendered ${candidate.title}, but the project status could not be saved: ${output}`;
+              break;
+            }
+            outputPath = output;
+            message = `Rendered ${candidate.title}: ${output}`;
+          } catch (error) {
+            const cancelled = String(error).includes("RENDER_CANCELLED");
+            await persistRender({ ...render, status: cancelled ? "cancelled" : "failed", error: String(error) });
+            message = cancelled ? `Render cancelled: ${candidate.title}` : `Render failed for ${candidate.title}: ${String(error)}`;
+            break;
+          }
       }
-    } finally { busy = false; }
+    } finally { busy = false; rendering = false; }
   }
 
   async function render() {
@@ -487,11 +639,19 @@
     await renderSelected();
   }
 
+  async function cancelRender() {
+    try { await invoke("cancel_render"); message = "Stopping render…"; }
+    catch (error) { message = `Could not cancel render: ${String(error)}`; }
+  }
+
   async function abort() {
     if (!jobId) { busy = false; resetTimer(); return; }
-    try { await invoke("stop_analysis", { id: jobId }); message = "Analysis stopped."; }
+    const stoppingId = jobId;
+    const stoppingRun = pollRun;
+    busy = false; pollRun += 1;
+    try { await invoke("stop_analysis", { id: stoppingId }); message = "Analysis stopped."; }
     catch (error) { message = `Abort failed: ${String(error)}`; }
-    finally { busy = false; resetTimer(); await reconnectJobs(false); }
+    finally { if (jobId === stoppingId && pollRun === stoppingRun + 1) { busy = false; resetTimer(); } await reconnectJobs(false); }
   }
 
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
@@ -535,7 +695,7 @@
     </ol>
 
     {#if currentStep === 1}
-    <div class="card dropzone" class:over={dragOver} role="region" aria-label="Video upload drop zone" ondragover={(e) => { e.preventDefault(); dragOver = true; }} ondragleave={() => dragOver = false} ondrop={(e) => { e.preventDefault(); onDrop(e); }}>
+    <div class="card drop" class:over={dragOver} role="region" aria-label="Video upload drop zone" ondragover={(e) => { e.preventDefault(); dragOver = true; }} ondragleave={() => dragOver = false} ondrop={(e) => { e.preventDefault(); onDrop(e); }}>
       {#if !inputPath}
         <div class="drop-inner">
           <div class="drop-icon"><Icon name="film" size={28} /></div>
@@ -554,10 +714,11 @@
           <div class="thumb"><Icon name="film" size={22} /></div>
           <div class="preview-info">
             <strong>{meta.name}</strong>
-            <span>{clock(meta.duration)} · {meta.width && meta.height ? `${meta.width}×${meta.height}` : ""}</span>
+            {#if sourceVerified}<span>{clock(meta.duration)} · {meta.width && meta.height ? `${meta.width}×${meta.height}` : ""} · verified</span>{:else}<span class="hint">Not verified — analysis and export are disabled</span>{/if}
           </div>
-          <button class="cta small" onclick={() => currentStep = 2}>Continue to config →</button>
-          <button class="ghost" onclick={() => { inputPath = ""; meta = null; youtubeVideoId = ""; message = "Drop a video to begin."; }}>Remove</button>
+          <button class="btn btn-primary btn-sm" disabled={!sourceVerified} onclick={() => currentStep = 2}>Continue to config →</button>
+          {#if probeError}<p class="hint" aria-live="polite">{probeError}</p>{/if}
+          <button class="btn btn-quiet btn-sm" onclick={() => { inputPath = ""; meta = null; sourceVerified = false; probeError = ""; youtubeVideoId = ""; message = "Drop a video to begin."; }}>Remove</button>
         </div>
       {/if}
     </div>
@@ -567,29 +728,32 @@
     <div class="card">
       <div class="section-title">AI model</div>
       <div class="model-row">
-        {#each ["tiny", "base", "small"] as m}<button class="chip" class:sel={runtimeStore.model === m} disabled={busy || modelBusy} onclick={() => setModel(m)}>{m}</button>{/each}
+        {#each ["tiny", "base", "small"] as m}<button class="chip" class:on={runtimeStore.model === m} disabled={busy || modelBusy} onclick={() => setModel(m)}>{m}</button>{/each}
       </div>
       <p class="hint">tiny = fastest on CPU · base/small need a Pro license · GPU (CUDA) speeds all up</p>
-      <div class="spec-line"><span class="dev">{runtimeStore.device === "cuda" ? "GPU · CUDA" : "CPU · 1 thread"}</span><span>{runtimeStore.model} model</span></div>
+      <div class="spec-line"><span class="tc">{runtimeStore.device === "cuda" ? "GPU · CUDA" : "CPU · 1 thread"}</span><span>{runtimeStore.model} model</span></div>
       <p class="hint">{runtimeStore.storageMessage}</p>
     </div>
 
     <div class="card">
       <div class="section-title">Range (seconds{meta ? ` · full ${clock(meta.duration)}` : ""})</div>
-      <div class="range-row">
-        <label>Start <input type="number" min="0" bind:value={analyzeStart} /></label>
-        <label>End <input type="number" min="1" bind:value={analyzeEnd} /></label>
+      <div class="field-row">
+        <label>Start <input type="number" min="0" max={meta && meta.duration > 0 ? Math.max(0, Math.floor(meta.duration) - 1) : undefined} bind:value={analyzeStart} /></label>
+        <label>End <input type="number" min="1" max={meta && meta.duration > 0 ? Math.floor(meta.duration) : undefined} bind:value={analyzeEnd} /></label>
       </div>
+      {#if meta && meta.duration > 0 && analyzeEnd > Math.floor(meta.duration)}
+        <p class="hint">Range is clamped to the video length ({clock(meta.duration)}) when analysis starts.</p>
+      {/if}
       <div class="section-title">Output format</div>
       <div class="model-row">
-        {#each ["9:16", "1:1", "16:9"] as ratio}<button class="chip" class:sel={aspectRatio === ratio} disabled={busy} onclick={() => aspectRatio = ratio}>{ratio}</button>{/each}
+        {#each ["9:16", "1:1", "16:9"] as ratio}<button class="chip" class:on={aspectRatio === ratio} disabled={busy} onclick={() => aspectRatio = ratio}>{ratio}</button>{/each}
       </div>
       <p class="hint">Aspect ratio for the final export (FFmpeg crop + scale).</p>
-      <button class="cta" disabled={!inputPath || busy || !runtimeStore.ready || analyzeEnd <= analyzeStart} onclick={analyze}>
+      <button class="btn btn-primary btn-wide" disabled={!inputPath || !sourceVerified || busy || !runtimeStore.ready || analyzeEnd <= analyzeStart} onclick={analyze}>
         {#if busy}<span class="spinner"></span>{/if}
         {busy ? "Processing…" : "Start analysis"}
       </button>
-      {#if busy}<button class="ghost wide" onclick={abort}>Abort</button>{/if}
+      {#if busy}<button class="btn btn-quiet btn-wide" onclick={abort}>Abort</button>{/if}
       <p class="hint" aria-live="polite">{runtimeStore.licenseMessage}</p>
     </div>
     {/if}
@@ -597,15 +761,15 @@
     {#if currentStep === 3}
     <div class="card">
       <div class="section-title">Pipeline</div>
-      <ol class="stepper">
-        <li class:done={stepState().done[0]} class:active={stepState().current === 0 && busy}><span class="step-no">1</span>Upload</li>
-        <li class:done={stepState().done[1]} class:active={stepState().current === 1 && busy}><span class="step-no">2</span>Transcribe</li>
-        <li class:done={stepState().done[2]} class:active={stepState().current === 2 && busy}><span class="step-no">3</span>Highlights</li>
-        <li class:done={highlights.length > 0}><span class="step-no">4</span>Edit</li>
-        <li><span class="step-no">5</span>Export</li>
+      <ol class="steps" aria-label="Pipeline steps">
+        <li class="step" class:done={stepState().done[0]} class:on={stepState().current === 0 && busy}><span class="step-no">1</span>Upload</li>
+        <li class="step" class:done={stepState().done[1]} class:on={stepState().current === 1 && busy}><span class="step-no">2</span>Transcribe</li>
+        <li class="step" class:done={stepState().done[2]} class:on={stepState().current === 2 && busy}><span class="step-no">3</span>Highlights</li>
+        <li class="step" class:done={highlights.length > 0}><span class="step-no">4</span>Edit</li>
+        <li class="step"><span class="step-no">5</span>Export</li>
       </ol>
-      {#if busy}<div class="progress-track"><div class="progress-fill" style:width="{Math.round(progress * 100)}%"></div></div><p class="hint">{phase} · {Math.round(progress * 100)}% · elapsed {elapsedLabel()}</p>
-      <button class="ghost wide" onclick={abort}>Abort analysis</button>{:else}<p class="hint">Waiting for a job…</p>{/if}
+      {#if busy}<div class="run-track"><div class="run-fill" style:width="{Math.round(progress * 100)}%"></div></div><p class="hint">{phase} · {Math.round(progress * 100)}% · elapsed {elapsedLabel()}</p>
+      <button class="btn btn-quiet btn-wide" onclick={abort}>Abort analysis</button>{:else}<p class="hint">Waiting for a job…</p>{/if}
     </div>
     {/if}
 
@@ -632,17 +796,17 @@
       </div>
       {#if studioState.transcript}
         <div class="card">
-          <div class="spread"><div><div class="section-title">Experimental · Transcript edit variants</div><p class="hint">AI suggests ordered source ranges from the transcript. Compare a version, edit it, then export that version only.</p></div><button class="cta small" disabled={variantsBusy || busy} onclick={generateVariants}>{#if variantsBusy}<span class="spinner"></span>{/if}{variantsBusy ? "Generating…" : variants.length ? "Generate again" : "Generate variants"}</button></div>
+          <div class="spread"><div><div class="section-title">Experimental · Transcript edit variants</div><p class="hint">AI suggests ordered source ranges from the transcript. Compare a version, edit it, then export that version only.</p></div><button class="btn btn-primary btn-sm" disabled={variantsBusy || busy} onclick={generateVariants}>{#if variantsBusy}<span class="spinner"></span>{/if}{variantsBusy ? "Generating…" : variants.length ? "Generate again" : "Generate variants"}</button></div>
           {#if variants.length}
             <div class="variant-grid">
               {#each variants as variant}
                 {@const plan = variant.plan ?? studioState.plans[`variant:${variant.id}`]}
                 {@const duration = (plan?.ranges ?? variant.ranges).reduce((sum, range) => sum + range.end - range.start, 0)}
-                <article class="variant-card" class:selected={selectedVariantId === variant.id}>
+                <article class="variant-card" class:on={selectedVariantId === variant.id}>
                   <div class="variant-select" aria-current={selectedVariantId === variant.id ? "true" : undefined}><button class="variant-choice" aria-pressed={selectedVariantId === variant.id} onclick={() => chooseVariant(variant.id)}><strong>{variant.title}</strong><span>{variant.reason ?? "Transcript-selected moments"}</span><small>{variant.ranges.length} ranges · {clock(duration)}</small></button>
                     <ol>{#each variant.ranges as range, index}<li><span>{index + 1}. {clock(range.start)}–{clock(range.end)}</span><small>{(studioState.transcript?.segments ?? []).filter((segment) => segment.end > range.start && segment.start < range.end).map((segment) => segment.text).join(" ")}</small></li>{/each}</ol>
                   </div>
-                  <div class="field-row"><button class="btn btn-sm" onclick={() => editVariant(variant.id)}>Edit in Editor</button><button class="btn btn-sm btn-primary" disabled={busy} onclick={() => renderVariant(variant.id)}>Export this version</button></div>
+                  <div class="field-row"><button class="btn btn-sm" onclick={() => editVariant(variant.id)}>Edit in Editor</button><button class="btn btn-sm btn-primary" disabled={busy || !sourceVerified} onclick={() => renderVariant(variant.id)}>Export this version</button></div>
                 </article>
               {/each}
             </div>
@@ -665,22 +829,28 @@
             {/each}
           </div>
         {/if}
-        <div class="candidates">
+        <div class="cand-list">
           {#each highlights as candidate}
-            <button class:selected={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => chooseCandidate(candidate.id)}>
-              <strong>{candidate.title}</strong>
-              <span>{clock(candidate.start)}–{clock(candidate.end)} · rank {highlights.findIndex((item) => item.id === candidate.id) + 1} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
-              {#if candidate.hook}<small>{candidate.hook}</small>{/if}
-            </button>
-            <label class="chip"><input type="checkbox" checked={selectedIds.includes(candidate.id)} onchange={() => toggleCandidate(candidate.id)} /> Keep clip</label>
+            <div class="cand-item">
+              <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => chooseCandidate(candidate.id)}>
+                <span class="cand-rank">{highlights.findIndex((item) => item.id === candidate.id) + 1}</span>
+                <span>
+                  <span class="cand-title">{candidate.title}</span>
+                  <span class="cand-sub">{clock(candidate.start)}–{clock(candidate.end)} · rank {highlights.findIndex((item) => item.id === candidate.id) + 1} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
+                  {#if candidate.hook}<span class="cand-hook">{candidate.hook}</span>{/if}
+                </span>
+                <span class="cand-score">{candidate.score}</span>
+              </button>
+              <label class="chip"><input type="checkbox" checked={selectedIds.includes(candidate.id)} onchange={() => toggleCandidate(candidate.id)} /> Keep clip</label>
+            </div>
           {/each}
         </div>
         <div class="spec-line"><span>Export {aspectRatio}</span><span>{highlights.length} candidates{collections.length ? ` · ${collections.length} collections` : ""}</span></div>
-        <button class="cta secondary" disabled={busy || !selectedIds.length} onclick={renderSelected}>
+        <button class="btn btn-primary btn-wide" disabled={busy || !sourceVerified || !selectedIds.length} onclick={renderSelected}>
           {#if busy}<span class="spinner"></span>{/if}
           {busy ? "Rendering…" : `Render ${selectedIds.length} selected clip${selectedIds.length === 1 ? "" : "s"} (${aspectRatio})`}
         </button>
-        {#if outputPath}<p class="hint">Saved: {outputPath}</p>{/if}
+      {#if busy && rendering}<div class="run-track"><div class="run-fill" style:width="{Math.round(renderProgress)}%"></div></div><p class="hint">Render progress · {Math.floor(renderProgress)}%</p><button class="btn btn-quiet btn-wide" onclick={cancelRender}>Cancel render</button>{/if}
       </div>
       {#if inputPath.startsWith("http") && youtubeVideoId && selectedCandidate}
         <div class="card">
@@ -701,11 +871,11 @@
         <RelatedYoutubeSearch initialQuery={relatedQuery} sourceText={relatedSourceText} />
       {/if}
     {:else}
-      <div class="card"><p class="hint">No highlights yet. Run an analysis first.</p><button class="ghost wide" onclick={() => currentStep = 2}>← Back to config</button></div>
+      <div class="card"><p class="hint">No highlights yet. Run an analysis first.</p><button class="btn btn-quiet btn-wide" onclick={() => currentStep = 2}>← Back to config</button></div>
     {/if}
     {/if}
 
-    <p class="message" aria-live="polite">{message}</p>
+    <p class="message" class:error={message.startsWith("Analyze failed") || message.startsWith("YouTube analyze failed")} aria-live="polite">{message}</p>
 
     <div class="panel">
       <div class="panel-head"><span class="panel-title"><span class="eyebrow">Recent projects</span></span><span class="badge">{projects.length}</span></div>
@@ -724,8 +894,8 @@
   </section>
   <style>
     .variant-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:.75rem; margin-top:.8rem; }
-    .variant-card { border:1px solid var(--line-soft); border-radius:14px; padding:.8rem; background:var(--panel); }
-    .variant-card.selected { border-color:var(--volt); box-shadow:0 0 0 1px var(--volt); }
+    .variant-card { border:1px solid var(--line-soft); border-radius:14px; padding:.8rem; background:var(--surface); }
+    .variant-card.on { border-color:var(--volt); box-shadow:0 0 0 1px var(--volt); }
     .variant-select { display:flex; flex-direction:column; align-items:flex-start; gap:.45rem; width:100%; text-align:left; color:inherit; }
     .variant-choice { display:flex; flex-direction:column; align-items:flex-start; gap:.45rem; width:100%; text-align:left; color:inherit; background:none; border:0; padding:0; cursor:pointer; }
     .variant-choice > span,.variant-choice > small { color:var(--ink-2); }

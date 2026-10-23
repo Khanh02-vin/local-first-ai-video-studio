@@ -11,12 +11,14 @@ export const studioState = $state<{
   highlights: Highlight[];
   transcript: Transcript | null;
   selectedId: string;
+  selectedIds: string[];
   plan: RenderPlan | null;
   projectId: string;
+  projectRevision: number;
   plans: Record<string, RenderPlan>;
   variants: EditVariant[];
   selectedVariantId: string;
   editingVariantId: string;
   speakerFaceMatches: Record<string, string>;
   speakerFaceConfirmed: boolean;
-}>({ sourcePath: "", sourceName: "", sourceDuration: 0, highlights: [], transcript: null, selectedId: "", plan: null, projectId: "", plans: {}, variants: [], selectedVariantId: "", editingVariantId: "", speakerFaceMatches: {}, speakerFaceConfirmed: false });
+}>({ sourcePath: "", sourceName: "", sourceDuration: 0, highlights: [], transcript: null, selectedId: "", selectedIds: [], plan: null, projectId: "", projectRevision: 0, plans: {}, variants: [], selectedVariantId: "", editingVariantId: "", speakerFaceMatches: {}, speakerFaceConfirmed: false });

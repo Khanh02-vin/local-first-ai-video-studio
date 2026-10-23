@@ -3,18 +3,21 @@ import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
+import { tmpdir } from "node:os";
 import { LocalRunner } from "../../adapters/local/runner.ts";
+import { resolveEnginePath } from "../../adapters/local/engine.ts";
 
 const execFile = promisify(execFileCb);
 
 
-const root = "/tmp/local-first-ai-video-studio-test";
+const root = join(tmpdir(), "local-first-ai-video-studio-test");
 await rm(root, { recursive: true, force: true });
 await mkdir(root, { recursive: true });
 const input = join(root, "input.mp4");
 const output = join(root, "output.mp4");
 const ffmpeg = process.env.FFMPEG_PATH ?? "ffmpeg";
 const ffprobe = process.env.FFPROBE_PATH ?? "ffprobe";
+const enginePath = resolveEnginePath();
 await execFile(ffmpeg, ["-y", "-f", "lavfi", "-i", "color=c=red:s=160x120:r=10:d=3", "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=44100:duration=3", "-f", "lavfi", "-i", "color=c=blue:s=160x120:r=10:d=3", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100:duration=3", "-filter_complex", "[0:v][1:a][2:v][3:a]concat=n=2:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", input]);
 const segmentA = join(root, "segment-a.mp4");
 const segmentB = join(root, "segment-b.mp4");
@@ -29,7 +32,7 @@ const first = (await execFile(ffmpeg, ["-v", "error", "-ss", "0.2", "-i", output
 const last = (await execFile(ffmpeg, ["-v", "error", "-ss", "1.2", "-i", output, "-frames:v", "1", "-vf", "scale=1:1,format=rgb24", "-f", "rawvideo", "-"], { encoding: "buffer" })).stdout;
 assert.ok(first.readUInt8(2) > first.readUInt8(0), "first output frame should be blue range");
 assert.ok(last.readUInt8(0) > last.readUInt8(2), "second output frame should be red range");
-const runner = new LocalRunner({ ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
+const runner = new LocalRunner({ enginePath, ffmpegPath: ffmpeg, ffprobePath: ffprobe, maxDurationSeconds: 10, statePath: ":memory:" });
 const job = runner.enqueue({ input, output });
 assert.equal(job.status, "queued");
 await runner.drain();

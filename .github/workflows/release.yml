@@ -35,8 +35,13 @@ jobs:
       - name: Install system deps (ffmpeg for media tests, webkit for cargo test)
         run: |
           sudo -n apt-get update && sudo -n apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev || echo "deps already present on this runner — skipping apt"
-      - run: npm test
       - uses: dtolnay/rust-toolchain@stable
+      # The Node-side render tests drive the Rust render engine through its CLI, so the
+      # engine binary has to exist before `npm test` runs.
+      - name: Build the render engine CLI
+        run: cargo build -p lfai-render
+        working-directory: apps/desktop/src-tauri
+      - run: npm test
       - run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
       - name: Build web frontend (generate_context needs frontendDist)
         run: |

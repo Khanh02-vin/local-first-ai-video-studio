@@ -53,6 +53,11 @@ Transition phải idempotent; retry không tạo artifact trùng.
 - CE.SDK dùng `RenderPlan` để preview.
 - FFmpeg dùng cùng `RenderPlan` để final render.
 - Nếu preview và final render khác nhau ngoài tolerance đã định nghĩa, QA phải báo lỗi parity.
+- Chỉ có **một** final renderer: crate `render-engine` giữ toàn bộ argument FFmpeg, và cả
+  app lẫn CLI đều gọi nó (ADR-002). Không có renderer thứ hai để lệch semantics.
+- Chỉ có **một** nguồn sự thật cho đường crop: tracker chạy trong Rust
+  (`analyze_crop_path`); TypeScript chỉ map output đó sang `CropKeyframe` (ADR-003).
+  Không có tầng smooth/re-track thứ hai ở phía UI.
 
 ## Validation bắt buộc
 

@@ -1,8 +1,8 @@
 import { mkdir, rm } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { transcribeWithWhisper, whisperDevice, whisperFp16, type WhisperOptions } from "./whisper.ts";
+import { runAbortable } from "./abortable.ts";
 import type { Transcript, Word, TranscriptSegment } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 import { sourceFingerprint, chunkCacheKey, cachePath, readCachedTranscript, writeCachedTranscript } from "./analysis-cache.ts";
@@ -18,6 +18,8 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
   const words: Word[] = []; const wordIndex = new Map<string, Word>(); const segments: TranscriptSegment[] = []; const segmentIndex = new Map<string, TranscriptSegment>(); let language = options.language ?? "und";
   try {
     for (let index = 0; index < total; index++) {
+      // A cancel must stop the remaining chunks, not just the one in flight.
+      if (options.shouldAbort?.()) throw new Error("ANALYZE_INTERRUPTED");
       const start = offsetSeconds + Math.max(0, index * chunkSeconds - (index ? overlap : 0));
       const end = Math.min(offsetSeconds + duration, offsetSeconds + (index + 1) * chunkSeconds);
       const key = await chunkCacheKey(audioPath, index, start, end, options.model ?? "tiny", options.language, whisperDevice(options), whisperFp16(options), source);
@@ -30,7 +32,7 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
         part = cached ?? await (async () => {
           const chunk = join(root, `chunk-${index}.wav`);
           try {
-            await run(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], options.chunkTimeoutMs ?? 120_000);
+            await runAbortable(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], { timeoutMs: options.chunkTimeoutMs ?? 120_000, abortLabel: "CHUNK_FFMPEG_ABORTED", shouldAbort: options.shouldAbort });
             const result = await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
             await writeCachedTranscript(cachePath(source, key), result); return result;
           } finally { await rm(chunk, { force: true }); }
@@ -46,10 +48,25 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
       options.onChunkComplete?.(index, total, cacheHit);
       options.onProgress?.(index + 1, total);
     }
-    words.sort((a, b) => a.start - b.start); segments.sort((a, b) => a.start - b.start);
+    words.sort((a, b) => a.start - b.start || a.end - b.end);
+    // Chunk overlaps can leave a boundary word starting before the previous
+    // word ends (whisper's per-chunk timings are approximate); the transcript
+    // contract requires ordered, non-overlapping words. Keep the earlier word,
+    // drop the overlapping one, and prune segment references so they never dangle.
+    const orderedWords: Word[] = [];
+    for (const word of words) {
+      const previous = orderedWords[orderedWords.length - 1];
+      if (previous && word.start < previous.end) continue;
+      orderedWords.push(word);
+    }
+    if (orderedWords.length !== words.length) {
+      const kept = new Set(orderedWords.map((word) => word.id));
+      for (const segment of segments) segment.wordIds = segment.wordIds.filter((id) => kept.has(id));
+    }
+    words.length = 0;
+    words.push(...orderedWords);
+    segments.sort((a, b) => a.start - b.start);
     const transcript: Transcript = { version: 1, sourceArtifactId, language, duration: options.sourceDuration ?? duration, provider: `openai-whisper:${options.model ?? "tiny"}`, words, segments };
     validateTranscript(transcript); return transcript;
   } finally { await rm(root, { recursive: true, force: true }); }
 }
-
-function run(command: string, args: string[], timeoutMs: number): Promise<void> { return new Promise((resolve, reject) => { const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] }); let error = ""; let settled = false; const finish = (failure?: Error) => { if (settled) return; settled = true; clearTimeout(timer); failure ? reject(failure) : resolve(); }; const timer = setTimeout(() => { child.kill("SIGTERM"); setTimeout(() => child.kill("SIGKILL"), 1000); finish(new Error("CHUNK_FFMPEG_TIMEOUT")); }, timeoutMs); child.stderr.on("data", (chunk: Buffer) => error += chunk.toString()); child.on("error", (cause) => finish(new Error(`CHUNK_FFMPEG_SPAWN:${cause.message}`))); child.on("close", (code) => code === 0 ? finish() : finish(new Error(`CHUNK_FFMPEG_FAILED:${error.slice(-300)}`))); }); }

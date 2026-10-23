@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const mainRs = join(repoRoot, "apps", "desktop", "src-tauri", "src", "main.rs");
+// The Rust shell is split into modules; the handler list still lives in main.rs.
 const handler = readFileSync(mainRs, "utf8").match(/generate_handler!\[[^\]]*\]/s)?.[0] ?? "";
 assert.ok(handler, "generate_handler![...] not found in main.rs");
 const registered = new Set([...handler.matchAll(/[a-z_][a-z0-9_]*/g)].map((m) => m[0]));

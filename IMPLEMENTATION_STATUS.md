@@ -40,6 +40,63 @@ Deferred until measured demand:
 - Phase 3 host-agnostic media engine modules.
 - SQLite local job store with retry/recovery states.
 - Local FFmpeg adapter with probe/render/cancel.
+- **One final renderer** (ADR-002): the FFmpeg arguments live in a Tauri-free Rust crate,
+  `apps/desktop/src-tauri/crates/render-engine`. The desktop app (`src/render.rs`) and the
+  headless CLI (`crates/lfai-render`, binary `lfai-render`) are two front doors to that one
+  engine, and the Node job queue (`adapters/local/runner.ts` → `adapters/local/engine.ts`)
+  is a *client* of it — the duplicate Node renderer (`adapters/ffmpeg/`) is gone. The five
+  unused `render_enqueue`/`render_list`/`render_get`/`render_retry`/`render_drain` Tauri
+  commands that used to call back into that duplicate renderer are removed. The shared
+  `#[typeshare]` IPC structs moved into the engine crate, so `npm run contracts:generate`
+  and `npm run test:contracts-published` read the engine, and the app re-exports them
+  instead of declaring a second copy. CI builds `lfai-render` before `npm test`, because
+  the Node render tests drive the real engine binary. `tests/local/render-engine.test.ts`
+  (`test:render-engine`) pins the engine's observable behaviour: probe metadata, a real
+  1080x1920 H.264+AAC MP4 for the requested range, progress reaching 100%, and refusal to
+  overwrite the input or to start FFmpeg on an invalid plan.
+- **One source of truth for the crop path** (ADR-003): the Rust `analyze_crop_path` command
+  already picks the speaker's face, smooths the path (alpha 0.35) and assigns scene ids.
+  The Editor used to feed that output back through the TypeScript `trackFacePath`, which
+  smoothed the path a *second* time and re-derived scene cuts with a different rule (it
+  cut on face-area change, Rust does not). The renderer reads the plan, so it followed the
+  drifted path: with the subject moving from x=0.2 to x=0.8, Rust alone converged to 0.73
+  while the double-smoothed path stopped at 0.61. The Editor now maps the Rust output onto
+  contract keyframes through `packages/media-engine/reframe/crop-keyframes.ts`
+  (`cropKeyframesFromPath`), which only maps — it does not smooth, re-track, or invent
+  fallback points for frames the tracker skipped. The TypeScript copies with no production
+  call site (`generateAss`, `cropWindow`, `ffmpegCropCenterExpression`, `trackFacePath`,
+  `smoothFacePath`, `isSceneCut`, `choosePrimaryFace`, `sceneLayoutAt`, `aspectTarget`,
+  `validateEngineRenderPlan`) are removed; `packages/media-engine` keeps validation, the
+  probe and the editor's view helper `cropCenterAt`. The tracking algorithm itself was
+  split out of `analyze_crop_path` into a pure `track_crop_path` function so it can be
+  tested: four Rust tests pin that a frame without a face is skipped rather than filled
+  in, that the path is smoothed exactly once (0.41 after a 0.2→0.8 jump, where a second
+  pass would give 0.27), that a subject jump starts a new scene, and that an unconfirmed
+  speaker→face mapping produces no crop at all.
+- **Crop-path E2E scenario** (`DESKTOP_E2E_SCENARIO=crop-path`): drives the real chain
+  through the app's IPC — `sample_speaker_faces` (Haar cascade on real frames),
+  `analyze_crop_path` (the Rust tracker), contract keyframes, then `render_video` with a
+  progress channel. On the 180s dialogue fixture it found the face, produced 9 keyframes
+  across 2 scenes, and the rendered export shows the face at output-centre 0.525 where a
+  centre crop would leave it at 0.39 — the tracked crop is genuinely applied. Speaker
+  labels come from the test (diarization needs pyannote + a Hugging Face token, which a
+  clean machine does not have). Finding it surfaced a real product bug: five media
+  commands ran blocking work on the main thread and froze the webview for the whole
+  scan; they now run on blocking workers, guarded by a wiring test.
+- **Production-hardening of state layout and process trees** (ADR-004): durable data
+  (`projects.sqlite`, `analysis.sqlite`, `runtime.env`, tokens, RAG playlists) moved to
+  the OS data directory (`%APPDATA%` / `~/Library/Application Support` / `$XDG_DATA_HOME`)
+  and regenerable caches (preview, LLM, chunk caches, llama runtime + model, the Python
+  venv) to the OS cache directory — the old single `~/.cache` root lost projects to disk
+  cleaners, and the Windows fallback silently landed in `%TEMP%` (Windows does not set
+  `HOME`). `LOCAL_FIRST_STATE_DIR` still collapses both roots into one (tests/E2E); Node
+  workers get `LOCAL_FIRST_CACHE_DIR` alongside it. A copy-only migration moves legacy
+  data on first launch (never overwrites an existing file, renames the GB-size llama/venv
+  directories, keeps the legacy root as backup). The analysis worker is now spawned with
+  the `command-group` crate — a process group on Unix, a Job Object with
+  `KILL_ON_JOB_CLOSE` on Windows — so cancel works on Windows (`taskkill /F /T`) and a
+  crashed app can no longer orphan its whisper/ffmpeg tree there; six new Rust tests pin
+  the OS-path resolution and the migration semantics.
 - Local Faster-Whisper CLI adapter with cleanup, timeout and transcript validation.
 - Deterministic heuristic highlight selector using sentence completeness, length and hook keywords.
 - Semantic highlight strategy + Gemini BYOK provider wired into the analysis worker (`HIGHLIGHT_STRATEGY`/`GEMINI_API_KEY` in runtime.env, `SemanticProviderAdapter` bridges the LLM provider into the pipeline); deterministic heuristic/content selector is the offline default and the automatic fallback when the provider errors or no key is set.

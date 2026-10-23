@@ -28,10 +28,14 @@ const whisperModel = process.env.WHISPER_MODEL ?? "tiny";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const exec = promisify(execFile);
-const probeOut = (await exec(ffprobePath, ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputPath])).stdout.trim();
-const duration = Number(probeOut);
+const { probe } = await import("../adapters/local/engine.ts");
+const metadata = await probe(inputPath, {
+  enginePath: process.env.LF_AI_RENDER_BIN ?? "lfai-render",
+  ffprobePath,
+});
+const duration = Number(metadata.format?.duration);
 if (!Number.isFinite(duration) || duration <= 0) {
-  console.error(`INVALID_DURATION from probe: ${probeOut}`);
+  console.error(`INVALID_DURATION from probe: ${metadata.format?.duration}`);
   process.exit(2);
 }
 const rangeStart = Number(rangeStartArg ?? 0);
@@ -72,7 +76,13 @@ for (const h of highlights) {
 const top = highlights[0];
 const { LocalRunner } = await import("../adapters/local/runner.ts");
 const statePath = pjoin(workDir, "demo-jobs.sqlite");
-const runner = new LocalRunner({ ffmpegPath, ffprobePath, maxDurationSeconds: 4 * 3600, statePath });
+const runner = new LocalRunner({
+  enginePath: process.env.LF_AI_RENDER_BIN ?? "lfai-render",
+  ffmpegPath,
+  ffprobePath,
+  maxDurationSeconds: 4 * 3600,
+  statePath,
+});
 const enq = runner.enqueue({ input: inputPath, output: outputPath, start: top?.start ?? rangeStart, end: top?.end ?? rangeEnd, aspectRatio: "9:16" });
 await runner.drain();
 const job = runner.store.get(enq.id);

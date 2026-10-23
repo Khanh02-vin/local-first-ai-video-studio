@@ -39,6 +39,18 @@ function dataDir(): string {
 }
 
 type Segment = { start: number; end: number; text: string };
+
+function validPlaylistUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const list = url.searchParams.get("list") ?? "";
+    return ["http:", "https:"].includes(url.protocol)
+      && ["youtube.com", "www.youtube.com", "m.youtube.com"].includes(url.hostname)
+      && !url.username && !url.password && !url.port && url.pathname === "/playlist"
+      && /^[A-Za-z0-9_-]{10,}$/.test(list);
+  } catch { return false; }
+}
+
 type VideoDoc = {
   videoId: string;
   playlistId: string;
@@ -246,7 +258,7 @@ export const POST: RequestHandler = async ({ request }) => {
     try { body = await request.json(); } catch { return jsonError(400, "INVALID_JSON"); }
     const playlistUrl = (body as { playlistUrl?: string })?.playlistUrl;
     const title = (body as { title?: string })?.title;
-    if (typeof playlistUrl !== "string" || !/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\/?/.test(playlistUrl)) {
+    if (typeof playlistUrl !== "string" || !validPlaylistUrl(playlistUrl)) {
       return jsonError(400, "PLAYLIST_MUST_BE_YOUTUBE_URL");
     }
     const id = `pl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

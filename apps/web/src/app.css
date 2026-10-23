@@ -48,6 +48,11 @@ a { color: inherit; text-decoration: none; }
 h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.015em; }
 h1 { font-size: 1.35rem; }
 h2 { font-size: 1rem; }
+/* Buttons inherit the app typography and affordance instead of the UA widget look;
+   component classes below supply their own background/border/padding. */
+button { font: inherit; color: inherit; }
+button:disabled { cursor: not-allowed; }
+button:not(:disabled) { cursor: pointer; }
 ::selection { background: var(--volt); color: var(--volt-ink); }
 
 /* ---------- micro type ---------- */
@@ -76,6 +81,11 @@ h2 { font-size: 1rem; }
 }
 .titlebar-btn:hover { background: var(--surface-2); color: var(--ink); }
 .titlebar-close:hover { background: #c42b1c; color: #fff; }
+.titlebar-error {
+  flex: none; padding: 0.35rem 0.85rem;
+  background: var(--danger); color: #fff; font-size: 0.8rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* crash report from the previous run (written by the Rust panic hook) */
 .crash-banner {
@@ -110,6 +120,7 @@ h2 { font-size: 1rem; }
   color: var(--faint); position: relative;
   transition: color 0.14s, background 0.14s;
 }
+.rail-link span { display: none; }
 .rail-link:hover { color: var(--ink-2); background: var(--surface); }
 .rail-link.on { color: var(--volt); background: var(--surface); }
 .rail-link.on::before {
@@ -126,6 +137,14 @@ h2 { font-size: 1rem; }
    hidden with display:none so switching never unmounts (instant nav). */
 .page { position: absolute; inset: 0; }
 .page.off { display: none; }
+
+@media (min-width: 1100px) {
+  :root { --rail-w: 156px; }
+  .rail { align-items: stretch; padding-inline: 0.6rem; }
+  .rail-link { width: 100%; display: flex; justify-content: flex-start; gap: 0.7rem; padding: 0 0.75rem; }
+  .rail-link span { display: inline; font-size: 0.82rem; }
+  .rail-link.on::before { left: -10px; }
+}
 
 /* ---------- workbench: context | canvas | inspector ---------- */
 .bench {
@@ -179,12 +198,18 @@ h2 { font-size: 1rem; }
 .btn-icon { padding: 0.4rem; }
 
 /* ---------- inputs ---------- */
-input, select, textarea {
+/* Checkboxes/radios keep their intrinsic size: the 100% width below is for
+   text-ish inputs only, and it used to stretch the chips in the candidate list. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+select,
+textarea {
   font: inherit; width: 100%;
   background: var(--bg); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 0.5rem 0.65rem;
 }
+/* Range kept full-width but without the text-input box; the volt accent carries it. */
+input[type="range"] { width: 100%; padding: 0; background: transparent; border: 0; accent-color: var(--volt); }
 input:focus-visible, select:focus-visible, textarea:focus-visible,
 .btn:focus-visible, .rail-link:focus-visible, .seg-item:focus-visible, .cand:focus-visible {
   outline: 2px solid var(--volt); outline-offset: 1px;
@@ -226,6 +251,15 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .stage-title { display: flex; align-items: center; gap: 0.55rem; min-width: 0; }
 .stage-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stage-body { flex: 1; display: flex; flex-direction: column; padding: 1rem; gap: 1rem; }
+/* The Studio stage is fixed to frame height with overflow:hidden, which clipped
+   long content (candidates list, render button) below the fold with no way to
+   scroll. Let its body scroll instead of trapping content out of reach. */
+.studio-workspace .stage-body { overflow-y: auto; }
+
+/* Optional editor controls stay out of the way until requested. */
+.editor-disclosure { border-top: 1px solid var(--line-soft); padding-top: 0.75rem; }
+.editor-disclosure > summary { cursor: pointer; color: var(--ink-2); font-weight: 600; list-style-position: inside; padding: 0.25rem 0; }
+.editor-disclosure[open] > summary { margin-bottom: 0.65rem; }
 
 /* video / preview canvas */
 .canvas-view {
@@ -237,6 +271,7 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   min-height: 300px;
 }
 .canvas-view video { width: 100%; height: 100%; display: block; max-height: 62vh; background: #000; }
+.preview-error { position: absolute; z-index: 2; left: 1rem; right: 1rem; bottom: 1rem; margin: 0; }
 .frame-guide {
   position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none;
 }
@@ -261,7 +296,6 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   display: grid; place-items: center; color: var(--volt);
   border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2);
 }
-.browse { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
 .browse svg { flex: 0 0 auto; }
 .drop h2 { margin-bottom: 0.25rem; }
 .drop p { margin: 0.2rem 0; color: var(--muted); font-size: 0.85rem; }
@@ -471,3 +505,69 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 /* F-01: footer trigger is a real button, styled like the old link */
 .stage-foot a, .stage-foot .stage-foot-link { background: none; border: 0; color: inherit; cursor: pointer; font: inherit; padding: 0; }
 .stage-foot .stage-foot-link:hover { color: var(--ink-2); }
+
+/* ---------- studio: helper text + meta lines ---------- */
+/* Secondary guidance under a control; quieter than a .note inside a card. */
+.hint { font-size: 0.78rem; line-height: 1.45; color: var(--muted); margin: 0.25rem 0 0; }
+.section-title { font-size: 0.88rem; font-weight: 650; letter-spacing: -0.01em; color: var(--ink); }
+.answer p { margin: 0.4rem 0 0; color: var(--ink-2); line-height: 1.55; }
+.spec-line {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;
+  font: 500 0.72rem/1.3 var(--mono); letter-spacing: 0.04em; color: var(--faint);
+  padding-top: 0.15rem;
+}
+
+/* ---------- source preview ---------- */
+.preview-card { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; }
+.preview-info { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; flex: 1; }
+.preview-info strong { font-size: 0.9rem; }
+.preview-info span { font-size: 0.74rem; color: var(--muted); }
+.thumb {
+  width: 52px; height: 52px; flex: none; display: grid; place-items: center;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--volt);
+}
+
+/* ---------- dropzone contents ---------- */
+.drop-inner { display: flex; flex-direction: column; align-items: center; gap: 0.3rem; text-align: center; }
+/* Primary action inside the drop area: same weight as .btn-primary. */
+.browse {
+  cursor: pointer; font: 600 0.82rem/1.2 var(--font);
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.45rem;
+  padding: 0.55rem 0.85rem;
+  background: var(--volt); border: 1px solid var(--volt); border-radius: var(--radius-sm); color: var(--volt-ink);
+  transition: background 0.14s, border-color 0.14s;
+}
+.browse:hover:not(:disabled) { background: #e4fa66; border-color: #e4fa66; }
+.browse:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ---------- compact option rows (model / aspect ratio) ---------- */
+.model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; }
+.chip.on { background: var(--volt); border-color: var(--volt); color: var(--volt-ink); }
+
+/* ---------- speaker → face matching ---------- */
+.speaker-face-match { display: flex; flex-direction: column; gap: 0.7rem; }
+.speaker-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 0.7rem; }
+.speaker-row {
+  display: flex; flex-direction: column; gap: 0.45rem;
+  padding: 0.7rem; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg-2);
+}
+.speaker-row strong { font: 600 0.8rem/1 var(--mono); color: var(--volt); }
+.face-samples { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: 0.55rem; }
+.face-samples figure { margin: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.face-samples img { width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--line); background: #000; }
+.face-samples figcaption { font: 500 0.66rem/1.2 var(--mono); color: var(--faint); }
+
+/* ---------- candidate list with keep-clip toggles ---------- */
+.cand-list { display: flex; flex-direction: column; gap: 0.55rem; }
+.cand-item { display: flex; align-items: center; gap: 0.5rem; }
+.cand-item .cand { flex: 1; min-width: 0; }
+.cand-item .chip { flex: none; }
+
+/* ---------- related video thumbnails / editor review blocks ---------- */
+.youtube-thumb {
+  width: 96px; flex: none; aspect-ratio: 16 / 9; object-fit: cover;
+  border-radius: var(--radius-sm); border: 1px solid var(--line); background: #000;
+}
+.tl-range-number { font: 600 10px/1 var(--mono); color: var(--faint); }
+.crop-review, .scene-review { display: flex; flex-direction: column; gap: 0.5rem; }

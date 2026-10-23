@@ -48,6 +48,7 @@ async function main(args: string[]): Promise<unknown> {
   const runner = new LocalRunner({
     statePath: join(stateDir, "local-render.sqlite"),
     analysisStatePath: join(stateDir, "analysis.sqlite"),
+    enginePath: process.env.LF_AI_RENDER_BIN ?? "lfai-render",
     ffmpegPath: process.env.FFMPEG_PATH ?? "ffmpeg",
     ffprobePath: process.env.FFPROBE_PATH ?? "ffprobe",
     maxDurationSeconds: 4 * 60 * 60,
@@ -73,9 +74,14 @@ async function main(args: string[]): Promise<unknown> {
           mode: "local-render-only",
           stateDirectory: stateDir,
           database: join(stateDir, "local-render.sqlite"),
+          enginePath: process.env.LF_AI_RENDER_BIN ?? "lfai-render",
           ffmpegPath: process.env.FFMPEG_PATH ?? "ffmpeg",
           ffprobePath: process.env.FFPROBE_PATH ?? "ffprobe",
           supportedAspectRatios: ASPECT_RATIOS,
+          // The engine is the same renderer the desktop app uses, so it *can* render
+          // captions and hooks. This queue, however, enqueues plain range cuts and does
+          // not build a caption/hook plan, so it never asks for them.
+          engine: "render-engine",
           renderedCaptions: false,
           renderedHooks: false,
           jobs: Object.fromEntries(["queued", "running", "completed", "failed", "cancelled", "interrupted"].map((status) => [status, jobs.filter((job) => job.status === status).length])),
