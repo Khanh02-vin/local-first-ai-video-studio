@@ -252,6 +252,38 @@ use std::sync::{Arc, Mutex};
     }
 
     #[test]
+    /// The preview cache must evict oldest-first under the cap and never touch
+    /// the newest file — every import adds a regenerable transcode, and nothing
+    /// else ever deleted one.
+    #[test]
+    fn preview_cache_quota_evicts_oldest_first() {
+        let dir = create_temporary_render_dir().unwrap();
+        let cache = dir.0.join("preview-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // Three 4-byte previews with ordered mtimes: successive writes a few
+        // milliseconds apart give a stable oldest→newest order.
+        std::fs::write(cache.join("a.mp4"), b"1234").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(cache.join("b.mp4"), b"1234").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(cache.join("c.mp4"), b"1234").unwrap();
+
+        // Quota 8 bytes over three 4-byte files: one must go, the oldest.
+        preview::enforce_preview_cache_quota_at(&cache, 8);
+        assert!(!cache.join("a.mp4").exists(), "the oldest preview must be evicted");
+        assert!(cache.join("b.mp4").exists());
+        assert!(cache.join("c.mp4").exists());
+
+        // Under the cap: nothing is touched.
+        preview::enforce_preview_cache_quota_at(&cache, 8);
+        assert!(cache.join("b.mp4").exists() && cache.join("c.mp4").exists());
+
+        // A foreign file type in the cache dir is not evicted (only *.mp4 entries).
+        std::fs::write(cache.join("notes.txt"), b"keep me around").unwrap();
+        preview::enforce_preview_cache_quota_at(&cache, 0);
+        assert!(cache.join("notes.txt").exists(), "non-mp4 entries must be left alone");
+    }
+
     fn preview_proxy_cache_key_tracks_source_version_and_rejects_remote_inputs() {
         let dir = create_temporary_render_dir().unwrap();
         let source = dir.0.join("source.webm");

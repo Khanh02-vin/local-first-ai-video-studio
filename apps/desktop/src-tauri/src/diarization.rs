@@ -2,14 +2,14 @@
 // speaker mapping, and the crop/scene analysis the Editor previews.
 //
 // Everything here runs the local models on the machine; nothing leaves it.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::paths::{
     ffmpeg_bin, helper_env, helper_script, is_remote_input, node_bin, runtime_env, data_dir,
     tool, venv_python, write_runtime_settings,
 };
-use render_engine::engine::{create_temporary_render_dir, stable_subject_pair, subject_pair_continues};
+use render_engine::engine::{create_temporary_render_dir, stable_subject_pair, subject_pair_continues, TemporaryRenderDir};
 use crate::paths::NODE_ARGS;
 
 /// Asks the AI pipeline to propose ordered transcript ranges as alternative edits.
@@ -400,40 +400,99 @@ fn analyze_crop_path_blocking(
         return Err("FACE_RUNTIME_MISSING".into());
     }
     let temp = create_temporary_render_dir()?;
-    let script = helper_script(&app, "detect-face-boxes.py")?;
-    let mut frames = Vec::new();
-    let mut time = 0.0;
-    while time < duration && frames.len() < 360 {
-        let frame = temp.0.join(format!("crop-{:.3}.jpg", time));
-        let status = tool(ffmpeg_bin(app))
-            .args(["-y", "-nostdin", "-v", "error", "-ss"])
-            .arg(format!("{time:.3}"))
-            .args(["-i"])
-            .arg(&input)
-            .args(["-frames:v", "1", "-vf", "scale='min(640,iw)':-2"])
-            .arg(&frame)
-            .status()
-            .map_err(|e| format!("CROP_FRAME_SPAWN:{e}"))?;
-        if status.success() {
-            let detected = tool(&python)
-                .arg(&script)
-                .arg(&frame)
-                .output()
-                .map_err(|e| format!("CROP_DETECT_SPAWN:{e}"))?;
-            if !detected.status.success() {
-                return Err(String::from_utf8_lossy(&detected.stderr).trim().to_owned());
-            }
-            let faces: Vec<serde_json::Value> = serde_json::from_slice(&detected.stdout)
-                .map_err(|e| format!("CROP_DETECT_JSON:{e}"))?;
-            frames.push(serde_json::json!({"time": time, "faces": faces.into_iter().take(4).collect::<Vec<_>>()}));
-        }
-        time += 5.0;
-    }
+    let frames: Vec<serde_json::Value> = extract_and_detect(app, &input, 5.0, 360, duration, &temp, "crop")?
+        .into_iter()
+        .map(|(time, faces)| serde_json::json!({"time": time, "faces": faces}))
+        .collect();
     let mapping_confirmed = face_mapping["confirmed"].as_bool() == Some(true)
         && face_mapping["sourceArtifactId"].as_str() == Some(source_artifact_id);
     let matches = face_mapping["matches"].as_object();
     let output = track_crop_path(&frames, intervals, matches, mapping_confirmed, source_artifact_id);
     Ok(serde_json::json!(output))
+}
+
+/// The timestamps a batched extraction produces: one frame every `interval`
+/// seconds from zero, capped by the extraction itself, never at/after `duration`.
+fn sample_times(count: usize, interval: f64, duration: f64) -> Vec<f64> {
+    (0..count)
+        .map(|index| index as f64 * interval)
+        .take_while(|time| *time < duration)
+        .collect()
+}
+
+/// One FFmpeg pass writes every sampled frame; one Python call detects faces in
+/// all of them. Replaces the per-sample spawn loop — 720 process spawns for a
+/// 30-minute video became two; the Python + cv2 import cost (~1s) is paid once
+/// instead of once per sample.
+///
+/// An unreadable frame comes back as `None` from the detector and is skipped
+/// here rather than killing the scan. A failed extraction batch returns an empty
+/// result, matching the old per-sample loop's "skip what failed" behaviour.
+fn extract_and_detect(
+    app: &tauri::AppHandle,
+    input: &Path,
+    interval: f64,
+    max_frames: usize,
+    duration: f64,
+    temp: &TemporaryRenderDir,
+    prefix: &str,
+) -> Result<Vec<(f64, Vec<serde_json::Value>)>, String> {
+    let python = venv_python();
+    if !python.is_file() {
+        return Err("FACE_RUNTIME_MISSING".into());
+    }
+    let script = helper_script(app, "detect-face-boxes.py")?;
+    let pattern = temp.0.join(format!("{prefix}-%04d.jpg"));
+    // One sequential decode instead of hundreds of seeks: comparable CPU time,
+    // but a single process with a warm decoder instead of a spawn storm.
+    let status = tool(ffmpeg_bin(app))
+        .args(["-y", "-nostdin", "-v", "error", "-i"])
+        .arg(input)
+        .args([
+            "-vf",
+            &format!("fps=1/{interval},scale='min(640,iw)':-2"),
+            "-frames:v",
+            &max_frames.to_string(),
+        ])
+        .arg(&pattern)
+        .status()
+        .map_err(|e| format!("FRAME_SPAWN:{e}"))?;
+    if !status.success() {
+        return Ok(Vec::new());
+    }
+    let mut frame_paths: Vec<PathBuf> = std::fs::read_dir(&temp.0)
+        .map_err(|e| format!("FRAME_LIST:{e}"))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "jpg")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect();
+    frame_paths.sort();
+    if frame_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = tool(&python)
+        .arg(&script)
+        .args(&frame_paths)
+        .output()
+        .map_err(|e| format!("DETECT_SPAWN:{e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let detected: Vec<Option<Vec<serde_json::Value>>> =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("DETECT_JSON:{e}"))?;
+    let mut frames = Vec::new();
+    for (index, time) in sample_times(frame_paths.len(), interval, duration).into_iter().enumerate() {
+        if let Some(Some(faces)) = detected.get(index) {
+            frames.push((time, faces.clone()));
+        }
+    }
+    Ok(frames)
 }
 
 /// Tracks the speaker's face across frames and returns the smoothed crop path.
@@ -533,44 +592,17 @@ fn analyze_scene_layouts_blocking(
     if !input.is_file() {
         return Err("INPUT_NOT_FILE".into());
     }
-    let python = venv_python();
-    if !python.is_file() {
-        return Err("FACE_RUNTIME_MISSING".into());
-    }
     let temp = create_temporary_render_dir()?;
-    let script = helper_script(&app, "detect-face-boxes.py")?;
     let mut scenes = Vec::new();
     let mut start = 0.0;
     let mut samples = Vec::<Vec<serde_json::Value>>::new();
     let mut previous_count: Option<usize> = None;
-    let mut time = 0.0;
-    while time < duration && scenes.len() < 360 {
-        let frame = temp.0.join(format!("scene-{:.3}.jpg", time));
-        let status = tool(ffmpeg_bin(&app))
-            .args(["-y", "-nostdin", "-v", "error", "-ss"])
-            .arg(format!("{time:.3}"))
-            .args(["-i"])
-            .arg(&input)
-            .args(["-frames:v", "1", "-vf", "scale='min(640,iw)':-2"])
-            .arg(&frame)
-            .status()
-            .map_err(|e| format!("SCENE_FRAME_SPAWN:{e}"))?;
-        if !status.success() {
-            samples.clear();
-            previous_count = None;
-            time += 2.0;
-            continue;
+    // 1800s / 2s = 900 possible samples; the old loop stopped at 360 *scenes*,
+    // which the loop below still honours.
+    for (time, faces) in extract_and_detect(app, &input, 2.0, 900, duration, &temp, "scene")? {
+        if scenes.len() >= 360 {
+            break;
         }
-        let result = tool(&python)
-            .arg(&script)
-            .arg(&frame)
-            .output()
-            .map_err(|e| format!("SCENE_DETECT_SPAWN:{e}"))?;
-        if !result.status.success() {
-            return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
-        }
-        let faces: Vec<serde_json::Value> =
-            serde_json::from_slice(&result.stdout).map_err(|e| format!("SCENE_DETECT_JSON:{e}"))?;
         let count = faces.len();
         let stable = count == 2
             && samples
@@ -587,7 +619,6 @@ fn analyze_scene_layouts_blocking(
         }
         samples.push(faces);
         previous_count = Some(count);
-        time += 2.0;
     }
     let pair = stable_subject_pair(&samples);
     scenes.push(serde_json::json!({"start": start, "end": duration, "faceCount": previous_count.unwrap_or(0), "layout": if pair.is_some() { "side-by-side" } else { "solo" }, "confidence": if pair.is_some() { 0.65 } else { 0.4 }, "confirmed": false, "sourceArtifactId": source_artifact_id, "subjectBoxes": pair}));
@@ -597,7 +628,18 @@ fn analyze_scene_layouts_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::track_crop_path;
+    use super::{sample_times, track_crop_path};
+
+    /// The batched extraction's timestamps: one frame every `interval` seconds,
+    /// never at or past the end of the video.
+    #[test]
+    fn sample_times_are_interval_spaced_and_clamped_to_duration() {
+        assert_eq!(sample_times(3, 5.0, 12.0), vec![0.0, 5.0, 10.0]);
+        // A trailing frame at exactly the duration is not a sample.
+        assert_eq!(sample_times(3, 5.0, 10.0), vec![0.0, 5.0]);
+        // Zero-frame edge: no samples, no panic.
+        assert!(sample_times(0, 5.0, 60.0).is_empty());
+    }
 
     fn face(x: f64, y: f64, width: f64, height: f64, confidence: f64) -> serde_json::Value {
         serde_json::json!({"x": x, "y": y, "width": width, "height": height, "confidence": confidence})

@@ -107,6 +107,15 @@ Deferred until measured demand:
   instead of a fixed port. Verified live (401/401/200) and pinned by wiring tests;
   the preview shim keeps its fixed port because the webview CSP allow-lists it
   statically, and the OAuth callback port is an external registration constraint.
+- **Batched media analysis + preview cache quota** (ADR-006): the crop/scene scans now
+  run as exactly two processes — one FFmpeg pass with an `fps` filter extracts all
+  sampled frames, and `detect-face-boxes.py` takes the whole batch (cv2 imported once,
+  unreadable frames reported as null and skipped instead of killing the scan). Measured
+  on the 180s fixture: 15.4s → 5.4s; a 30-minute video drops from ~720 process spawns
+  to 2. Sampling semantics are pinned by tests (`sample_times`: interval spacing,
+  duration clamp, the scene loop still stopping at 360 scenes). The preview cache now
+  evicts oldest-first (`*.mp4` only) under a 5 GiB cap after each publish — previously
+  nothing ever deleted a preview, so the disk leak grew with every imported video.
 - Local Faster-Whisper CLI adapter with cleanup, timeout and transcript validation.
 - Deterministic heuristic highlight selector using sentence completeness, length and hook keywords.
 - Semantic highlight strategy + Gemini BYOK provider wired into the analysis worker (`HIGHLIGHT_STRATEGY`/`GEMINI_API_KEY` in runtime.env, `SemanticProviderAdapter` bridges the LLM provider into the pipeline); deterministic heuristic/content selector is the offline default and the automatic fallback when the provider errors or no key is set.
