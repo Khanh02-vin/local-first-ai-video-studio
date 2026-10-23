@@ -91,6 +91,10 @@ không còn nhánh `#[cfg(unix)] process_group(0)` riêng:
 ## Điều kiện xem xét lại
 
 - Khi Windows runner khả dụng: chạy một lần `cargo test` + smoke test hủy analysis
-  trên Windows thật, rồi gỡ nhãn "chưa chạy thử" khỏi quyết định này.
+  trên Windows thật, rồi gỡ nhãn "chưa chạy thử" khỏi quyết định này. **Đã xử lý một
+  nửa (2026-10-23):** CI thêm job `windows-test` chạy `cargo test` trên windows-latest
+  — các đường cfg(windows) giờ được compile và chạy trên Windows ở mỗi push (test
+  ffmpeg tự skip khi runner thiếu ffmpeg). Phần còn cần chạy tay một lần: smoke test
+  hủy analysis với Whisper thật trên máy Windows.
 - Khi cần sync profile hoặc DB lớn: tách DB sang `%LOCALAPPDATA%` (đổi `data_dir`
   Windows sang Local và thêm migration lần hai).

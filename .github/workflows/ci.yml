@@ -39,3 +39,30 @@ jobs:
         working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high
         continue-on-error: true
+
+  # The hardening work (ADR-004) added cfg(windows) code paths — Job Object spawn,
+  # taskkill/tasklist worker control, %APPDATA% state layout — that only compile on a
+  # Windows host. The ffmpeg-driven tests skip themselves there (runners have no
+  # ffmpeg); everything else runs, which is what makes a typo in those paths fail CI
+  # instead of breaking the next Windows release build.
+  windows-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch bundled resources (placeholders are enough for cargo test)
+        shell: bash
+        run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        shell: bash
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
+          npm run build:node
+      - name: cargo test on Windows
+        run: cargo test
+        working-directory: apps/desktop/src-tauri
