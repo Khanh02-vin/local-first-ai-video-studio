@@ -1,9 +1,10 @@
 import { chooseContentHighlights } from "../services/ai-pipeline/content-highlights.ts";
 import { chooseHeuristicHighlights } from "../services/ai-pipeline/heuristic.ts";
 import { generateSemanticHighlights, SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/semantic.ts";
-import { GeminiHighlightProvider, LlamaCppHighlightProvider } from "../services/ai-pipeline/providers.ts";
+import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { transcriptFromCaptions, type CaptionPayload } from "../services/ai-pipeline/youtube-transcript.ts";
+import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
@@ -56,13 +57,17 @@ try {
 
   const strategy = process.env.HIGHLIGHT_STRATEGY ?? "heuristic";
   const geminiKey = process.env.GEMINI_API_KEY ?? "";
+  const activeBaseUrl = process.env.ACTIVE_PROVIDER_BASE_URL ?? "";
+  const activeApiKey = process.env.ACTIVE_PROVIDER_API_KEY ?? "";
+  const activeModel = process.env.ACTIVE_PROVIDER_MODEL ?? "";
   const llamaBaseUrl = process.env.LOCAL_LLM_BASE_URL ?? "http://127.0.0.1:8080";
   const llamaModel = process.env.LOCAL_LLM_MODEL ?? "qwen2.5-3b-instruct";
 
   // CachedSemanticProvider: replays stored highlights for the same transcript +
   // prompt version instead of re-calling the LLM; identity includes the model.
   const semanticProvider: SemanticHighlightProvider | undefined =
-    strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
+    strategy === "semantic-openai" && activeBaseUrl && activeModel ? new CachedSemanticProvider(new SemanticProviderAdapter(new OpenAIChatHighlightProvider(activeBaseUrl, activeApiKey, activeModel), "openai"), `openai:${activeBaseUrl}|${activeModel}`)
+    : strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
     : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
@@ -84,7 +89,9 @@ try {
   // Free tier: only the top 3 highlights.
   if (process.env.LICENSE_TIER !== "pro") highlights = highlights.slice(0, 3);
   store.update(jobId, { phase: "rank", progress: 0.9 });
-  const result = { transcript, highlights, videoId: payload.videoId };
+  // Collections group the final highlight set the UI receives. The video id is a
+  // stable project identity for the YouTube path.
+  const result = { transcript, highlights, videoId: payload.videoId, collections: await groupHighlightsIntoCollections(highlights, { projectId: payload.videoId, sourceArtifactId: transcript.sourceArtifactId }) };
   const resultPath = await persistResult(result);
   store.update(jobId, { status: "completed", phase: "completed", progress: 1, resultPath, error: null });
   store.close();

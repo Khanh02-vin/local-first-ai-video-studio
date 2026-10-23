@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
 import { analyzeVideo } from "../../services/ai-pipeline/index.ts";
-import { createEditorState, updateAspectRatio } from "../../packages/editor-core/index.ts";
+import { createEditorState, addRange, moveRange, removeRange, updateRange, updateAspectRatio } from "../../packages/editor-core/index.ts";
 import { validateRenderPlan } from "../../packages/contracts/render-plan.ts";
 import { ApprovalRequiredPublisher } from "../../services/publishing/index.ts";
 
 const analysis = analyzeVideo("source-1", 60);
 assert.equal(analysis.highlights.length, 1);
-let editor = createEditorState("source-1", 60, analysis.highlights[0]);
+let editor = createEditorState("source-1", 60, { ...analysis.highlights[0], start: 1, end: 10 });
 editor = updateAspectRatio(editor, "9:16");
 validateRenderPlan(editor.plan, 60);
+editor = addRange(editor, { start: 32, end: 36 });
+editor = updateRange(editor, { start: 33, end: 35 }, 1);
+assert.deepEqual(editor.plan.ranges, [{ start: 1, end: 10 }, { start: 33, end: 35 }]);
+editor = moveRange(editor, 1, -1);
+assert.equal(editor.plan.ranges[0].start, 33, "manual order controls output order");
+editor = moveRange(editor, 0, 1);
+editor = removeRange(editor, 1);
+assert.equal(editor.plan.ranges.length, 1);
+assert.throws(() => removeRange(editor, 0), /At least one/);
 const publisher = new ApprovalRequiredPublisher();
 await assert.rejects(() => publisher.publish({ version: 1, id: "p1", artifactId: "a1", platform: "youtube-shorts", accountId: "account", status: "draft" }));
 const published = await publisher.publish({ version: 1, id: "p1", artifactId: "a1", platform: "youtube-shorts", accountId: "account", status: "queued" });

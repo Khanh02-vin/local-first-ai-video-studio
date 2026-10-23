@@ -13,7 +13,7 @@ export default {
   preprocess: vitePreprocess(),
   kit: {
     adapter: useNode
-      ? adapterNode({ out: "build-node" })
-      : adapterStatic({ fallback: "index.html" }),
+      ? adapterNode({ out: process.env.VITE_DESKTOP_E2E === "1" ? process.env.VITE_NODE_BUILD_OUT_DIR ?? "build-node" : "build-node" })
+      : adapterStatic({ fallback: "index.html", pages: process.env.VITE_DESKTOP_E2E === "1" ? process.env.VITE_BUILD_OUT_DIR ?? "build" : "build", assets: process.env.VITE_DESKTOP_E2E === "1" ? process.env.VITE_BUILD_OUT_DIR ?? "build" : "build" }),
   },
 };

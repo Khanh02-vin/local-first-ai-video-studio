@@ -21,10 +21,31 @@ Dependencies (installed into the app's Python venv): yt-dlp, youtube-transcript-
 import json
 import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse
+
+
+def valid_playlist_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        list_ids = query.get("list", [])
+        list_id = list_ids[0] if len(list_ids) == 1 else ""
+        return (
+            parsed.scheme in ("http", "https")
+            and parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com")
+            and parsed.username is None and parsed.password is None and parsed.port is None
+            and parsed.path == "/playlist"
+            and len(list_id) >= 10
+            and all(char.isascii() and (char.isalnum() or char in "-_") for char in list_id)
+        )
+    except (ValueError, KeyError):
+        return False
 
 
 def enumerate_playlist(url: str) -> list[tuple[str, str]]:
-    """Return [(videoId, title)] for a playlist without downloading anything."""
+    """Return [(videoId, title)] for a validated playlist without downloading anything."""
+    if not valid_playlist_url(url):
+        raise ValueError("playlist URL must be a YouTube /playlist URL with a valid list id")
     proc = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "--flat-playlist", "--print", "%(id)s\t%(title)s", url],
         capture_output=True, text=True, timeout=600,

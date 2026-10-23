@@ -5,6 +5,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Everything here takes ~6 min normally; the one slow step is apt (a PR run once
+    # spent 41 min in apt-get on a congested mirror). A hung job should fail and be
+    # re-run, not sit for the 6-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,8 +21,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-      - run: npm test
       - uses: dtolnay/rust-toolchain@stable
+      # The Node-side render tests drive the Rust render engine through its CLI, so the
+      # engine binary has to exist before `npm test` runs. It is a separate crate, so it
+      # builds without the web frontend.
+      - name: Build the render engine CLI
+        run: cargo build -p lfai-render
+        working-directory: apps/desktop/src-tauri
+      - run: npm test
       # tauri-build validates bundle.resources at compile time; the real binaries are
       # git-ignored, so create the paths (placeholders are never executed by tests).
       - run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
@@ -33,3 +43,31 @@ jobs:
         working-directory: apps/desktop/src-tauri
       - run: npm audit --audit-level=high
         continue-on-error: true
+
+  # The hardening work (ADR-004) added cfg(windows) code paths — Job Object spawn,
+  # taskkill/tasklist worker control, %APPDATA% state layout — that only compile on a
+  # Windows host. The ffmpeg-driven tests skip themselves there (runners have no
+  # ffmpeg); everything else runs, which is what makes a typo in those paths fail CI
+  # instead of breaking the next Windows release build.
+  windows-test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch bundled resources (placeholders are enough for cargo test)
+        shell: bash
+        run: LIGHTWEIGHT=1 bash scripts/fetch-bundled-assets.sh
+      - name: Build web frontend (generate_context needs frontendDist)
+        shell: bash
+        run: |
+          cd apps/web
+          npm ci
+          npm run build
+          npm run build:node
+      - name: cargo test on Windows
+        run: cargo test
+        working-directory: apps/desktop/src-tauri

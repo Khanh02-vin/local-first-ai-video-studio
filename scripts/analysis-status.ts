@@ -28,8 +28,12 @@ if (target === "--recover") {
   const observing = store.listActive().filter((job) => job.status === "running" && alive(store.workerPid(job.id)));
   process.stdout.write(JSON.stringify({ resumable, observing }));
 } else if (mode === "--retry") {
-  store.retry(target);
-  process.stdout.write(JSON.stringify(store.get(target) ?? null));
+  if (!store.retry(target)) {
+    process.stderr.write("JOB_NOT_RETRYABLE: only failed jobs can be retried");
+    process.exitCode = 1;
+  } else {
+    process.stdout.write(JSON.stringify(store.get(target) ?? null));
+  }
 } else if (mode === "--reset-attempts") {
   store.resetAttempts(target);
   process.stdout.write(JSON.stringify(store.get(target) ?? null));
@@ -43,6 +47,9 @@ if (target === "--recover") {
   process.stdout.write(JSON.stringify(store.allJobs()));
 } else if (!target) {
   process.stdout.write("null");
+} else if (mode === "--cancel") {
+  store.cancel(target);
+  process.stdout.write(JSON.stringify(store.get(target) ?? null));
 } else if (mode === "--fail") {
   store.update(target, { status: "failed", phase: "failed", error: rest.join(" ") || "worker failed" });
   process.stdout.write(JSON.stringify(store.get(target) ?? null));

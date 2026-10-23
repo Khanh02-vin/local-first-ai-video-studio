@@ -7,6 +7,8 @@ target/
 build/
 build-node/
 dist/
+.tools/
+.zcode-tmp/
 uploads/
 output/
 *.log
@@ -18,3 +20,5 @@ apps/desktop/src-tauri/resources/models/**/*.pt
 apps/desktop/src-tauri/resources/models/**/*.gguf
 .cache/
 apps/desktop/src-tauri/*.mp4
+artifacts/
+release/

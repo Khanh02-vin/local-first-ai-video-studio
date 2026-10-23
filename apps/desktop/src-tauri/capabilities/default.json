@@ -3,5 +3,17 @@
   "identifier": "default",
   "description": "Minimal local desktop capability",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "http:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "dialog:default",
+    "http:allow-fetch",
+    "http:allow-fetch-send",
+    "http:allow-fetch-read-body",
+    "http:allow-fetch-cancel",
+    "http:allow-fetch-cancel-body"
+  ]
 }

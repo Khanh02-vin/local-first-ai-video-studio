@@ -1,0 +1,19 @@
+Linux pilot candidates from working tree 170389eda01c48e37a279626a1b685e885c85d8c (dirty), version 0.1.0.
+
+Debian installer:
+  Local-first AI Video Studio_0.1.0_amd64.deb
+  SHA-256 3b08a081628f297759dc9892afc4b5909d315e3aaf3eeb9c7e0637e5a618d585
+  Install verified in a clean Ubuntu 24.04 container. GUI not tested.
+
+AppImage:
+  Current local file exists, but rebuild from the current source did NOT complete: linuxdeploy failed. The current AppImage is an older artifact and MUST NOT be treated as built from the current fixes.
+  SHA-256 0be2904b603b188742ac7b16e24dc4d2898bd49d6b434af8724fd581398142d6
+
+RPM:
+  Current local file exists, but is an older artifact and MUST NOT be treated as built from the current fixes.
+  SHA-256 b4dac7a1ddedd116926a0cc643c2b6e3597a923b8145cb707f354a9fafebdd16
+
+Windows portable:
+  No portable ZIP is available in the current local outputs or GitHub v0.1.0 release assets. Existing customer Drive portable was built before the current uncommitted UI/capability fixes. It has not been refreshed in this session; do not send it as the fixed build.
+
+No artifact from this directory has been uploaded or sent externally. Do not widen distribution before GUI and packaged analysis testing on the customer's OS.

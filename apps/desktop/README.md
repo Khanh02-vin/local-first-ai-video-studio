@@ -21,3 +21,7 @@ Do not claim a signed release until these environment values are supplied by the
 - Platform code-signing/notarization credentials.
 
 FFmpeg/model redistribution requires license and checksum review before bundling.
+
+Default desktop packages include Node.js, FFmpeg/ffprobe, and Whisper `.pt`
+assets, but exclude the local-LLM runtime and GGUF model. Users can opt in from
+Settings to install both (about 2.2 GB); see [`docs/local-llm.md`](../../docs/local-llm.md).

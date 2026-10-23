@@ -45,6 +45,7 @@
 
   const items = [
     { href: "/", id: "studio", label: "Studio" },
+    { href: "/projects", id: "project", label: "Projects" },
     { href: "/editor/demo", id: "editor", label: "Editor" },
     { href: "/youtube", id: "youtube", label: "YouTube Studio" },
     { href: "/settings", id: "settings", label: "Settings" },
@@ -56,10 +57,43 @@
 
   // Crash report from the previous run (Rust panic hook → panic.log → last_panic).
   let crashLog = $state("");
+  // Titlebar window controls surface failures instead of swallowing them: a dead
+  // button that hides its own error is undiagnosable (Wayland can reject some
+  // GTK window requests). The banner clears itself after a few seconds.
+  let titlebarError = $state("");
 
-  async function minimize() { if (isTauri()) await getCurrentWindow().minimize().catch(() => {}); }
-  async function toggleMax() { if (isTauri()) await getCurrentWindow().toggleMaximize().catch(() => {}); }
-  async function closeWindow() { if (isTauri()) await getCurrentWindow().close().catch(() => {}); }
+  async function minimize() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().minimize();
+    } catch (error) {
+      console.error("[titlebar] minimize failed", error);
+      titlebarError = `Không thu nhỏ được cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
+
+  async function toggleMax() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().toggleMaximize();
+    } catch (error) {
+      console.error("[titlebar] toggleMaximize failed", error);
+      titlebarError = `Không đổi được kích thước cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
+
+  async function closeWindow() {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().close();
+    } catch (error) {
+      console.error("[titlebar] close failed", error);
+      titlebarError = `Không đóng được cửa sổ: ${String(error)}`;
+      setTimeout(() => { titlebarError = ""; }, 5000);
+    }
+  }
 
   onMount(() => {
     // Block the browser's default file-drop navigation once for the whole app
@@ -102,6 +136,9 @@
       </div>
     </div>
   {/if}
+  {#if titlebarError}
+    <div class="titlebar-error" role="alert"><span>{titlebarError}</span></div>
+  {/if}
   {#if crashLog}
     <div class="crash-banner" role="alert">
       <div class="crash-body">
@@ -113,14 +150,15 @@
     </div>
   {/if}
   {#if browserPreview}
-    <div class="preview-banner" role="note">⚠ Browser preview — crawl, file dialogs, analysis and every <strong>save</strong> action need the desktop app. Open the installed app for full functionality.</div>
+    <div class="preview-banner" role="note"><Icon name="warning" size={16} /><span>Browser preview — crawl, file dialogs, analysis and every <strong>save</strong> action need the desktop app. Open the installed app for full functionality.</span></div>
   {/if}
   <div class="app" class:with-banner={browserPreview}>
     <nav class="rail" aria-label="Primary">
       <span class="rail-mark" title="Local-first AI Video Studio">LF</span>
       {#each items as item}
         <a class="rail-link" class:on={isOn(item)} href={item.href} title={item.label} aria-label={item.label}>
-          <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : "studio"} />
+          <Icon name={item.id === "youtube" ? "youtube" : item.id === "editor" ? "timeline" : item.id === "settings" ? "settings" : item.id === "project" ? "folder" : "studio"} />
+          <span>{item.label}</span>
         </a>
       {/each}
       <div class="rail-foot">
@@ -132,7 +170,7 @@
       {#if visited.studio}<div class="page" class:off={activePage !== "studio"}><StudioPage active={activePage === "studio"} /></div>{/if}
       {#if visited.editor}<div class="page" class:off={activePage !== "editor"}><EditorPage active={activePage === "editor"} /></div>{/if}
       {#if visited.youtube}<div class="page" class:off={activePage !== "youtube"}><YoutubePage /></div>{/if}
-      {#if visited.settings}<div class="page" class:off={activePage !== "settings"}><SettingsPage /></div>{/if}
+      {#if visited.settings}<div class="page" class:off={activePage !== "settings"}><SettingsPage active={activePage === "settings"} /></div>{/if}
       {#if visited.project}<div class="page" class:off={activePage !== "project"}><ProjectPage /></div>{/if}
     </div>
   </div>

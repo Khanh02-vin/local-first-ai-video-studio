@@ -18,7 +18,8 @@ import { HIGHLIGHT_PROMPT_VERSION } from "./providers.ts";
  */
 
 function cacheDir(): string {
-  return join(process.env.LOCAL_FIRST_STATE_DIR ?? join(process.env.HOME ?? ".", ".cache/local-first-ai-video-studio"), "llm-cache");
+  const root = process.env.LOCAL_FIRST_CACHE_DIR ?? process.env.LOCAL_FIRST_STATE_DIR ?? join(process.env.HOME ?? ".", ".cache/local-first-ai-video-studio");
+  return join(root, "llm-cache");
 }
 
 /** Key covers the prompt version, the provider identity (model included), the

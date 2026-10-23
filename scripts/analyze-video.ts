@@ -1,21 +1,29 @@
 import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
-import { GeminiHighlightProvider, LlamaCppHighlightProvider } from "../services/ai-pipeline/providers.ts";
+import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
+import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 
 const [mediaPath, sourceArtifactId, durationText, rangeStartText, rangeEndText, jobId, statePath] = process.argv.slice(2);
 const duration = Number(durationText);
 const rangeStart = Number(rangeStartText ?? 0);
 const rangeEnd = Number(rangeEndText ?? duration);
-if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeStart < 0 || rangeEnd <= rangeStart || rangeEnd > duration) { console.error("ANALYZE_INVALID_RANGE"); process.exit(2); }
-if (!mediaPath || !sourceArtifactId || !Number.isFinite(duration) || duration <= 0) {
-  console.error("ANALYZE_INVALID_ARGUMENTS");
-  process.exit(2);
-}
 
 const store = jobId && statePath ? AnalysisStore.open(statePath) : undefined;
+// Report the failure on the job row before exiting: without this the queued
+// row this worker was spawned for stays "queued" forever and the UI keeps
+// showing "Analyzing…" with no error.
+  const failJob = (code: string): never => {
+  if (store && jobId) store.update(jobId, { status: "failed", phase: "failed", error: code });
+  store?.close();
+  console.error(code);
+  process.exit(2);
+};
+if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeStart < 0 || rangeEnd <= rangeStart || rangeEnd > duration) failJob("ANALYZE_INVALID_RANGE");
+if (!mediaPath || !sourceArtifactId || !Number.isFinite(duration) || duration <= 0) failJob("ANALYZE_INVALID_ARGUMENTS");
 const persistResult = async (payload: unknown): Promise<string> => {
   const path = join(dirname(statePath ?? "."), `analysis-result-${jobId}.json`);
   await mkdir(dirname(path), { recursive: true });
@@ -31,10 +39,14 @@ process.on("SIGTERM", onSignal);
 process.on("SIGINT", onSignal);
 
 try {
+  assertAudioTrack(mediaPath);
   store?.update(jobId!, { status: "running", phase: "transcribe", progress: 0.1 });
   store?.setWorkerPid(jobId!, process.pid);
   const strategy = process.env.HIGHLIGHT_STRATEGY ?? "heuristic";
   const geminiKey = process.env.GEMINI_API_KEY ?? "";
+  const activeBaseUrl = process.env.ACTIVE_PROVIDER_BASE_URL ?? "";
+  const activeApiKey = process.env.ACTIVE_PROVIDER_API_KEY ?? "";
+  const activeModel = process.env.ACTIVE_PROVIDER_MODEL ?? "";
   const llamaBaseUrl = process.env.LOCAL_LLM_BASE_URL ?? "http://127.0.0.1:8080";
   const llamaModel = process.env.LOCAL_LLM_MODEL ?? "qwen2.5-3b-instruct";
 
@@ -54,13 +66,17 @@ try {
     },
     onChunkFail: (index: number, total: number, error: string) => store?.updateChunk(jobId!, index, { status: "failed", error }),
     onProgress: (completed: number, total: number) => store?.update(jobId!, { phase: "transcribe", progress: 0.1 + 0.8 * completed / total }),
+    // Kills the whisper/ffmpeg child currently running instead of letting it finish
+    // after this process is asked to stop (the old flag was only read between chunks).
+    shouldAbort: () => interrupted,
   };
 
   // CachedSemanticProvider: same transcript + prompt version replays stored
   // highlights instead of re-calling the LLM (identity includes the model so a
   // model swap never serves the wrong cache).
   const semanticProvider: SemanticHighlightProvider | undefined =
-    strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
+    strategy === "semantic-openai" && activeBaseUrl && activeModel ? new CachedSemanticProvider(new SemanticProviderAdapter(new OpenAIChatHighlightProvider(activeBaseUrl, activeApiKey, activeModel), "openai"), `openai:${activeBaseUrl}|${activeModel}`)
+    : strategy === "semantic-gemini" && geminiKey ? new CachedSemanticProvider(new SemanticProviderAdapter(new GeminiHighlightProvider(geminiKey), "gemini"), "gemini")
     : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
@@ -70,11 +86,15 @@ try {
   if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
   // Free tier: only the top 3 highlights, CPU + tiny already enforced by start_analysis.
   if (process.env.LICENSE_TIER !== "pro") result.highlights = result.highlights.slice(0, 3);
+  // Collections group the final (post-tier) highlight set, so every item points at
+  // a highlight the UI actually received. projectId falls back to the source
+  // artifact id — swap in a real project id once a local project store exists.
+  const payload = { ...result, collections: await groupHighlightsIntoCollections(result.highlights, { projectId: sourceArtifactId, sourceArtifactId }) };
   store?.update(jobId!, { phase: "rank", progress: 0.9 });
-  const resultPath = store ? await persistResult(result) : null;
+  const resultPath = store ? await persistResult(payload) : null;
   store?.update(jobId!, { status: "completed", phase: "completed", progress: 1, resultPath, error: null });
   store?.close();
-  process.stdout.write(JSON.stringify(result));
+  process.stdout.write(JSON.stringify(payload));
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   store?.update(jobId!, { status: interrupted ? "queued" : "failed", phase: interrupted ? "queued" : "failed", error: message });

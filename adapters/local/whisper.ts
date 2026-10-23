@@ -1,11 +1,11 @@
-import { spawn } from "node:child_process";
+import { runAbortable } from "./abortable.ts";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 
-export type WhisperOptions = { command?: string; model?: string; language?: string; timeoutMs?: number; timestampOffset?: number; idPrefix?: string; fp16?: boolean; threads?: number; device?: string };
+export type WhisperOptions = { command?: string; model?: string; language?: string; timeoutMs?: number; timestampOffset?: number; idPrefix?: string; fp16?: boolean; threads?: number; device?: string; shouldAbort?: () => boolean };
 
 export function whisperCommand(options: WhisperOptions = {}): string { return options.command ?? process.env.WHISPER_COMMAND ?? "whisper"; }
 export function whisperDevice(options: WhisperOptions = {}): string { return options.device ?? process.env.WHISPER_DEVICE ?? "cpu"; }
@@ -16,9 +16,13 @@ export async function transcribeWithWhisper(audioPath: string, sourceArtifactId:
   const output = join(dir, "result.json");
   try {
     const device = whisperDevice(options); const fp16 = whisperFp16(options);
-    const args = [audioPath, "--model", options.model ?? "tiny", "--fp16", fp16 ? "True" : "False", "--device", device, "--output_format", "json", "--output_dir", dir];
+    const args = [audioPath, "--model", options.model ?? "tiny", "--fp16", fp16 ? "True" : "False", "--device", device, "--word_timestamps", "True", "--output_format", "json", "--output_dir", dir];
     if (options.language) args.push("--language", options.language);
-    await run(whisperCommand(options), args, options.timeoutMs ?? 20 * 60_000);
+    await runAbortable(whisperCommand(options), args, {
+      timeoutMs: options.timeoutMs ?? 20 * 60_000,
+      abortLabel: "WHISPER_ABORTED",
+      shouldAbort: options.shouldAbort,
+    });
     const files = await (await import("node:fs/promises")).readdir(dir);
     const jsonName = files.find((name) => name.endsWith(".json"));
     if (!jsonName) throw new Error("WHISPER_OUTPUT_MISSING");
@@ -32,5 +36,3 @@ export async function transcribeWithWhisper(audioPath: string, sourceArtifactId:
     validateTranscript(transcript); return transcript;
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
-
-function run(command: string, args: string[], timeoutMs: number): Promise<void> { const env = { ...process.env }; delete env.PYTHONHOME; delete env.PYTHONPATH; delete env.PYTHONSTARTUP; delete env.PYTHONEXECUTABLE; return new Promise((resolve, reject) => { const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], env }); let error = ""; const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("WHISPER_TIMEOUT")); }, timeoutMs); child.stderr.on("data", (chunk: Buffer) => { error += chunk.toString(); }); child.on("error", (cause) => { clearTimeout(timer); reject(new Error(`WHISPER_SPAWN_ERROR:${cause.message}`)); }); child.on("close", (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`WHISPER_FAILED:${error.slice(-300)}`)); }); }); }

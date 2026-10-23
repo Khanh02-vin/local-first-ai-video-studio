@@ -12,7 +12,11 @@
   "app": {
     "withGlobalTauri": false,
     "security": {
-      "csp": "default-src 'self'; media-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; frame-src https://www.youtube.com https://www.youtube-nocookie.com http://localhost:14872"
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/**"]
+      },
+      "csp": "default-src 'self'; media-src 'self' asset: http://asset.localhost blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; frame-src https://www.youtube.com https://www.youtube-nocookie.com http://localhost:14872"
     },
     "windows": [
       {
@@ -39,6 +43,7 @@
     ],
     "resources": {
       "../../../scripts": "scripts",
+      "../../../scripts/detect-face-boxes.py": "scripts/detect-face-boxes.py",
       "../../../adapters": "adapters",
       "../../../packages": "packages",
       "../../../services": "services",
@@ -46,9 +51,7 @@
       "./resources/node": "node",
       "./resources/ffmpeg*": "",
       "./resources/ffprobe*": "",
-      "./resources/llama": "llama",
-      "./resources/models": "models",
-      "./resources/models/llama": "models/llama"
+      "./resources/models/*.pt": "models/"
     },
     "createUpdaterArtifacts": false
   }
