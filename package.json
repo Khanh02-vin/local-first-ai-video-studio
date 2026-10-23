@@ -32,6 +32,7 @@
     "test:rag-hybrid": "node --experimental-strip-types tests/ai-pipeline/rag-hybrid.test.ts",
     "test:related-videos": "node --experimental-strip-types tests/ai-pipeline/related-videos.test.ts",
     "test:youtube": "node --experimental-strip-types tests/ai-pipeline/youtube-transcript.test.ts",
+    "test:transcript-parity": "node --experimental-strip-types tests/ai-pipeline/transcript-parity.ts",
     "test:wiring": "node --experimental-strip-types tests/wiring/commands.test.ts && node --experimental-strip-types tests/wiring/project-hydration.test.ts && node --experimental-strip-types tests/wiring/project-save-queue.test.ts && node --experimental-strip-types tests/wiring/selected-ids.test.ts && node --experimental-strip-types tests/wiring/ipc-persistence.test.ts && node --experimental-strip-types tests/wiring/youtube-search.test.ts && node --experimental-strip-types tests/wiring/clip-workflow.test.ts",
     "contracts:generate": "scripts/contracts-generate.sh",
     "test:contracts-published": "node --experimental-strip-types tests/contracts/published.test.ts",
