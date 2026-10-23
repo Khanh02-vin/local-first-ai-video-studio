@@ -5,6 +5,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Everything here takes ~6 min normally; the one slow step is apt (a PR run once
+    # spent 41 min in apt-get on a congested mirror). A hung job should fail and be
+    # re-run, not sit for the 6-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,6 +51,7 @@ jobs:
   # instead of breaking the next Windows release build.
   windows-test:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
