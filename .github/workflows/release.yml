@@ -232,10 +232,25 @@ jobs:
     runs-on: [self-hosted, self-vostro]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: false
+      # The actions/download-artifact@v4 step died with BlobNotFound/connection
+      # resets on this runner's ISP (three consecutive publish runs). gh/curl with
+      # resume (-C -) finishes what a reset interrupts.
+      - name: Download build artifacts (resume on connection reset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          TOKEN="${{ github.token }}"
+          REPO_API="repos/${{ github.repository }}/actions/artifacts"
+          for artifact in windows-installer windows-portable macos-app; do
+            ID=$(curl -sS -H "Authorization: Bearer $TOKEN" "$REPO_API?name=$artifact" | python3 -c "import json,sys; print(json.load(sys.stdin)['artifacts'][0]['id'])")
+            ATTEMPT=0
+            until curl -sS -L -C - -H "Authorization: Bearer $TOKEN" -o "dist/$artifact.zip" "$REPO_API/$ID/zip"; do
+              ATTEMPT=$((ATTEMPT+1))
+              [ $ATTEMPT -ge 30 ] && echo "artifact $artifact: download failed after 30 resumes" >&2 && exit 1
+              sleep 5
+            done
+          done
       - name: Pick up linux AppImage from the shared staging dir
         run: |
           mkdir -p dist/linux-installer
@@ -280,9 +295,9 @@ jobs:
       - name: Rename portable asset in release
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         run: |
-          gh release upload v0.1.0 dist/windows-portable/*.zip --clobber
+          gh release upload v0.1.1 dist/windows-portable/*.zip --clobber
           # Rename the uploaded asset to customer-facing name
-          gh api repos/${{ github.repository }}/releases/tags/v0.1.0 --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -I {} gh api repos/${{ github.repository }}/releases/assets/{} -X PATCH -f name="Local-first AI Video Studio Portable.zip"
+          gh api repos/${{ github.repository }}/releases/tags/v0.1.1 --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -I {} gh api repos/${{ github.repository }}/releases/assets/{} -X PATCH -f name="Local-first AI Video Studio Portable.zip"
       - name: Upload installers to Google Drive (customer-facing links)
         run: |
           RCLONE=/home/khanh/.local/bin/rclone
@@ -300,13 +315,13 @@ jobs:
           appimage=$(ls dist/linux-installer/*.AppImage | head -1)
           portable=$(ls dist/windows-portable/*.zip | head -1)
           "$RCLONE" copyto "$mac_zip"   "$DEST/Local-first AI Video Studio.zip"
-          "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio_0.1.0_x64_en-US.msi"
-          "$RCLONE" copyto "$appimage"  "$DEST/Local-first AI Video Studio_0.1.0_amd64.AppImage"
+          "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio_0.1.1_x64_en-US.msi"
+          "$RCLONE" copyto "$appimage"  "$DEST/Local-first AI Video Studio_0.1.1_amd64.AppImage"
           "$RCLONE" copyto "$portable"  "$DEST/Local-first AI Video Studio Portable.zip"
           # Self-heal: remove the stray that pre-fix publishes left behind.
           "$RCLONE" deletefile "$DEST/portable-windows.zip" 2>/dev/null || true
           echo "=== Customer download links (Google Drive):"
-          for f in "Local-first AI Video Studio Portable.zip" "Local-first AI Video Studio.zip" "Local-first AI Video Studio_0.1.0_amd64.AppImage" "Local-first AI Video Studio_0.1.0_x64_en-US.msi"; do
+          for f in "Local-first AI Video Studio Portable.zip" "Local-first AI Video Studio.zip" "Local-first AI Video Studio_0.1.1_amd64.AppImage" "Local-first AI Video Studio_0.1.1_x64_en-US.msi"; do
             echo "$("$RCLONE" link "$DEST/$f")"
           done | tee drive-links.txt
           cat drive-links.txt >> "$GITHUB_STEP_SUMMARY"
