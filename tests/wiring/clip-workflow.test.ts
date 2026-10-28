@@ -31,6 +31,11 @@ assert.match(editor, /createEditorStateFromVariant/, "Editor must build a Render
 assert.match(editor, /variant:\$\{editingVariantId\}/, "variant edits must not overwrite highlight plans");
 assert.match(bridge, /fn render_segments[\s\S]*concat=n=\{count\}/, "desktop export must concatenate rendered ranges");
 assert.match(studio, /async function runDiarization[\s\S]*applySpeakerIntervals/, "Studio must map local diarization intervals onto transcript words");
+assert.match(studio, /async function renderManualClip/, "Studio must support manual clip rendering when AI is not ready");
+assert.match(studio, /manualBusy/, "manual render must have its own busy state");
+assert.match(studio, /renderManualClip[\s\S]*manualAspectRatio/, "manual render must use aspect ratio picker");
+assert.match(studio, /render_video[\s\S]*plan\.aspectRatio/, "manual render must pass aspect ratio through the same RenderRequest");
+assert.match(studio, /renderManualClip[\s\S]*cancelRender/, "manual render must support cancellation via the same cancel_render command");
 assert.match(studio, /async function sampleFaces[\s\S]*sample_speaker_faces/, "Studio must request temporary face samples");
 assert.match(studio, /function confirmSpeakerMatches[\s\S]*confirmed: true/, "face matching must require explicit confirmation");
 assert.match(studio, /speakerFaceMatches\s*:\s*\{ version: 1/, "confirmed mapping must be project-persisted");

@@ -2,7 +2,8 @@ import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, SemanticProviderAdapt
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
+import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
 import { dirname, join } from "node:path";
 import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
@@ -38,6 +39,34 @@ const onSignal = () => { interrupted = true; };
 process.on("SIGTERM", onSignal);
 process.on("SIGINT", onSignal);
 
+/**
+ * Loads a pre-built transcript when TRANSCRIPT_FIXTURE points at a JSON file.
+ * Whisper is skipped entirely: the fixture feeds the same highlight-selection
+ * pipeline a real transcription would, and a broken fixture fails the job with a
+ * named error instead of silently falling back to a real (and probably missing)
+ * Whisper install.
+ */
+async function loadTranscriptFixture(sourceArtifactId: string): Promise<Transcript | undefined> {
+  const fixturePath = process.env.TRANSCRIPT_FIXTURE?.trim();
+  if (!fixturePath) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(fixturePath, "utf8"));
+  } catch (error) {
+    failJob(`TRANSCRIPT_FIXTURE_UNREADABLE:${String(error)}`);
+  }
+  const transcript = parsed as Transcript;
+  try {
+    // The fixture carries its own artifact id; rebind it so highlights reference
+    // the artifact this job actually analyzes, then revalidate the whole shape.
+    const rebound = { ...transcript, sourceArtifactId };
+    validateTranscript(rebound);
+    return rebound;
+  } catch (error) {
+    failJob(`TRANSCRIPT_FIXTURE_INVALID:${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 try {
   assertAudioTrack(mediaPath);
   store?.update(jobId!, { status: "running", phase: "transcribe", progress: 0.1 });
@@ -52,12 +81,15 @@ try {
 
   const analyzeOptions = {
     command: process.env.WHISPER_COMMAND,
+    engine: process.env.WHISPER_ENGINE === "python" ? "python" as const : "cpp" as const,
     model: process.env.WHISPER_MODEL,
+    modelPath: process.env.WHISPER_MODEL_PATH,
     language: process.env.WHISPER_LANGUAGE,
     device: process.env.WHISPER_DEVICE,
     fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true",
     offsetSeconds: rangeStart,
     sourceDuration: duration,
+    transcript: await loadTranscriptFixture(sourceArtifactId),
     onChunkStart: (index: number, total: number) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
     onChunkComplete: (index: number, total: number, cacheHit: boolean) => {
       store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });

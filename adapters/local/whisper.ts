@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 
-export type WhisperOptions = { command?: string; model?: string; language?: string; timeoutMs?: number; timestampOffset?: number; idPrefix?: string; fp16?: boolean; threads?: number; device?: string; shouldAbort?: () => boolean };
+export type WhisperOptions = { engine?: "python" | "cpp"; command?: string; model?: string; modelPath?: string; language?: string; timeoutMs?: number; timestampOffset?: number; idPrefix?: string; fp16?: boolean; threads?: number; device?: string; shouldAbort?: () => boolean };
 
 export function whisperCommand(options: WhisperOptions = {}): string { return options.command ?? process.env.WHISPER_COMMAND ?? "whisper"; }
 export function whisperDevice(options: WhisperOptions = {}): string { return options.device ?? process.env.WHISPER_DEVICE ?? "cpu"; }

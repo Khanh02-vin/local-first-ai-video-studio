@@ -5,7 +5,7 @@
   "identifier": "com.localfirst.aivideostudio",
   "build": {
     "beforeDevCommand": "cd ../web && npm run dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "cd ../web && npm ci && npm run build && npm run build:node",
+    "beforeBuildCommand": "cd ../web && npm ci && npm run build && npm run build:node && cd ../.. && bash scripts/fetch-bundled-assets.sh",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/build"
   },
@@ -14,7 +14,9 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/**"]
+        "scope": [
+          "$HOME/**"
+        ]
       },
       "csp": "default-src 'self'; media-src 'self' asset: http://asset.localhost blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; frame-src https://www.youtube.com https://www.youtube-nocookie.com http://localhost:14872"
     },
@@ -51,7 +53,11 @@
       "./resources/node": "node",
       "./resources/ffmpeg*": "",
       "./resources/ffprobe*": "",
-      "./resources/models/*.pt": "models/"
+      "./resources/lfai-render*": "",
+      "./resources/models/*.pt": "models/",
+      "./resources/models/*.bin": "models/",
+      "./resources/models/*.onnx": "models/",
+      "./resources/whisper-cpp": "whisper-cpp"
     },
     "createUpdaterArtifacts": false
   }

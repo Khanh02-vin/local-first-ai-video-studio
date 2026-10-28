@@ -28,7 +28,7 @@
   type AnalysisResult = { transcript?: Transcript; highlights?: Highlight[]; collections?: Collection[]; videoId?: string; title?: string; topic?: string };
   type AnalysisJob = { status: string; phase: string; progress: number; chunkCompleted: number; chunkTotal: number; currentChunk?: number; result?: AnalysisResult; error?: string };
   type RenderRequest = { input: string; output: string; plan: RenderPlan };
-  type Meta = { name: string; duration: number; width: number; height: number };
+  type Meta = { name: string; duration: number; width: number; height: number; sourceArtifactId?: string };
   const e2eVideo = import.meta.env.MODE === "desktop-e2e" && import.meta.env.VITE_DESKTOP_E2E === "1" ? import.meta.env.VITE_DESKTOP_E2E_VIDEO : "";
   const e2eOutput = import.meta.env.MODE === "desktop-e2e" && import.meta.env.VITE_DESKTOP_E2E === "1" ? import.meta.env.VITE_DESKTOP_E2E_OUTPUT : "";
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
@@ -101,6 +101,12 @@
   let dragOver = $state(false);
   let resumableJobs = $state<JobRow[]>([]);
   let currentStep = $state<1 | 2 | 3 | 4>(1);
+
+  // Manual clip fallback when Whisper/runtime is not ready.
+  let manualStart = $state(0);
+  let manualEnd = $state(0);
+  let manualAspectRatio = $state("9:16");
+  let manualBusy = $state(false);
 
   async function choose() {
     if (!isTauri()) { message = "File dialogs only work in the desktop app — open the installed app to load a video."; return; }
@@ -328,6 +334,8 @@
     const seconds = Number.isFinite(duration) && duration > 0 ? Math.floor(duration) : 0;
     analyzeStart = 0;
     analyzeEnd = seconds > 0 ? Math.min(600, seconds) : 600;
+    manualStart = 0;
+    manualEnd = seconds > 0 ? seconds : 600;
   }
 
   async function loadVideo(path: string) {
@@ -342,7 +350,7 @@
         const stream = (probe.streams ?? []).find((item) => item.codec_type === "video");
         const duration = Number(probe.format?.duration ?? 0);
         if (!stream || !Number.isFinite(duration) || duration <= 0) throw new Error("MEDIA_NOT_VERIFIED: ffprobe returned no valid video stream or duration");
-        meta = { name: path.split(/[\\/]/).pop() ?? path, duration, width: Number(stream.width ?? 0), height: Number(stream.height ?? 0) };
+        meta = { name: path.split(/[\\/]/).pop() ?? path, duration, width: Number(stream.width ?? 0), height: Number(stream.height ?? 0), sourceArtifactId: path };
       studioState.sourcePath = path; studioState.sourceName = meta.name; studioState.sourceDuration = duration; sourceVerified = true;
       applyDefaultRange(duration);
       message = "Video loaded and verified. Set the range and start analysis.";
@@ -485,6 +493,51 @@
     } catch (error) { message = `Analyze failed: ${String(error)}`; busy = false; resetTimer(); }
   }
 
+  /// Manual clip: when Whisper/runtime is not ready, the user can still render a
+  /// hand-picked range by calling render_video directly. This keeps the same
+  /// progress/cancel path as the AI-driven render so the UI stays consistent.
+  async function renderManualClip() {
+    if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
+    if (!inputPath || !sourceVerified || manualBusy) return;
+    const duration = Number(meta?.duration ?? 0);
+    if (duration <= 0) { message = "Video duration unknown — cannot render."; return; }
+    const start = Math.max(0, Math.min(manualStart, duration - 1));
+    const end = Math.min(duration, Math.max(start + 1, manualEnd));
+    if (end <= start) { message = "Invalid range — end must be after start."; return; }
+    const output = e2eOutput || await save({ defaultPath: "manual-clip.mp4", filters: [{ name: "MP4", extensions: ["mp4"] }] });
+    if (!output) return;
+    const plan = createEditorState(meta?.sourceArtifactId ?? inputPath, duration, {
+      id: `manual-${Date.now()}`,
+      sourceArtifactId: meta?.sourceArtifactId ?? inputPath,
+      start,
+      end,
+      wordIds: [],
+      title: "Manual clip",
+      score: 100,
+      version: 1,
+    }).plan;
+    plan.aspectRatio = manualAspectRatio as "9:16" | "1:1" | "16:9";
+    const render = renderEntry(output, `manual-${Date.now()}`);
+    if (!await persistRender(render)) return;
+    manualBusy = true; rendering = true; renderProgress = 0; busy = true;
+    message = `Rendering manual clip…`;
+    try {
+      const channel = new Channel<RenderProgress>();
+      channel.onmessage = (update) => {
+        renderProgress = update.percent;
+        if (update.errorCode) { message = renderErrorCodeToMessage(update.errorCode, "Manual clip render failed"); }
+        else { message = `Rendering manual clip · ${Math.floor(update.percent)}%`; }
+      };
+      await invoke<string>("render_video", { request: { input: inputPath, output, plan } satisfies RenderRequest, onProgress: channel });
+      if (!await persistRender({ ...render, status: "completed" })) { message = `Manual clip rendered but project status not saved: ${output}`; }
+      else { message = `Manual clip rendered: ${output}`; }
+    } catch (error) {
+      const cancelled = String(error).includes("RENDER_CANCELLED");
+      await persistRender({ ...render, status: cancelled ? "cancelled" : "failed", error: String(error) });
+      message = cancelled ? "Manual clip render cancelled" : `Manual clip render failed: ${String(error)}`;
+    } finally { manualBusy = false; rendering = false; busy = false; }
+  }
+
   /// YouTube: one metadata call → transcript-based analysis (no Whisper, no download).
   async function analyzeYoutube() {
     if (!isTauri()) { message = "YouTube analysis runs in the desktop app only."; return; }
@@ -557,7 +610,14 @@
       const render = renderEntry(output, `variant:${id}`);
       if (!await persistRender(render)) return;
       const channel = new Channel<RenderProgress>();
-      channel.onmessage = (update) => { renderProgress = Math.max(renderProgress, update.percent); message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(renderProgress)}%`; };
+      channel.onmessage = (update) => {
+        renderProgress = Math.max(renderProgress, update.percent);
+        if (update.errorCode) {
+          message = renderErrorCodeToMessage(update.errorCode, "Render failed");
+        } else {
+          message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(renderProgress)}%`;
+        }
+      };
       rendering = true; renderProgress = 0;
       try {
         await invoke<string>("render_video", { request: { input: inputPath, output, plan } satisfies RenderRequest, onProgress: channel });
@@ -613,7 +673,8 @@
             const clipPercent = Math.max(renderProgress, update.percent);
             renderProgress = clipPercent;
             const overall = ((clipIndex + clipPercent / 100) / ids.length) * 100;
-            message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(overall)}%`;
+            if (update.errorCode) { message = renderErrorCodeToMessage(update.errorCode, "Render failed"); }
+            else { message = `${update.phase === "joining" ? "Joining clips" : "Rendering clips"} · ${Math.floor(overall)}%`; }
           };
           rendering = true; renderProgress = 0;
           try {
@@ -654,10 +715,33 @@
     finally { if (jobId === stoppingId && pollRun === stoppingRun + 1) { busy = false; resetTimer(); } await reconnectJobs(false); }
   }
 
-  function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
+function renderErrorCodeToMessage(code: string | undefined, fallback: string): string {
+  const map: Record<string, string> = {
+    RENDER_CANCELLED: "Người dùng đã hủy render.",
+    FFMPEG_SPAWN: "Không thể khởi chạy FFmpeg — kiểm tra cài đặt FFmpeg.",
+    FFMPEG_EXIT: "FFmpeg thoát với lỗi — có thể do codec không hỗ trợ.",
+    FFMPEG_WAIT: "Lỗi chờ FFmpeg kết thúc.",
+    RENDER_CHILD_MISSING: "Tiến trình render biến mất giữa chừng.",
+    OUTPUT_COPY: "Không thể sao chép file đầu ra.",
+    OUTPUT_PROBE_VERIFY: "File đầu ra không hợp lệ sau render.",
+    OUTPUT_RENAME: "Không thể đổi tên file đầu ra.",
+    OUTPUT_DIR: "Không thể tạo thư mục đầu ra.",
+    OUTPUT_PARENT_MISSING: "Thiếu thư mục đầu ra.",
+    INPUT_NOT_FILE: "Nguồn không phải file hợp lệ.",
+    OUTPUT_MUST_DIFFER_FROM_INPUT: "Đầu ra phải khác với nguồn.",
+    INVALID_RENDER_RANGES: "Khoảng cắt không hợp lệ.",
+    INVALID_RENDER_MEDIA: "Nguồn media không hợp lệ.",
+    RENDER_STATE_LOCK_POISONED: "Lỗi nội bộ trạng thái render.",
+    RENDER_WORKER: "Lỗi worker render.",
+  };
+  const friendly = map[code ?? ""];
+  return friendly ? `${fallback}: ${friendly}` : fallback;
+}
+function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   onMount(() => {
     void refreshRuntime(); void reconnectJobs(); void refreshProjects(); void refreshDiarizationStatus();
     if (isTauri()) invoke<string>("preview_origin").then((base) => previewBase = base).catch(() => {});
+    if (isTauri()) invoke<number>("recover_render_jobs").catch(() => {});
     const unlisten = getCurrentWindow().onDragDropEvent((event) => {
       const payload = event.payload;
       dragOver = payload.type === "over" || payload.type === "enter";
@@ -725,6 +809,26 @@
     {/if}
 
     {#if currentStep === 2}
+    {#if inputPath && sourceVerified && !runtimeStore.ready && !busy}
+    <div class="card">
+      <div class="section-title">Manual clip (Whisper not ready)</div>
+      <p class="hint">The AI transcription engine is not available. You can still render a hand-picked range directly — no analysis needed.</p>
+      <div class="field-row">
+        <label>Start <input type="number" min="0" max={meta && meta.duration > 0 ? Math.max(0, Math.floor(meta.duration) - 1) : undefined} bind:value={manualStart} /></label>
+        <label>End <input type="number" min="1" max={meta && meta.duration > 0 ? Math.floor(meta.duration) : undefined} bind:value={manualEnd} /></label>
+      </div>
+      <div class="section-title">Output format</div>
+      <div class="model-row">
+        {#each ["9:16", "1:1", "16:9"] as ratio}<button class="chip" class:on={manualAspectRatio === ratio} disabled={manualBusy} onclick={() => manualAspectRatio = ratio}>{ratio}</button>{/each}
+      </div>
+      <button class="btn btn-primary btn-wide" disabled={manualBusy || manualEnd <= manualStart} onclick={renderManualClip}>
+        {#if manualBusy}<span class="spinner"></span>{/if}
+        {manualBusy ? "Rendering…" : "Render manual clip"}
+      </button>
+      {#if manualBusy}<button class="btn btn-quiet btn-wide" onclick={cancelRender}>Cancel render</button>{/if}
+      <p class="hint" aria-live="polite">Use Settings → System Doctor to set up Whisper for AI highlights.</p>
+    </div>
+    {/if}
     <div class="card">
       <div class="section-title">AI model</div>
       <div class="model-row">

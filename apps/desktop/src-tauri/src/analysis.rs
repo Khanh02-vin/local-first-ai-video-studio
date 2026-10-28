@@ -12,9 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::contracts::AnalysisStatus;
 use crate::runtime::storage;
+use crate::analysis_store::{job_with_result, read_status, AnalysisStore, MAX_JOB_ATTEMPTS};
 use crate::paths::{
-    analysis_range_allowed, helper_env, helper_script, is_remote_input, jobs_path, node_bin,
-    probe_duration, read_sqlite_status, run_status_script, runtime_env, tool, venv_python,
+    analysis_range_allowed, app_render_temp_dir, ffmpeg_bin, helper_env, helper_script,
+    is_remote_input, jobs_path, node_bin, probe_duration, runtime_env, tool, venv_python,
 };
 use crate::paths::NODE_ARGS;
 use crate::{guard_pro_features, io_error};
@@ -90,6 +91,24 @@ pub(crate) fn start_analysis(
             "INVALID_ANALYZE_RANGE".into()
         });
     }
+
+    // Decode the source audio exactly once (16 kHz mono WAV) into the app-private
+    // temp dir, so diarize_video / sample_speaker_faces / analyze_crop_path can reuse it
+    // instead of re-decoding the whole video on every task. The path is handed to the
+    // worker via ANALYSIS_PREEXTRACTED_AUDIO; the Rust-side AI commands read the same env.
+    let temp_dir = app_render_temp_dir(&app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let audio_path = temp_dir.join(format!("analysis-{id}-audio.wav"));
+    let audio_extract = tool(ffmpeg_bin(&app))
+        .args(["-y", "-nostdin", "-v", "error", "-i"])
+        .arg(&input)
+        .args(["-vn", "-ac", "1", "-ar", "16000"])
+        .arg(&audio_path)
+        .status()
+        .map_err(|e| format!("ANALYSIS_AUDIO_EXTRACT:{e}"))?;
+    if !audio_extract.success() {
+        return Err("ANALYSIS_AUDIO_EXTRACT_FAILED".into());
+    }
+
     let mut init = tool(node_bin(&app));
     init.args(NODE_ARGS)
         .arg(init_script)
@@ -98,7 +117,8 @@ pub(crate) fn start_analysis(
         .arg(&input)
         .arg(format!("{duration:.3}"))
         .arg(format!("{range_start:.3}"))
-        .arg(format!("{range_end:.3}"));
+        .arg(format!("{range_end:.3}"))
+        .env("ANALYSIS_PREEXTRACTED_AUDIO", &audio_path);
     for (key, value) in helper_env(&app, &[]) {
         init.env(key, value);
     }
@@ -115,7 +135,8 @@ pub(crate) fn start_analysis(
         range_start,
         range_end,
     ) {
-        let _ = run_status_script(&app, &[id, "--fail".into(), "ANALYSIS_BUSY".into()]);
+        let _ = AnalysisStore::open(&jobs_path())
+            .and_then(|store| store.fail(&id, "ANALYSIS_BUSY"));
         return Err("ANALYSIS_BUSY: another analysis is already running".into());
     }
     Ok(id)
@@ -250,42 +271,62 @@ pub(crate) fn spawn_analysis_worker_reserved(
 }
 
 /// Resumes durable queued jobs left behind by a crash or restart.
+///
+/// Mirrors the status script's `--resumable` claim: a running job whose worker pid
+/// is gone (or a queued job with no live worker) counts one crash against its
+/// budget and is requeued, until the budget (`MAX_JOB_ATTEMPTS`) runs out.
 pub(crate) fn resume_queued_jobs(app: tauri::AppHandle, jobs: Jobs) {
-    let resumable = match run_status_script(&app, &["--resumable".to_string()]) {
-        Ok(value) => value,
-        Err(_) => return,
+    let Ok(store) = AnalysisStore::open(&jobs_path()) else { return };
+    let Ok(all) = store.all_jobs() else { return };
+    // Claim: bump the crash budget; a job that keeps dying without progress stops
+    // being auto-resumed until the user retries it manually.
+    let claim = |store: &AnalysisStore, job: &serde_json::Value| -> Option<serde_json::Value> {
+        let id = job["id"].as_str()?;
+        let attempts = store.bump_attempts(id).ok()?;
+        if attempts >= MAX_JOB_ATTEMPTS {
+            let _ = store.fail(id, &format!("worker died {attempts} times without progress; retry manually"));
+            return None;
+        }
+        store.mark_worker_lost(id).ok()?;
+        store.get(id).ok().flatten()
     };
-    let queued = resumable["resumable"].clone();
-    let entries = match queued.as_array() {
-        Some(entries) => entries.clone(),
-        None => return,
+    let alive = |store: &AnalysisStore, job: &serde_json::Value| -> bool {
+        store
+            .worker_pid(job["id"].as_str().unwrap_or(""))
+            .ok()
+            .flatten()
+            .map(|pid| process_alive(pid.max(0) as u32))
+            .unwrap_or(false)
     };
-    for entry in entries {
-        let (Some(id), Some(input)) = (entry["id"].as_str(), entry["input"].as_str()) else {
+    for job in all.iter() {
+        if job["status"] == "running" && !alive(&store, job) {
+            claim(&store, job);
+        }
+    }
+    let Ok(queued) = store.all_jobs() else { return };
+    for job in queued.iter().filter(|job| job["status"] == "queued") {
+        if alive(&store, job) {
+            continue;
+        }
+        let Some(claimed) = claim(&store, job) else { continue };
+        let (Some(id), Some(input)) = (claimed["id"].as_str(), claimed["input"].as_str()) else {
             continue;
         };
-        let duration = entry["duration"].as_f64().unwrap_or(0.0);
+        let duration = claimed["duration"].as_f64().unwrap_or(0.0);
         if duration <= 0.0 {
             continue;
         }
         let path = PathBuf::from(input);
         if !is_remote_input(input) && !path.is_file() {
-            let _ = run_status_script(
-                &app,
-                &[
-                    id.to_string(),
-                    "--fail".to_string(),
-                    "input file missing".to_string(),
-                ],
-            );
+            let _ = store.fail(id, "input file missing");
             continue;
         }
-        let range_start = entry["rangeStart"].as_f64().unwrap_or(0.0);
-        let range_end = entry["rangeEnd"]
+        let range_start = claimed["rangeStart"].as_f64().unwrap_or(0.0);
+        let range_end = claimed["rangeEnd"]
             .as_f64()
             .filter(|end| *end > range_start)
             .unwrap_or(duration);
-    if !spawn_analysis_worker(
+        if !spawn_analysis_worker(
             app.clone(),
             jobs.clone(),
             id.to_string(),
@@ -301,16 +342,17 @@ pub(crate) fn resume_queued_jobs(app: tauri::AppHandle, jobs: Jobs) {
 
 #[tauri::command]
 pub(crate) fn analysis_status(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     _jobs: tauri::State<'_, Jobs>,
     id: String,
 ) -> Result<AnalysisStatus, String> {
-    read_sqlite_status(&app, &id)
+    read_status(&id)
 }
 
 #[tauri::command]
-pub(crate) fn list_analysis_jobs(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    run_status_script(&app, &["--active".to_string()])
+pub(crate) fn list_analysis_jobs(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let store = AnalysisStore::open(&jobs_path())?;
+    Ok(serde_json::Value::Array(store.all_jobs()?))
 }
 
 /// Clears the crash budget and requeues failed chunks, then restarts the worker.
@@ -335,20 +377,17 @@ pub(crate) fn retry_analysis(
         return Err("ANALYSIS_BUSY: another analysis is already running".into());
     }
     let slot = RunningGuard(&ANALYSIS_RUNNING);
-    let job = run_status_script(&app, &[id.clone(), "--retry".to_string()])?;
+    let store = AnalysisStore::open(&jobs_path())?;
+    if !store.retry(&id)? {
+        return Err("JOB_NOT_RETRYABLE: only failed jobs can be retried".into());
+    }
+    let job = store.get(&id)?.ok_or("JOB_NOT_FOUND")?;
     let (Some(input), Some(duration)) = (job["input"].as_str(), job["duration"].as_f64()) else {
         return Err("JOB_NOT_FOUND".into());
     };
     let path = PathBuf::from(input);
     if !is_remote_input(input) && !path.is_file() {
-        let _ = run_status_script(
-            &app,
-            &[
-                id.clone(),
-                "--fail".to_string(),
-                "input file missing".to_string(),
-            ],
-        );
+        let _ = store.fail(&id, "input file missing");
         return Err("INPUT_NOT_FILE".into());
     }
     let range_start = job["rangeStart"].as_f64().unwrap_or(0.0);
@@ -370,26 +409,28 @@ pub(crate) fn retry_analysis(
 
 /// Stops a job from being auto-resumed without deleting its transcript cache.
 #[tauri::command]
-pub(crate) fn abandon_analysis(app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> {
-    run_status_script(
-        &app,
-        &[id, "--fail".to_string(), "abandoned by user".to_string()],
-    )
+pub(crate) fn abandon_analysis(_app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> {
+    let store = AnalysisStore::open(&jobs_path())?;
+    store.fail(&id, "abandoned by user")?;
+    Ok(store.get(&id)?.unwrap_or(serde_json::Value::Null))
 }
 
-/// Kills the analysis worker for a job and marks it failed cleanly (user abort).
+/// Kills the analysis worker for a job and marks it cancelled cleanly (user abort).
 #[tauri::command]
-pub(crate) fn stop_analysis(app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> {
-    let status = run_status_script(&app, &[id.clone()])?;
-    run_status_script(&app, &[id.clone(), "--cancel".to_string()])?;
+pub(crate) fn stop_analysis(_app: tauri::AppHandle, id: String) -> Result<serde_json::Value, String> {
+    let store = AnalysisStore::open(&jobs_path())?;
     // Prefer the pid Rust spawned (authoritative); fall back to the worker's own
     // record for a job started by a previous app run.
     let spawned = ANALYSIS_WORKERS.lock().ok().and_then(|guard| guard.get(&id).copied());
-    let recorded = status["workerPid"].as_i64().filter(|pid| *pid > 0).map(|pid| pid as u32);
+    let recorded = store
+        .worker_pid(&id)?
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid as u32);
     for pid in spawned.into_iter().chain(recorded) {
         kill_analysis_worker(pid);
     }
-    run_status_script(&app, &[id])
+    store.cancel(&id)?;
+    job_with_result(&store, &id)?.ok_or_else(|| "JOB_NOT_FOUND".into())
 }
 
 /// Stops the detached llama-server and RAG sidecar processes, if running.

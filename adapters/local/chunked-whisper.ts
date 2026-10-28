@@ -2,6 +2,8 @@ import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { transcribeWithWhisper, whisperDevice, whisperFp16, type WhisperOptions } from "./whisper.ts";
+import { transcribeWithWhisperCpp } from "./whisper-cpp.ts";
+import { resolveWhisperCommand, resolveWhisperModelPath } from "./whisper-engine.ts";
 import { runAbortable } from "./abortable.ts";
 import type { Transcript, Word, TranscriptSegment } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
@@ -10,6 +12,9 @@ import { sourceFingerprint, chunkCacheKey, cachePath, readCachedTranscript, writ
 export type ChunkedWhisperOptions = WhisperOptions & { ffmpegCommand?: string; chunkSeconds?: number; overlapSeconds?: number; offsetSeconds?: number; sourceDuration?: number; chunkTimeoutMs?: number; onProgress?: (completed: number, total: number) => void; onChunkStart?: (index: number, total: number) => void; onChunkComplete?: (index: number, total: number, cacheHit: boolean) => void; onChunkFail?: (index: number, total: number, error: string) => void };
 
 export async function transcribeChunkedWithWhisper(audioPath: string, sourceArtifactId: string, duration: number, options: ChunkedWhisperOptions = {}): Promise<Transcript> {
+  const engine = options.engine ?? process.env.WHISPER_ENGINE ?? "cpp";
+  const cppCommand = resolveWhisperCommand("cpp", options.command ?? process.env.WHISPER_COMMAND, "whisper-cli");
+  const cppModel = resolveWhisperModelPath("cpp", options.modelPath ?? process.env.WHISPER_MODEL_PATH, process.env.WHISPER_CPP_MODEL ?? "");
   const chunkSeconds = Math.max(30, options.chunkSeconds ?? Number(process.env.WHISPER_CHUNK_SECONDS ?? 120));
   const overlap = Math.min(5, Math.max(0, options.overlapSeconds ?? 1));
   const offsetSeconds = options.offsetSeconds ?? 0;
@@ -22,7 +27,7 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
       if (options.shouldAbort?.()) throw new Error("ANALYZE_INTERRUPTED");
       const start = offsetSeconds + Math.max(0, index * chunkSeconds - (index ? overlap : 0));
       const end = Math.min(offsetSeconds + duration, offsetSeconds + (index + 1) * chunkSeconds);
-      const key = await chunkCacheKey(audioPath, index, start, end, options.model ?? "tiny", options.language, whisperDevice(options), whisperFp16(options), source);
+      const key = await chunkCacheKey(audioPath, index, start, end, `${engine}:${cppModel || options.modelPath || options.model || "tiny"}`, options.language, whisperDevice(options), whisperFp16(options), source);
       options.onChunkStart?.(index, total);
       let cacheHit = false;
       let part: Transcript;
@@ -33,7 +38,9 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
           const chunk = join(root, `chunk-${index}.wav`);
           try {
             await runAbortable(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], { timeoutMs: options.chunkTimeoutMs ?? 120_000, abortLabel: "CHUNK_FFMPEG_ABORTED", shouldAbort: options.shouldAbort });
-            const result = await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
+            const result = engine === "cpp"
+              ? await transcribeWithWhisperCpp(chunk, sourceArtifactId, options.sourceDuration ?? duration, { command: cppCommand ?? "whisper-cli", modelPath: cppModel ?? "", language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort })
+              : await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
             await writeCachedTranscript(cachePath(source, key), result); return result;
           } finally { await rm(chunk, { force: true }); }
         })();

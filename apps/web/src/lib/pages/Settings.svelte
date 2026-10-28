@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
-  import { refreshRuntime, runtimeStore } from "../runtime-status.svelte.ts";
+  import { refreshRuntime, runtimeStore, downloadWhisperCppModel, refreshWhisperCppModels, setupWhisperCpp, smokeWhisperCpp, startWhisperBootstrap, stopBootstrapPoll } from "../runtime-status.svelte.ts";
 
 let { active = true }: { active?: boolean } = $props();
 
@@ -34,10 +34,92 @@ let llmSetupBusy = $state(false);
 let smallBusy = $state(false);
 let smallProgress = $state<Progress | null>(null);
 let smallPresent = $state(false);
+let ggmlBusy = $state("");
 let hfToken = $state("");
 let diarizationInstalled = $state(false);
 let hfTokenPresent = $state(false);
 let diarizationBusy = $state(false);
+
+// System Doctor state
+let doctorBusy = $state(false);
+let doctorMessage = $state("");
+
+// System Doctor: one-click environment check + fix
+  async function downloadGgml(model: "base" | "small-q5_1") {
+    if (ggmlBusy) return;
+    ggmlBusy = model;
+    try { await downloadWhisperCppModel(model); doctorMessage = `Whisper.cpp ${model} model ready.`; }
+    catch (error) { doctorMessage = `Model download failed: ${String(error)}`; }
+    finally { ggmlBusy = ""; }
+  }
+
+  async function runSystemDoctor() {
+    if (!isTauri() || doctorBusy) return;
+    doctorBusy = true;
+    doctorMessage = "Running system check…";
+    try {
+      const status = await invoke<{ ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; modelReady: boolean; device?: string; model?: string }>("runtime_status");
+      // Refresh the shared store
+      await refreshRuntime(true);
+      // Build a summary message
+      const components = runtimeStore.components;
+      const missing: string[] = [];
+      if (!components.ffmpeg) missing.push("ffmpeg");
+      if (!components.ffprobe) missing.push("ffprobe");
+      if (!components.node) missing.push("node");
+      if (!components.whisper) missing.push("whisper");
+      if (!components.model) missing.push("model");
+      if (missing.length === 0) {
+        doctorMessage = "✓ All components ready. Engine is fully operational.";
+      } else {
+        doctorMessage = `Missing: ${missing.join(", ")}. Use the buttons below to install.`;
+      }
+    } catch (error) {
+      doctorMessage = `System check failed: ${String(error)}`;
+    } finally {
+      doctorBusy = false;
+    }
+  }
+
+  async function installWhisperNow() {
+    if (!isTauri() || doctorBusy) return;
+    doctorBusy = true;
+    doctorMessage = "Starting Whisper bootstrap…";
+    try {
+      await startWhisperBootstrap();
+      doctorMessage = "Whisper bootstrap started. Progress will appear below.";
+    } catch (error) {
+      doctorMessage = `Failed to start Whisper bootstrap: ${String(error)}`;
+      doctorBusy = false;
+    }
+  }
+
+  async function smokeWhisperCppNow() {
+    if (!isTauri() || doctorBusy || !runtimeStore.whisperCpp) return;
+    doctorBusy = true;
+    doctorMessage = "Running real Whisper.cpp CPU smoke test…";
+    try { await smokeWhisperCpp(); doctorMessage = "Whisper.cpp CPU/model smoke test passed."; }
+    catch (error) { doctorMessage = `Whisper.cpp smoke test failed: ${String(error)}`; }
+    finally { doctorBusy = false; }
+  }
+
+  async function setupWhisperCppNow() {
+    if (!isTauri() || doctorBusy) return;
+    doctorBusy = true;
+    doctorMessage = "Activating Whisper.cpp — no Python required…";
+    try {
+      await setupWhisperCpp();
+      doctorMessage = "Whisper.cpp is ready. Analysis now runs without Python.";
+    } catch (error) {
+      doctorMessage = `Whisper.cpp setup failed: ${String(error)}`;
+    } finally { doctorBusy = false; }
+  }
+
+  async function stopWhisperBootstrap() {
+    stopBootstrapPoll();
+    doctorBusy = false;
+    doctorMessage = "Whisper bootstrap polling stopped.";
+  }
 
 async function setupWhisper() {
   if (!isTauri()) { message = "Whisper setup runs in the desktop app only."; return; }
@@ -170,7 +252,7 @@ async function pollSmall() {
 onMount(refresh);
 onMount(readStrategy);
 onMount(loadAiProviders);
-onMount(() => { void reloadSetupState(); });
+onMount(() => { void reloadSetupState(); void refreshWhisperCppModels(); });
 $effect(() => {
   const setupBusy = whisperBusy || llmSetupBusy || smallBusy;
   if (!active || !setupBusy) return;
@@ -227,8 +309,8 @@ $effect(() => {
         </div>
 
         <div class="panel">
-          <div class="panel-title"><span class="eyebrow">First-run setup</span></div>
-          <div class="spread"><span class="note" style="margin:0;">Whisper — installs openai-whisper + PyTorch into the app's own environment (one time, a few GB).</span><button class="btn btn-sm" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Setup Whisper"}</button></div>
+          <div class="panel-title"><span class="eyebrow">Legacy Python fallback</span></div>
+          <div class="spread"><span class="note" style="margin:0;">Deprecated: openai-whisper/PyTorch Python venv is retained only for existing installations. New setups should use the bundled Whisper.cpp engine above.</span><button class="btn btn-sm btn-quiet" disabled={whisperBusy} onclick={setupWhisper}>{whisperBusy ? "Setting up…" : "Use legacy Python fallback"}</button></div>
           {#if whisperProgress}<p class="hint" aria-live="polite">{whisperProgress.message}{whisperProgress.error ? ` — ${whisperProgress.error}` : ""}</p>{:else}<p class="note">Status unknown — press Setup to check.</p>{/if}
           <div class="spread" style="border-top:1px solid var(--line-soft);padding-top:.6rem;">
             <span class="note" style="margin:0;">Local LLM — optional llama.cpp runtime and Qwen2.5-3B GGUF model (~2.2 GB total); downloads on request and verifies checksums.</span><button class="btn btn-sm" disabled={llmSetupBusy || (modelPresent && llamaRuntimePresent)} onclick={setupLocalLlm}>{modelPresent && llamaRuntimePresent ? "Ready ✓" : llmSetupBusy ? "Installing…" : "Install Local LLM"}</button>
@@ -244,6 +326,19 @@ $effect(() => {
           <p class="hint">Before use, visit the <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noreferrer">pyannote/speaker-diarization-3.1 model page</a> and accept its access conditions. The token is kept in this app's local runtime settings and passed only to the local diarization process.</p>
           <div class="spread"><span class="note">Runtime: {diarizationInstalled ? "installed" : "not installed"} · Token: {hfTokenPresent ? "saved" : "not saved"}</span><button class="btn btn-sm" disabled={diarizationBusy || diarizationInstalled} onclick={setupDiarization}>{diarizationInstalled ? "Installed ✓" : diarizationBusy ? "Installing…" : "Install optional runtime"}</button></div>
           {#if !runtimeStore.components.whisper}<p class="hint">Set up the app's Python/Whisper environment first.</p>{/if}
+        </div>
+
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">System Doctor</span><span class="badge" class:ok={runtimeStore.whisperCpp}>{runtimeStore.whisperEngine === "cpp" ? "Whisper.cpp active" : runtimeStore.whisperCpp ? "Whisper.cpp ready" : "Whisper.cpp missing"}</span></div>
+          <p class="note">One-click local engine check. Whisper.cpp uses the bundled binary and ggml model — no Python or PyTorch.</p>
+          <p class="note">GGML models: {#each runtimeStore.whisperCppModels ?? [] as model}<span class="badge" class:ok={model.ready}>{model.name} {model.ready ? "ready" : "not downloaded"}</span>{/each}</p>
+          <div class="spread"><button class="btn btn-sm" disabled={!!ggmlBusy} onclick={() => downloadGgml("base")}>{ggmlBusy === "base" ? "Downloading…" : "Download GGML base (~142 MB)"}</button><button class="btn btn-sm" disabled={!!ggmlBusy} onclick={() => downloadGgml("small-q5_1")}>{ggmlBusy === "small-q5_1" ? "Downloading…" : "Download GGML small q5 (~190 MB)"}</button></div>
+          <div class="spread"><button class="btn btn-sm" disabled={doctorBusy} onclick={runSystemDoctor}>{doctorBusy ? "Checking…" : "Run system check"}</button><button class="btn btn-sm" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={smokeWhisperCppNow}>CPU smoke test</button><button class="btn btn-sm btn-primary" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={setupWhisperCppNow}>{runtimeStore.whisperEngine === "cpp" ? "Whisper.cpp active ✓" : "Setup Whisper.cpp (no Python)"}</button></div>
+          <div class="spread"><span class="note" style="margin:0;">Python venv is deprecated. Use bundled Whisper.cpp for new setups.</span><button class="btn btn-sm" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={setupWhisperCppNow}>{runtimeStore.whisperEngine === "cpp" ? "Active ✓" : "Use Whisper.cpp"}</button></div>
+          {#if !runtimeStore.whisperCpp}<p class="hint">Rebuild after running <code>scripts/fetch-bundled-assets.sh</code> to include whisper-cli and ggml-tiny.bin.</p>{/if}
+          {#if doctorBusy && runtimeStore.whisperBootstrap}<p class="hint" aria-live="polite">{runtimeStore.whisperBootstrap.message} ({Math.round(runtimeStore.whisperBootstrap.progress * 100)}%)</p>{/if}
+          {#if doctorMessage}<p class="hint" aria-live="polite">{doctorMessage}</p>{/if}
+          <button class="btn btn-sm btn-quiet" disabled={!doctorBusy || !runtimeStore.whisperBootstrap} onclick={stopWhisperBootstrap}>Stop bootstrap polling</button>
         </div>
 
         <div class="panel">

@@ -6,11 +6,12 @@
 // the app does.
 //
 // Usage:
-//   lfai-render probe  <input>
-//   lfai-render render <request.json> [--ffmpeg PATH] [--ffprobe PATH]
+//   lfai-render probe  <input> [--ffprobe PATH]
+//   lfai-render render <request.json> [--ffmpeg PATH] [--ffprobe PATH] [--hardware]
 //
 // `render` writes the resulting file path to stdout as JSON. Progress is reported on
-// stderr as `{"percent":..,"phase":".."}` lines so a caller can stream it.
+// stderr as `{"percent":..,"phase":".."}` lines so a caller can stream it. `--hardware`
+// requests a GPU encoder (nvenc/videotoolbox/qsv) when the platform provides one.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -81,6 +82,21 @@ fn probe_command(flags: &[String]) -> Result<String, String> {
     serde_json::to_string(&metadata).map_err(|e| format!("PROBE_JSON:{e}"))
 }
 
+/// True when `--hardware` was passed: prefer the platform GPU encoder.
+fn prefer_hardware(flags: &[String]) -> bool {
+    flags.iter().any(|value| value == "--hardware")
+}
+
+/// Scratch root for temp render dirs and the progress log. `LOCAL_FIRST_STATE_DIR`
+/// keeps the CLI's scratch next to the app's own data (owner-only) when the app
+/// spawns it; a bare headless run falls back to the system temp dir.
+fn scratch_root() -> PathBuf {
+    std::env::var("LOCAL_FIRST_STATE_DIR")
+        .ok()
+        .map(|state| PathBuf::from(state).join("tmp"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn render_command(flags: &[String]) -> Result<String, String> {
     let request_path = flags
         .iter()
@@ -131,6 +147,11 @@ fn render_command(flags: &[String]) -> Result<String, String> {
             serde_json::json!({ "percent": progress.percent, "phase": progress.phase })
         );
     };
+    let temp_dir = scratch_root();
+    let progress_log = temp_dir.join(format!(
+        "local-first-render-progress-{}.log",
+        std::process::id()
+    ));
     let rendered = engine::render_segments(
         &ffmpeg,
         &ffprobe,
@@ -140,6 +161,9 @@ fn render_command(flags: &[String]) -> Result<String, String> {
         Some(request.plan.aspect_ratio.clone()),
         Some(&plan),
         &on_progress,
+        &temp_dir,
+        &progress_log,
+        prefer_hardware(flags),
     )?;
     serde_json::to_string(&rendered).map_err(|e| format!("RENDER_JSON:{e}"))
 }

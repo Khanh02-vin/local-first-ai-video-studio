@@ -8,12 +8,13 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use render_engine::contracts::{RenderProgress, RenderRequest};
-use render_engine::engine;
-
 use crate::analysis::RunningGuard;
-use crate::paths::{ffmpeg_bin, ffprobe_bin, is_remote_input};
+use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, is_remote_input, render_progress_log};
+use crate::project_store::{save};
 use crate::youtube::resolve_stream_url;
+use render_engine::contracts::{RenderProgress, RenderRequest};
+use render_engine::engine::{render_segments};
+use serde_json::Value;
 
 /// Set while a render is being asked to stop. This is the engine's own flag: the app
 /// and the CLI share it, so a cancel reaches whichever renderer is running.
@@ -53,6 +54,8 @@ pub(crate) async fn render_video(
         }
         let _guard = RunningGuard(&RENDER_RUNNING);
         RENDER_CANCELLED.store(false, Ordering::SeqCst);
+        let temp_dir = app_render_temp_dir(&app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+        let progress_log = render_progress_log(&app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
         let result = (|| {
             if request.plan.version == 0
                 || request.plan.source_artifact_id.trim().is_empty()
@@ -84,7 +87,7 @@ pub(crate) async fn render_video(
                 }
                 vec![input_path.to_string_lossy().into_owned()]
             };
-            engine::render_segments(
+            render_segments(
                 &ffmpeg_bin(&app),
                 &ffprobe_bin(&app),
                 &media,
@@ -93,6 +96,9 @@ pub(crate) async fn render_video(
                 Some(request.plan.aspect_ratio.clone()),
                 Some(&plan),
                 &ChannelSink(&on_progress),
+                &temp_dir,
+                &progress_log,
+                request.plan.hardware_acceleration.unwrap_or(false),
             )
         })();
         result
@@ -108,4 +114,29 @@ pub(crate) fn cancel_render() -> Result<(), String> {
     }
     RENDER_CANCELLED.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// Startup reconciliation: scans every project in `projects.sqlite` and resets any
+/// render record still stuck in `running` (app was killed mid-render) to `interrupted`,
+/// so the UI never shows a forever-running render after a crash or force-quit.
+#[tauri::command]
+pub(crate) fn recover_render_jobs() -> Result<usize, String> {
+    let dir = data_dir();
+    let mut projects = crate::project_store::list(&dir)?;
+    let mut recovered = 0;
+    for project in projects.iter_mut() {
+        let mut changed = false;
+        for render in project.renders.iter_mut() {
+            if render.get("status").and_then(|v| v.as_str()) == Some("running") {
+                render["status"] = Value::String("interrupted".into());
+                render["error"] = Value::String("recovered after restart".into());
+                changed = true;
+                recovered += 1;
+            }
+        }
+        if changed {
+            save(&dir, project.clone())?;
+        }
+    }
+    Ok(recovered)
 }

@@ -16,6 +16,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RES="$ROOT/apps/desktop/src-tauri/resources"
 NODE_VERSION="${NODE_VERSION:-v24.21.0}"
 WHISPER_MODELS="${WHISPER_MODELS:-tiny base}"
+WHISPER_CLI_VERSION="${WHISPER_CLI_VERSION:-b5454}"
 ARCH="$(uname -m)"
 OS="$(uname -s)"
 
@@ -52,7 +53,9 @@ if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
   # real weights are only needed when Whisper actually runs).
   mkdir -p "$RES/models"
   [[ -e "$RES/models/tiny.pt" ]] || : > "$RES/models/tiny.pt"
-  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models)"
+  [[ -e "$RES/whisper-cli" ]] || : > "$RES/whisper-cli"
+  [[ -e "$RES/models/ggml-tiny.bin" ]] || : > "$RES/models/ggml-tiny.bin"
+  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models, whisper-cli)"
   exit 0
 fi
 
@@ -156,6 +159,29 @@ else
   rm -rf "$tmp"
 fi
 
+# --- lfai-render CLI (workspace crate; built from source) ----------------------
+# Headless front door to the render engine: the app spawns it when a caller wants
+# a render in a separate process. Built with the same toolchain that compiles the
+# app, so it lands in resources/ next to ffmpeg/ffprobe and ships in the installer.
+lf_target() {
+  if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then echo "$RES/$1.exe"; else echo "$RES/$1"; fi
+}
+if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
+  [[ -e "$RES/lfai-render" ]] || : > "$RES/lfai-render"
+  echo "==> LIGHTWEIGHT: lfai-render placeholder created"
+elif [[ -e "$(lf_target lfai-render)" && -s "$(lf_target lfai-render)" ]]; then
+  echo "==> lfai-render already present"
+else
+  echo "==> lfai-render: building from workspace (cargo build --release -p lfai-render)"
+  (cd "$ROOT/apps/desktop/src-tauri" && cargo build --release -p lfai-render)
+  built="$ROOT/apps/desktop/src-tauri/target/release/lfai-render"
+  [[ -f "$built.exe" ]] && built="$built.exe"
+  [[ -f "$built" ]] || { echo "lfai-render binary not found after build" >&2; exit 1; }
+  cp -f "$built" "$(lf_target lfai-render)"
+  chmod +x "$(lf_target lfai-render)"
+  echo "    lfai-render installed"
+fi
+
 # --- whisper models (HuggingFace CDN — Azure blob blocked from CI IPs) ----------
 # NOTE: GitHub Actions runners are IP-blocked from openaipublic.azureedge.net.
 # HuggingFace CDN works from all CI environments.
@@ -174,7 +200,87 @@ for model in $WHISPER_MODELS; do
   curl -L --fail --retry 3 -o "$final" "$url"
 done
 
+# --- whisper-cli binary (standalone, no Python) --------------------------------
+# whisper.cpp official releases provide prebuilt binaries for major platforms.
+# We download the CLI binary directly; no Python/PyTorch needed at runtime.
+echo "==> whisper-cli binary: $WHISPER_CLI_VERSION"
+case "$OS-$ARCH" in
+  Linux-x86_64)
+    WHISPER_CLI_URL="https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_CLI_VERSION}/whisper-bin-ubuntu-x64.tar.gz"
+    WHISPER_CLI_DIR="whisper-bin-ubuntu-x64"
+    WHISPER_CLI_BIN="whisper-cli"
+    ;;
+  Linux-aarch64)
+    WHISPER_CLI_URL="https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_CLI_VERSION}/whisper-bin-ubuntu-arm64.tar.gz"
+    WHISPER_CLI_DIR="whisper-bin-ubuntu-arm64"
+    WHISPER_CLI_BIN="whisper-cli"
+    ;;
+  Darwin-arm64)
+    echo "whisper.cpp macOS binary bundle is not part of the pinned release; set WHISPER_CLI_URL to a signed build." >&2; exit 1
+    ;;
+  Darwin-x86_64)
+    echo "whisper.cpp macOS binary bundle is not part of the pinned release; set WHISPER_CLI_URL to a signed build." >&2; exit 1
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    WHISPER_CLI_URL="https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_CLI_VERSION}/whisper-bin-x64.zip"
+    WHISPER_CLI_DIR="whisper-bin-x64"
+    WHISPER_CLI_BIN="whisper-cli.exe"
+    ;;
+  *) echo "unsupported platform for whisper-cli: $OS-$ARCH" >&2; exit 1 ;;
+esac
+
+WHISPER_CLI_TARGET="$RES/whisper-cpp/$WHISPER_CLI_BIN"
+if [[ -x "$WHISPER_CLI_TARGET" ]]; then
+  echo "    whisper-cli already present"
+else
+  echo "  Fetching whisper-cli: $WHISPER_CLI_URL"
+  tmp="$(mktemp -d)"
+  mkdir -p "$tmp/x"
+  curl -L --fail --retry 3 -o "$tmp/whisper-cli.pkg.part" "$WHISPER_CLI_URL"
+  mv "$tmp/whisper-cli.pkg.part" "$tmp/whisper-cli.pkg"
+  case "$WHISPER_CLI_URL" in
+    *.tar.gz|*.tgz) tar xf "$tmp/whisper-cli.pkg" -C "$tmp/x" ;;
+    *.zip) extract_zip "$tmp/whisper-cli.pkg" "$tmp/x" 2>/dev/null || unzip -q -o "$tmp/whisper-cli.pkg" -d "$tmp/x" 2>/dev/null || true ;;
+    *) echo "unsupported whisper-cli package type: $WHISPER_CLI_URL" >&2; exit 1 ;;
+  esac
+  found_cli="$(find "$tmp/x" -type f \( -name 'whisper-cli' -o -name 'whisper-cli.exe' \) | head -1)"
+  if [[ -z "$found_cli" ]]; then
+    echo "whisper-cli binary not found in archive" >&2; exit 1
+  fi
+  WHISPER_CLI_TARGET="$RES/whisper-cpp/$WHISPER_CLI_BIN"
+  mkdir -p "$RES/whisper-cpp"
+  cp -f "$found_cli" "$WHISPER_CLI_TARGET"
+  # Copy the shared libraries shipped beside whisper-cli; the runtime resolver
+  # launches with this directory as its library root.
+  found_dir="$(dirname "$found_cli")"
+  find "$found_dir" -maxdepth 1 -type f \( -name 'libwhisper*.so*' -o -name 'libggml*.so*' -o -name 'libwhisper*.dylib' -o -name 'libggml*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/whisper-cpp/" \;
+  if [[ "$OS" == Linux* ]]; then
+    for lib in libwhisper.so.1.9.5 libggml.so.0.26.0 libggml-base.so.0.26.0; do
+      [[ -f "$RES/whisper-cpp/$lib" ]] || continue
+      case "$lib" in
+        libwhisper.so.1.9.5) ln -sf "$lib" "$RES/whisper-cpp/libwhisper.so.1" ;;
+        libggml.so.0.26.0) ln -sf "$lib" "$RES/whisper-cpp/libggml.so.0" ;;
+        libggml-base.so.0.26.0) ln -sf "$lib" "$RES/whisper-cpp/libggml-base.so.0" ;;
+      esac
+    done
+  fi
+  chmod +x "$WHISPER_CLI_TARGET"
+  rm -rf "$tmp"
+  echo "    whisper-cli installed"
+fi
+
+# --- whisper.cpp ggml model (tiny) ---
+WHISPER_MODEL_TINY="$RES/models/ggml-tiny.bin"
+WHISPER_MODEL_TINY_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+if [[ -s "$WHISPER_MODEL_TINY" ]]; then
+  echo "    whisper.cpp model ggml-tiny.bin already present"
+else
+  echo "  Fetching whisper.cpp model: $WHISPER_MODEL_TINY_URL"
+  curl -L --fail --retry 3 -o "$WHISPER_MODEL_TINY" "$WHISPER_MODEL_TINY_URL"
+  echo "    whisper.cpp model ggml-tiny.bin installed"
+fi
+
 # --- no local-LLM assets are staged in default builds -------------------------
 
 echo "==> Assets ready:"
-du -sh "$RES/node" "$RES/ffmpeg" "$RES/models" 2>/dev/null || true
+du -sh "$RES/node" "$RES/ffmpeg" "$RES/models" "$RES/whisper-cli" 2>/dev/null || true

@@ -68,12 +68,16 @@ pub struct RenderRange {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[typeshare]
 #[serde(rename_all = "camelCase")]
 pub struct RenderPlan {
     pub version: u32,
     pub source_artifact_id: String,
     pub ranges: Vec<RenderRange>,
     pub aspect_ratio: String,
+    #[serde(default)]
+    pub hardware_acceleration: Option<bool>,
+    #[typeshare(skip)]
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -92,4 +96,6 @@ pub struct RenderRequest {
 pub struct RenderProgress {
     pub percent: f64,
     pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }

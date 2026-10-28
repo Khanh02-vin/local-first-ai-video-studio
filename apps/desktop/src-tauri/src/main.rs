@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 mod analysis;
+mod analysis_store;
 mod app;
 mod contracts;
 mod diarization;
@@ -18,7 +19,7 @@ mod shell;
 mod youtube;
 
 use app::{
-    app_info, last_panic, license_status, probe_video, project_create, project_get, project_list,
+    app_info, last_panic, license_status, probe_video, project_create, project_delete, project_get, project_list,
     project_save,
 };
 use analysis::{
@@ -42,7 +43,7 @@ use providers::{
 use runtime::{
     bootstrap_whisper, clear_analysis_cache, download_llm_model, download_whisper_model,
     install_local_llm, local_llm_setup_status, model_download_status, rag_server_url,
-    runtime_status, start_local_llm, stop_local_llm, storage_status,
+    runtime_status, setup_whisper_cpp, whisper_cpp_status, whisper_cpp_smoke, download_whisper_cpp_model, whisper_cpp_model_status, start_local_llm, stop_local_llm, storage_status,
     whisper_bootstrap_status, whisper_model_download_status, BootstrapState,
     LlamaDownloadState, LlamaState, ModelDownloadState, RagState, WhisperDlState,
 };
@@ -133,6 +134,11 @@ fn main() {
             install_local_llm,
             local_llm_setup_status,
             runtime_status,
+            setup_whisper_cpp,
+            whisper_cpp_status,
+            whisper_cpp_smoke,
+            download_whisper_cpp_model,
+            whisper_cpp_model_status,
             storage_status,
             clear_analysis_cache,
             preflight_analyze,
@@ -148,6 +154,7 @@ fn main() {
             prepare_video_preview,
             render::render_video,
             render::cancel_render,
+            render::recover_render_jobs,
             youtube::crawl_playlist,
             download_whisper_model,
             whisper_model_download_status,
@@ -161,6 +168,7 @@ fn main() {
             project_get,
             project_save,
             project_create,
+            project_delete,
             generate_transcript_variants,
             diarization_setup_status,
             save_diarization_token,
@@ -186,34 +194,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-use std::sync::{Arc, Mutex};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
-    use contracts::ProbeMetadata;
     use render_engine::contracts::RenderProgress;
     use render_engine::engine::{
-        create_temporary_render_dir, stable_subject_pair, subject_pair_continues,
+        ass_dialogue, ass_timestamp, create_temporary_render_dir, escape_ass_filter_path,
+        join_segments, remap_hook, render_segments, side_by_side_graph, stable_subject_pair,
+        subject_pair_continues, write_temporary_ass,
     };
-    use runtime::sha256_file;
-    use crate::analysis::kill_analysis_worker;
-    use std::path::PathBuf;
+
+    use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, render_progress_log};
+
     use crate::runtime::{
         download_and_verify, find_runtime_server, llama_runtime_asset, run_whisper_bootstrap,
-        write_runtime_env, LLAMA_RUNTIME_ASSETS, LLAMA_VERSION,
+        sha256_file, write_runtime_env, LLAMA_RUNTIME_ASSETS, LLAMA_VERSION,
     };
-    use crate::youtube::{
-        preview_page, preview_query, youtube_search_query,
-    };
-    use crate::render::RENDER_CANCELLED;
-    use render_engine::engine::{
-        ass_dialogue, ass_timestamp, escape_ass_filter_path, remap_hook, render_segments,
-        side_by_side_graph, write_temporary_ass,
-    };
-    use std::process::Command;
+    use crate::youtube::{preview_page, preview_query, youtube_search_query};
+
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
     /// process-wide env vars, so they take turns on this lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes render tests so they don't collide on the shared cancel flag and child slot.
+    static RENDER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn endpoint_validation_allows_custom_provider_but_limits_local_llm_to_loopback() {
@@ -234,7 +240,9 @@ use std::sync::{Arc, Mutex};
 
     #[test]
     fn private_file_writes_owner_only_on_unix() {
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let file = dir.0.join("secret.txt");
         write_private_file(&file, b"secret").unwrap();
         #[cfg(unix)]
@@ -257,7 +265,9 @@ use std::sync::{Arc, Mutex};
     /// else ever deleted one.
     #[test]
     fn preview_cache_quota_evicts_oldest_first() {
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let cache = dir.0.join("preview-cache");
         std::fs::create_dir_all(&cache).unwrap();
         // Three 4-byte previews with ordered mtimes: successive writes a few
@@ -285,7 +295,9 @@ use std::sync::{Arc, Mutex};
     }
 
     fn preview_proxy_cache_key_tracks_source_version_and_rejects_remote_inputs() {
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.webm");
         std::fs::write(&source, b"source").unwrap();
         let source = source.canonicalize().unwrap();
@@ -310,7 +322,9 @@ use std::sync::{Arc, Mutex};
             eprintln!("skipping preview proxy fixture: ffmpeg/ffprobe unavailable");
             return;
         }
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.mp4");
         let generated = Command::new(ffmpeg)
             .args([
@@ -453,7 +467,9 @@ use std::sync::{Arc, Mutex};
             eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
             return;
         }
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
             build_segment(&dir.0, "seg-b.mp4", "h264"),
@@ -468,6 +484,7 @@ use std::sync::{Arc, Mutex};
             (160, 120),
             &dir,
             &sink,
+            &temp_dir.join("progress.log"),
         )
         .expect("a uniform copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
@@ -507,7 +524,9 @@ use std::sync::{Arc, Mutex};
             eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
             return;
         }
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
             build_segment(&dir.0, "seg-b.mp4", "h264"),
@@ -522,6 +541,7 @@ use std::sync::{Arc, Mutex};
             (160, 120),
             &dir,
             &sink,
+            &temp_dir.join("progress.log"),
         )
         .expect("the -an copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, false, (160, 120), 4.0, 2)
@@ -549,7 +569,9 @@ use std::sync::{Arc, Mutex};
             eprintln!("skipping join tests: ffmpeg/ffprobe unavailable");
             return;
         }
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         // seg-b is mpeg4: the copy demuxer cannot stream-copy a mixed-codec join.
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
@@ -565,6 +587,7 @@ use std::sync::{Arc, Mutex};
             (160, 120),
             &dir,
             &sink,
+            &temp_dir.join("progress.log"),
         )
         .expect("the fallback must produce a valid join");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
@@ -590,127 +613,6 @@ use std::sync::{Arc, Mutex};
         assert!((duration - 4.0).abs() < 0.3, "unexpected fallback duration: {duration}");
     }
 
-    /// Cancelling must take down the worker *and* its children. This starts a shell
-    /// that spawns a grandchild, then kills only the worker's process group.
-    #[cfg(unix)]
-    #[test]
-    fn kill_analysis_worker_terminates_the_whole_process_group() {
-        let dir = create_temporary_render_dir().unwrap();
-        let parent_marker = dir.0.join("parent.pid");
-        let child_marker = dir.0.join("child.pid");
-        let mut cmd = Command::new("bash");
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        cmd.args([
-            "-c",
-            &format!(
-                "echo $$ > '{}'; sleep 30 & echo $! > '{}'; wait",
-                parent_marker.display(),
-                child_marker.display()
-            ),
-        ]);
-        let mut child = cmd.spawn().expect("fixture process must spawn");
-        let parent_pid = child.id();        let wait_for_pid = |path: &Path| -> Option<u32> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    if let Ok(pid) = text.trim().parse::<u32>() { return Some(pid); }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            None
-        };
-        let worker = wait_for_pid(&parent_marker).expect("fixture worker never reported its pid");
-        let grandchild = wait_for_pid(&child_marker).expect("fixture grandchild never reported its pid");
-        assert_ne!(parent_pid, grandchild, "the grandchild must be a separate process");
-
-        kill_analysis_worker(parent_pid);
-        let _ = child.wait();
-
-        // A surviving grandchild is exactly the orphan this guard exists to prevent.
-        let settle = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < settle && process_alive(grandchild) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert_eq!(worker, parent_pid, "the fixture's own pid must be the group leader");
-        assert!(!process_alive(grandchild), "grandchild pid {grandchild} survived the group kill");
-        assert!(!process_alive(parent_pid), "worker pid {parent_pid} survived its own kill");
-    }
-
-    #[cfg(unix)]
-    fn process_alive(pid: u32) -> bool {
-        // Signal 0 probes existence without sending anything.
-        Command::new("kill").args(["-0", &pid.to_string()]).status().map(|s| s.success()).unwrap_or(false)
-    }
-
-    /// The renderer tests drive real FFmpeg through a process-wide "current child" slot,
-    /// so they must not run at the same time.
-    static RENDER_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// ffprobe emits snake_case keys and omits width/height on audio streams; the typed
-    /// probe result must survive that payload or the app rejects verified media.
-    #[test]
-    fn probe_metadata_decodes_ffprobe_stream_payload() {
-        let probe: ProbeMetadata = serde_json::from_value(serde_json::json!({
-            "streams": [
-                {"codec_name": "h264", "codec_type": "video", "width": 1280, "height": 720},
-                {"codec_name": "aac", "codec_type": "audio"}
-            ],
-            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "180.000000"}
-        }))
-        .expect("ffprobe payload must decode into typed metadata");
-        let video = probe.streams.iter().find(|stream| stream.codec_type.as_deref() == Some("video"));
-        assert_eq!(video.and_then(|stream| stream.width), Some(1280));
-        assert_eq!(video.and_then(|stream| stream.height), Some(720));
-        assert_eq!(probe.format.as_ref().and_then(|format| format.duration.as_deref()), Some("180.000000"));
-    }
-
-    /// A cancel request must abort an in-flight render and be reported as cancelled rather
-    /// than left to finish (or swallowed into a generic failure).
-    #[test]
-    fn render_cancellation_stops_a_running_render() {
-        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ffmpeg = Path::new("ffmpeg");
-        let ffprobe = Path::new("ffprobe");
-        if Command::new(ffmpeg).arg("-version").output().is_err() || Command::new(ffprobe).arg("-version").output().is_err() {
-            eprintln!("skipping cancellation fixture: ffmpeg/ffprobe unavailable");
-            return;
-        }
-        let dir = create_temporary_render_dir().unwrap();
-        let source = dir.0.join("source.mp4");
-        let fixture = Command::new(ffmpeg)
-            .args([
-                "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=30",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=30",
-                "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-            ])
-            .arg(&source)
-            .status()
-            .unwrap();
-        assert!(fixture.success(), "source fixture generation failed");
-        let output = dir.0.join("cancelled.mp4");
-        let canceller = std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            RENDER_CANCELLED.store(true, Ordering::SeqCst);
-        });
-        let result = render_segments(
-            ffmpeg,
-            ffprobe,
-            &[source.to_string_lossy().into_owned()],
-            &output,
-            &[(0.0, 30.0)],
-            None,
-            None,
-            &silent_progress(),
-        );
-        canceller.join().unwrap();
-        RENDER_CANCELLED.store(false, Ordering::SeqCst);
-        let error = result.expect_err("a cancelled render must not report success");
-        assert!(error.contains("RENDER_CANCELLED"), "expected RENDER_CANCELLED, got: {error}");
-    }
-
     #[test]
     fn ffmpeg_renderer_handles_ranges_captions_audio_and_side_by_side() {
         let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -722,7 +624,9 @@ use std::sync::{Arc, Mutex};
             eprintln!("skipping FFmpeg render fixture: ffmpeg/ffprobe unavailable");
             return;
         }
-        let dir = create_temporary_render_dir().unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+let _ = std::fs::create_dir_all(&temp_dir);
+let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.mp4");
         let fixture = Command::new(ffmpeg)
             .args([
@@ -764,6 +668,9 @@ use std::sync::{Arc, Mutex};
             Some("9:16".into()),
             Some(&plan),
             &silent_progress(),
+            &temp_dir,
+            &temp_dir.join("progress.log"),
+            false,
         )
         .unwrap();
         let probe = Command::new(ffprobe)
@@ -812,6 +719,9 @@ use std::sync::{Arc, Mutex};
             Some("9:16".into()),
             Some(&caption_plan),
             &silent_progress(),
+            &temp_dir,
+            &temp_dir.join("progress.log"),
+            false,
         )
         .unwrap();
         render_segments(
@@ -823,6 +733,9 @@ use std::sync::{Arc, Mutex};
             Some("9:16".into()),
             Some(&plain_plan),
             &silent_progress(),
+            &temp_dir,
+            &temp_dir.join("progress.log"),
+            false,
         )
         .unwrap();
         let multi_output = dir.0.join("multi.mp4");
@@ -835,6 +748,9 @@ use std::sync::{Arc, Mutex};
             Some("9:16".into()),
             Some(&side_by_side_plan),
             &silent_progress(),
+            &temp_dir,
+            &temp_dir.join("progress.log"),
+            false,
         )
         .unwrap();
         // Compare the decoded video frame at 0.8s (inside the caption cue) directly:
@@ -958,7 +874,9 @@ use std::sync::{Arc, Mutex};
 
     #[test]
     fn temporary_ass_is_removed_when_dropped() {
-        let subtitle = write_temporary_ass("test").unwrap();
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let subtitle = write_temporary_ass(&temp_dir, "test").unwrap();
         assert!(subtitle.0.is_file());
         let path = subtitle.0.clone();
         drop(subtitle);

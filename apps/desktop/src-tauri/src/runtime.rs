@@ -11,12 +11,13 @@ use tauri::Manager;
 
 use crate::paths::{
     command_ready, ensure_bundled_whisper_model, ffmpeg_bin, ffprobe_bin, free_loopback_port,
-    node_bin, python_binary, runtime_env, data_dir, cache_dir, session_token, tool,
-    whisper_command, whisper_usable, whisper_venv_bin, whisper_venv_dir,
+    lfai_render_bin, node_bin, python_binary, runtime_env, data_dir, cache_dir, session_token, tool,
+    whisper_command, whisper_cpp_bin, whisper_cpp_model, whisper_cpp_ready, whisper_usable, whisper_venv_bin, whisper_venv_dir,
     write_runtime_settings,
 };
 use crate::youtube::prepare_youtube_venv;
-use crate::{license_tier, run_status_script};
+use crate::paths::jobs_path;
+use crate::license_tier;
 
 pub(crate) type LlamaState = Arc<Mutex<Option<u32>>>; // pid of the detached llama-server, if running
 
@@ -420,6 +421,16 @@ pub(crate) fn run_whisper_bootstrap<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &BootstrapState,
 ) -> Result<String, String> {
+    // Python bootstrap remains available as an explicit legacy fallback, but the
+    // bundled whisper.cpp engine is now the supported default and requires no venv.
+    if runtime_env().get("WHISPER_ENGINE").map(String::as_str) != Some("python") {
+        let cpp_bin = whisper_cpp_bin(app);
+        let cpp_model = whisper_cpp_model(app);
+        if cpp_bin.is_file() && cpp_model.is_file() {
+            set_bootstrap(state, "deprecated", "Whisper.cpp is bundled; Python setup is deprecated.", true, None);
+            return Ok(cpp_bin.to_string_lossy().into_owned());
+        }
+    }
     let venv = whisper_venv_dir();
     let whisper = whisper_venv_bin("whisper");
     if whisper.is_file() {
@@ -1085,6 +1096,51 @@ pub(crate) fn model_download_status(
 // using the same URL the openai-whisper CLI itself downloads from, so the file
 // is cache-compatible and later runs need no re-download.
 pub(crate) const WHISPER_SMALL_URL: &str = "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt";
+pub(crate) const WHISPER_CPP_MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
+pub(crate) const WHISPER_CPP_MODEL_SMALL_Q5_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin";
+
+fn whisper_cpp_model_file(model: &str) -> Result<PathBuf, String> {
+    if !["base", "small-q5_1"].contains(&model) { return Err("WHISPER_CPP_MODEL_UNSUPPORTED".into()); }
+    Ok(cache_dir().join("whisper-cpp").join(format!("ggml-{model}.bin")))
+}
+
+#[tauri::command]
+pub(crate) fn download_whisper_cpp_model(state: tauri::State<'_, WhisperDlState>, model: String) -> Result<(), String> {
+    let url = match model.as_str() { "base" => WHISPER_CPP_MODEL_BASE_URL, "small-q5_1" => WHISPER_CPP_MODEL_SMALL_Q5_URL, _ => return Err("WHISPER_CPP_MODEL_UNSUPPORTED".into()) };
+    let target = whisper_cpp_model_file(&model)?;
+    if target.is_file() { return Ok(()); }
+    set_download(&state.0, "starting", "Downloading Whisper.cpp GGML model…", false, None);
+    let shared = state.inner().0.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let parent = target.parent().ok_or("WHISPER_CPP_MODEL_DIR")?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("WHISPER_CPP_MODEL_DIR:{e}"))?;
+            let part = PathBuf::from(format!("{}.part", target.display()));
+            let out = tool("curl").args(["-L", "--fail", "--retry", "3", "-o"]).arg(&part).arg(url).output().map_err(|e| format!("WHISPER_CPP_DOWNLOAD:{e}"))?;
+            if !out.status.success() { return Err("WHISPER_CPP_DOWNLOAD_FAILED".into()); }
+            let size = std::fs::metadata(&part).map_err(|e| format!("WHISPER_CPP_MODEL_STAT:{e}"))?.len();
+            if size < 1024 * 1024 { let _ = std::fs::remove_file(&part); return Err("WHISPER_CPP_MODEL_INVALID".into()); }
+            std::fs::rename(&part, &target).map_err(|e| format!("WHISPER_CPP_MODEL_RENAME:{e}"))?;
+            let mut settings = runtime_env();
+            settings.insert("WHISPER_ENGINE".into(), "cpp".into());
+            settings.insert("WHISPER_MODEL_PATH".into(), target.to_string_lossy().into_owned());
+            write_runtime_settings(&settings)?;
+            Ok(())
+        })();
+        set_download(&shared, if result.is_ok() { "ready" } else { "failed" }, if result.is_ok() { "Whisper.cpp model ready." } else { "Whisper.cpp model download failed." }, true, result.err());
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn whisper_cpp_model_status() -> serde_json::Value {
+    let models = ["base", "small-q5_1"].into_iter().map(|name| {
+        let path = whisper_cpp_model_file(name).unwrap();
+        serde_json::json!({"name": name, "path": path, "ready": path.is_file(), "bytes": std::fs::metadata(&path).ok().map(|m| m.len())})
+    }).collect::<Vec<_>>();
+    serde_json::json!({"models": models})
+}
+
 
 pub(crate) const WHISPER_SMALL_SHA256: &str =
     "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794";
@@ -1168,17 +1224,105 @@ pub(crate) fn storage_status() -> serde_json::Value {
 }
 
 #[tauri::command]
-pub(crate) fn clear_analysis_cache(app: tauri::AppHandle, id: String) -> Result<u64, String> {
-    let status = run_status_script(&app, &[id.clone()])?;
-    if let Some(pid) = status["workerPid"].as_i64() {
+pub(crate) fn clear_analysis_cache(_app: tauri::AppHandle, id: String) -> Result<u64, String> {
+    let store = crate::analysis_store::AnalysisStore::open(&jobs_path())?;
+    if let Some(pid) = store.worker_pid(&id)? {
         if pid > 0 {
             let _ = tool("kill").args(["-TERM", &pid.to_string()]).status();
             std::thread::sleep(std::time::Duration::from_millis(500));
             let _ = tool("kill").args(["-KILL", &pid.to_string()]).status();
         }
     }
-    let result = run_status_script(&app, &[id, "--clear".into()])?;
-    Ok(result["bytes"].as_u64().unwrap_or(0))
+    let cache_bytes = store.clear_chunk_caches(&id, &cache_dir())?;
+    let row_bytes = store.clear(&id)?;
+    Ok((cache_bytes + row_bytes).max(0) as u64)
+}
+
+#[tauri::command]
+pub(crate) fn setup_whisper_cpp(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let binary = whisper_cpp_bin(&app);
+    let model = whisper_cpp_model(&app);
+    if !binary.is_file() {
+        return Err("WHISPER_CPP_BINARY_MISSING: rebuild after fetching whisper-cli".into());
+    }
+    if !model.is_file() {
+        return Err("WHISPER_CPP_MODEL_MISSING: rebuild after fetching ggml-tiny.bin".into());
+    }
+    let mut probe_cmd = tool(&binary);
+    #[cfg(unix)]
+    if let Some(parent) = binary.parent() {
+        probe_cmd.env("LD_LIBRARY_PATH", parent);
+    }
+    let probe = probe_cmd.arg("--help").output().map_err(|e| format!("WHISPER_CPP_SPAWN:{e}"))?;
+    if !probe.status.success() {
+        return Err("WHISPER_CPP_BINARY_INVALID: whisper-cli could not start".into());
+    }
+    let mut settings = runtime_env();
+    if let Some(legacy) = settings.get("WHISPER_COMMAND").cloned() {
+        if legacy.contains(".venv") || legacy.contains("python") || legacy.ends_with("/whisper") || legacy.ends_with("\\whisper.exe") {
+            settings.insert("PYTHON_WHISPER_COMMAND".into(), legacy);
+        }
+    }
+    settings.insert("WHISPER_ENGINE".into(), "cpp".into());
+    settings.insert("WHISPER_COMMAND".into(), binary.to_string_lossy().into_owned());
+    settings.insert("WHISPER_MODEL_PATH".into(), model.to_string_lossy().into_owned());
+    settings.insert("WHISPER_MODEL".into(), "tiny".into());
+    write_runtime_settings(&settings)?;
+    Ok(serde_json::json!({
+        "engine": "cpp",
+        "command": binary,
+        "model": model,
+        "ready": true,
+        "pythonRequired": false,
+    }))
+}
+
+/// Runs a real 0.5-second CPU smoke test: dynamic libraries, model header and
+/// CPU instruction path all execute, unlike a shallow `--help` probe.
+#[tauri::command]
+pub(crate) fn whisper_cpp_smoke(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let binary = whisper_cpp_bin(&app);
+    let model = whisper_cpp_model(&app);
+    let ffmpeg = ffmpeg_bin(&app);
+    if !binary.is_file() { return Err("WHISPER_CPP_BINARY_MISSING".into()); }
+    if !model.is_file() { return Err("WHISPER_CPP_MODEL_MISSING".into()); }
+    let root = std::env::temp_dir().join(format!("lfai-whisper-smoke-{}", std::process::id()));
+    std::fs::create_dir_all(&root).map_err(|e| format!("WHISPER_CPP_SMOKE_DIR:{e}"))?;
+    let wav = root.join("silence.wav");
+    let json = root.join("result");
+    let result = (|| {
+        let audio = tool(&ffmpeg).args(["-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "0.5", "-c:a", "pcm_s16le"]).arg(&wav).output().map_err(|e| format!("WHISPER_CPP_SMOKE_FFMPEG:{e}"))?;
+        if !audio.status.success() { return Err("WHISPER_CPP_SMOKE_FFMPEG_FAILED".into()); }
+        let mut cmd = tool(&binary);
+        #[cfg(unix)]
+        if let Some(parent) = binary.parent() { cmd.env("LD_LIBRARY_PATH", parent); }
+        let output = cmd.args(["-m", model.to_string_lossy().as_ref(), "-f", wav.to_string_lossy().as_ref(), "-t", "1", "-nt", "-ojf", "-of", json.to_string_lossy().as_ref()]).output().map_err(|e| format!("WHISPER_CPP_SMOKE_SPAWN:{e}"))?;
+        if !output.status.success() { return Err("WHISPER_CPP_SMOKE_FAILED".into()); }
+        if !json.with_extension("json").is_file() { return Err("WHISPER_CPP_SMOKE_OUTPUT_MISSING".into()); }
+        let mut settings = runtime_env();
+        settings.insert("WHISPER_CPP_SMOKE_PASSED".into(), "1".into());
+        write_runtime_settings(&settings)?;
+        Ok(serde_json::json!({"ready": true, "engine": "cpp", "pythonRequired": false}))
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+/// Returns whether the bundled whisper.cpp assets are present and executable.
+#[tauri::command]
+pub(crate) fn whisper_cpp_status(app: tauri::AppHandle) -> serde_json::Value {
+    let binary = whisper_cpp_bin(&app);
+    let model = whisper_cpp_model(&app);
+    serde_json::json!({
+        "engine": runtime_env().get("WHISPER_ENGINE").cloned().unwrap_or_else(|| "python".into()),
+        "binary": binary,
+        "model": model,
+        "binaryReady": binary.is_file(),
+        "modelReady": model.is_file(),
+        "ready": whisper_cpp_ready(&app),
+        "smokePassed": runtime_env().get("WHISPER_CPP_SMOKE_PASSED").map(|v| v == "1").unwrap_or(false),
+        "pythonRequired": false,
+    })
 }
 
 #[tauri::command]
@@ -1207,8 +1351,13 @@ pub(crate) fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     // readiness from what is actually on disk — the old synchronous copy froze
     // this command for seconds on page loads.
     let model_copied = ensure_bundled_whisper_model(&app, &model);
-    let model_ready = model_copied
-        && (std::env::var("WHISPER_MODEL_PATH")
+    let cpp_bin = whisper_cpp_bin(&app);
+    let cpp_model = whisper_cpp_model(&app);
+    let cpp_ready = whisper_cpp_ready(&app);
+    let model_ready = if file.get("WHISPER_ENGINE").map(String::as_str) == Some("cpp") {
+        cpp_ready
+    } else {
+        model_copied && (std::env::var("WHISPER_MODEL_PATH")
             .is_ok_and(|p| !p.is_empty() && Path::new(&p).exists())
             || std::env::var("HOME")
                 .map(|h| {
@@ -1217,7 +1366,8 @@ pub(crate) fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
                         .join(format!("{model}.pt"))
                         .exists()
                 })
-                .unwrap_or(false));
+                .unwrap_or(false))
+    };
     let device = std::env::var("WHISPER_DEVICE")
         .ok()
         .or_else(|| file.get("WHISPER_DEVICE").cloned())
@@ -1225,11 +1375,13 @@ pub(crate) fn runtime_status(app: tauri::AppHandle) -> serde_json::Value {
     let ffmpeg = ffmpeg_bin(&app);
     let ffprobe = ffprobe_bin(&app);
     let node = node_bin(&app);
+    let lfai_render = lfai_render_bin(&app);
     let whisper_present = Path::new(&whisper).exists()
         || (whisper_venv_bin("whisper").is_file()
             && whisper == whisper_venv_bin("whisper").to_string_lossy().into_owned())
         || command_ready(&whisper);
-    serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": whisper_present, "model": model, "modelReady": model_ready, "device": device, "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file() } })
+    let whisper_engine = file.get("WHISPER_ENGINE").cloned().unwrap_or_else(|| "cpp".into());
+    serde_json::json!({ "ffmpeg": ffmpeg.as_path().is_file() || command_ready(ffmpeg.to_str().unwrap_or("ffmpeg")), "ffprobe": ffprobe.as_path().is_file() || command_ready(ffprobe.to_str().unwrap_or("ffprobe")), "node": node.as_path().is_file() || command_ready(node.to_str().unwrap_or("node")), "whisper": if whisper_engine == "cpp" { cpp_ready } else { whisper_present }, "whisperEngine": whisper_engine, "whisperCpp": cpp_ready, "whisperCppModelReady": cpp_model.is_file(), "whisperCppSmokePassed": file.get("WHISPER_CPP_SMOKE_PASSED").map(|v| v == "1").unwrap_or(false), "model": model, "modelReady": model_ready, "device": device, "lfaiRender": lfai_render.as_path().is_file(), "bundled": { "node": node.as_path().is_file(), "ffmpeg": ffmpeg.as_path().is_file(), "ffprobe": ffprobe.as_path().is_file(), "whisperCli": cpp_bin.is_file(), "whisperModel": cpp_model.is_file(), "lfaiRender": lfai_render.as_path().is_file() } })
 }
 
 /// Persists the chosen Whisper model into runtime.env so init/worker agree on cache keys.

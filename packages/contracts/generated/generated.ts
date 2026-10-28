@@ -19,13 +19,22 @@ export interface ProbeMetadata {
 	streams?: ProbeStream[];
 }
 
-export interface RenderProgress {
-	percent: number;
-	phase: string;
-}
-
 export interface RenderRange {
 	start: number;
 	end: number;
+}
+
+export interface RenderPlan {
+	version: number;
+	sourceArtifactId: string;
+	ranges: RenderRange[];
+	aspectRatio: string;
+	hardwareAcceleration?: boolean;
+}
+
+export interface RenderProgress {
+	percent: number;
+	phase: string;
+	errorCode?: string;
 }
 

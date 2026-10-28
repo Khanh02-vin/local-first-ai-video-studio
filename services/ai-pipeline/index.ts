@@ -28,15 +28,18 @@ export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAn
   return { transcript, highlights };
 }
 
-export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds">;
+export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds"> & {
+  /** Pre-built transcript (e.g. from a fixture): skips Whisper entirely and only selects highlights. */
+  transcript?: Transcript;
+};
 
 export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: string, duration: number, options: LocalAnalyzeOptions = {}): Promise<LocalClipAnalysis> {
   const sourceDuration = options.sourceDuration ?? duration;
-  // Always go through the chunked path. It extracts the selected range with
-  // ffmpeg before transcribing, so whisper never loads a whole source file into
-  // memory (large sources were OOM-killed) and a non-zero range offset is cut
-  // from real audio instead of shifting timestamps of the full transcript.
-  const transcript = await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, sourceDuration });
+  // An injected transcript (fixture or pre-computed cache) replaces transcription:
+  // Whisper is never spawned, and every downstream step stays the real pipeline.
+  const transcript = options.transcript
+    ? await Promise.resolve(options.transcript)
+    : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
   const highlights = duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);
   validateTranscript(transcript);
   // Chunked transcription shifts every timestamp by the range offset, so the
@@ -60,7 +63,9 @@ export async function analyzeLocalVideoWithSemantic(
   options: SemanticAnalyzeOptions = {}
 ): Promise<LocalClipAnalysis> {
   const sourceDuration = options.sourceDuration ?? duration;
-  const transcript = await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, sourceDuration });
+  const transcript = options.transcript
+    ? await Promise.resolve(options.transcript)
+    : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
 
   const provider = options.semanticProvider ?? new NotImplementedSemanticProvider();
   let highlights: Highlight[];

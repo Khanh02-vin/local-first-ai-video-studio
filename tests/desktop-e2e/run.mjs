@@ -456,9 +456,9 @@ try {
   tempState = await mkdtemp(`${tmpdir()}/local-first-desktop-e2e-`);
   report.stateDir = tempState;
   const sourceRuntime = process.env.DESKTOP_E2E_RUNTIME_ENV ? resolve(process.env.DESKTOP_E2E_RUNTIME_ENV) : `${process.env.HOME}/.cache/local-first-ai-video-studio/runtime.env`;
-  const runtimeOverrides = new Set(Object.keys(process.env).filter((key) => key.startsWith("WHISPER_")));
+  const runtimeOverrides = new Set(Object.keys(process.env).filter((key) => key.startsWith("WHISPER_") || key === "TRANSCRIPT_FIXTURE"));
   const runtimeFile = await readFile(sourceRuntime, "utf8").catch(() => "");
-  const overrides = new Map(Object.entries(process.env).filter(([key]) => key.startsWith("WHISPER_")));
+  const overrides = new Map(Object.entries(process.env).filter(([key]) => key.startsWith("WHISPER_") || key === "TRANSCRIPT_FIXTURE"));
   const runtimeLines = runtimeFile.split(/\r?\n/).filter((line) => !runtimeOverrides.has(line.split("=", 1)[0]) && line.trim());
   runtimeLines.push(...[...overrides].map(([key, value]) => `${key}=${value}`));
   await writeFile(`${tempState}/runtime.env`, `${runtimeLines.join("\n")}\n`);

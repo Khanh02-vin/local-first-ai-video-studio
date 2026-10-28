@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 export function runAbortable(
   command: string,
   args: string[],
-  { timeoutMs, abortLabel, shouldAbort }: { timeoutMs: number; abortLabel: string; shouldAbort?: () => boolean },
+    { timeoutMs, abortLabel, shouldAbort, env: extraEnv }: { timeoutMs: number; abortLabel: string; shouldAbort?: () => boolean; env?: Record<string, string> },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     // The app ships its own Python venv (whisper, yt-dlp). Leaving the caller's
@@ -19,6 +19,7 @@ export function runAbortable(
     delete env.PYTHONPATH;
     delete env.PYTHONSTARTUP;
     delete env.PYTHONEXECUTABLE;
+    Object.assign(env, extraEnv ?? {});
     const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], env });
     let error = "";
     let settled = false;

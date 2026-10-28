@@ -14,7 +14,7 @@ use crate::paths::{
 use crate::runtime::{ensure_rag_server, RagState};
 use crate::paths::NODE_ARGS;
 use crate::{
-    run_status_script, spawn_analysis_worker, Jobs,
+    spawn_analysis_worker, Jobs,
 };
 
 /// Creates the app venv with only the YouTube crawler deps (yt-dlp +
@@ -682,7 +682,8 @@ pub(crate) fn start_youtube_analysis(
     if !spawn_analysis_worker(
         app.clone(), jobs.inner().clone(), id.clone(), PathBuf::from(&url), duration, 0.0, duration,
     ) {
-        let _ = run_status_script(&app, &[id, "--fail".into(), "ANALYSIS_BUSY".into()]);
+        let _ = crate::analysis_store::AnalysisStore::open(&jobs_path())
+            .and_then(|store| store.fail(&id, "ANALYSIS_BUSY"));
         return Err("ANALYSIS_BUSY: another analysis is already running".into());
     }
     Ok(serde_json::json!({ "id": id, "duration": duration, "title": title }))

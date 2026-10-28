@@ -225,10 +225,40 @@ pub(crate) fn jobs_path() -> PathBuf {
     data_dir().join("analysis.sqlite")
 }
 
+/// App-private scratch directory for render temp files (`.ass` subtitles,
+/// segment intermediates, progress logs). Kept under `data_dir()` so it lives on
+/// the same volume as the project database and is never mixed with the shared
+/// system `/tmp`. Created with owner-only permissions (0o700 dir, 0o600 files).
+pub(crate) fn app_render_temp_dir(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = data_dir().join("tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    }
+    Ok(dir)
+}
+
+/// Progress log path inside the app-private temp dir.
+pub(crate) fn render_progress_log(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_render_temp_dir(app)?.join(format!(
+        "local-first-render-progress-{}.log",
+        std::process::id()
+    )))
+}
+
 /// Prefer a bundled binary in the app resources, then fall back to PATH.
 /// Windows ships `node.exe`/`ffmpeg.exe`; Unix packages use the extensionless
 /// name. Probe the platform-native name first so one config serves both.
-pub(crate) fn bundled_bin(app: &tauri::AppHandle, rel: &str, fallback: &str) -> PathBuf {
+pub(crate) fn bundled_bin<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rel: &str, fallback: &str) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
         let candidates: Vec<PathBuf> = if cfg!(windows) {
             vec![dir.join(format!("{rel}.exe")), dir.join(rel)]
@@ -311,6 +341,13 @@ pub(crate) fn helper_env(app: &tauri::AppHandle, extra: &[(&str, &str)]) -> Vec<
         .filter(|(key, _)| key.as_str() != "HF_TOKEN")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let cpp_default = file.get("WHISPER_ENGINE").map(String::as_str).unwrap_or("cpp") != "python";
+    if cpp_default {
+        env.retain(|(key, _)| key != "WHISPER_COMMAND" && key != "WHISPER_MODEL_PATH");
+        env.push(("WHISPER_ENGINE".into(), "cpp".into()));
+        env.push(("WHISPER_COMMAND".into(), whisper_cpp_bin(app).to_string_lossy().into_owned()));
+        env.push(("WHISPER_MODEL_PATH".into(), whisper_cpp_model(app).to_string_lossy().into_owned()));
+    }
     env.push((
         "LOCAL_FIRST_STATE_DIR".into(),
         data_dir().to_string_lossy().into_owned(),
@@ -460,6 +497,13 @@ pub(crate) fn ffprobe_bin(app: &tauri::AppHandle) -> PathBuf {
     bundled_bin(app, "ffprobe", "ffprobe")
 }
 
+/// Resolves the bundled headless render CLI (`lfai-render`) from the Tauri
+/// resource directory. The app keeps it as a sidecar: a caller that wants the
+/// render in a separate process spawns this binary with a request JSON file.
+pub(crate) fn lfai_render_bin(app: &tauri::AppHandle) -> PathBuf {
+    bundled_bin(app, "lfai-render", "lfai-render")
+}
+
 /// Resolve the whisper CLI the way the local whisper adapter will find it:
 /// env/runtime.env first, then a venv next to the app, then plain PATH.
 /// True when a whisper CLI string can actually be executed: a path that exists, or a
@@ -513,34 +557,8 @@ pub(crate) fn whisper_command() -> String {
     "whisper".into()
 }
 
-pub(crate) fn status_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // Bundled resources come first: in a dev build the tauri dev runtime wires
-    // the resource dir to src-tauri/resources, which does not contain the
-    // analysis scripts. Installed builds ship scripts/ (bundle.resources), so
-    // the resource-dir hit only succeeds there. Fall back to the dev-tree
-    // scripts/ next to the repo root.
-    let candidate = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("RESOURCE_DIR:{e}"))?
-        .join("scripts/analysis-status.ts");
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("scripts/analysis-status.ts");
-    if dev.is_file() {
-        return Ok(dev);
-    }
-    Err(
-        "STATUS_SCRIPT_MISSING: scripts/analysis-status.ts not found in resources or the dev tree"
-            .into(),
-    )
-}
-
 /// Resolves a bundled helper script by name with the same resource-dir-first,
-/// dev-tree-fallback strategy as status_script().
+/// dev-tree-fallback strategy the analysis scripts use.
 pub(crate) fn helper_script(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let candidate = app
         .path()
@@ -562,20 +580,6 @@ pub(crate) fn helper_script(app: &tauri::AppHandle, name: &str) -> Result<PathBu
     ))
 }
 
-pub(crate) fn run_status_script(app: &tauri::AppHandle, args: &[String]) -> Result<serde_json::Value, String> {
-    let script = status_script(app)?;
-    let mut cmd = tool(node_bin(app));
-    cmd.args(NODE_ARGS).arg(&script).arg(jobs_path()).args(args);
-    for (key, value) in helper_env(app, &[]) {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().map_err(|e| format!("STATUS_SPAWN:{e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    serde_json::from_slice(&output.stdout).map_err(|e| format!("STATUS_JSON:{e}"))
-}
-
 pub(crate) fn status_from_json(job: &serde_json::Value) -> Result<AnalysisStatus, String> {
     let result = match job.get("result") {
         Some(serde_json::Value::String(encoded)) => Some(serde_json::from_str(encoded).map_err(|error| format!("ANALYSIS_RESULT_JSON:{error}"))?),
@@ -592,14 +596,6 @@ pub(crate) fn status_from_json(job: &serde_json::Value) -> Result<AnalysisStatus
         chunk_total: job["chunkTotal"].as_u64().unwrap_or(0),
         current_chunk: job["currentChunk"].as_u64(),
     })
-}
-
-pub(crate) fn read_sqlite_status(app: &tauri::AppHandle, id: &str) -> Result<AnalysisStatus, String> {
-    let value = run_status_script(app, &[id.to_string()])?;
-    if value.is_null() {
-        return Err("JOB_NOT_FOUND".into());
-    }
-    status_from_json(&value)
 }
 
 pub(crate) fn probe_duration(app: &tauri::AppHandle, input: &Path) -> Result<f64, String> {
@@ -711,6 +707,34 @@ pub(crate) fn whisper_venv_bin(name: &str) -> PathBuf {
     {
         whisper_venv_dir().join("bin").join(name)
     }
+}
+
+/// Resolves the bundled whisper.cpp CLI from the Tauri resource directory.
+pub(crate) fn whisper_cpp_bin<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
+    bundled_bin(app, "whisper-cpp/whisper-cli", "whisper-cli")
+}
+
+/// Resolves the bundled whisper.cpp tiny model from the Tauri resource directory.
+pub(crate) fn whisper_cpp_model<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
+    if let Ok(dir) = app.path().resource_dir() {
+        let bundled = dir.join("models/ggml-tiny.bin");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    cache_dir().join("whisper-cpp/ggml-tiny.bin")
+}
+
+/// True when the bundled whisper.cpp CLI and model are both usable.
+pub(crate) fn whisper_cpp_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    let bin = whisper_cpp_bin(app);
+    let model = whisper_cpp_model(app);
+    let mut command = tool(&bin);
+    #[cfg(unix)]
+    if let Some(parent) = bin.parent() {
+        command.env("LD_LIBRARY_PATH", parent);
+    }
+    bin.is_file() && model.is_file() && command.arg("--help").output().is_ok_and(|o| o.status.success())
 }
 
 /// Python interpreter inside the app venv (yt-dlp + youtube-transcript-api live there).

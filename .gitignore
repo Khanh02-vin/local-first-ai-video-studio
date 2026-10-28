@@ -18,6 +18,9 @@ apps/desktop/src-tauri/resources/ffmpeg
 apps/desktop/src-tauri/resources/ffprobe
 apps/desktop/src-tauri/resources/models/**/*.pt
 apps/desktop/src-tauri/resources/models/**/*.gguf
+apps/desktop/src-tauri/resources/models/**/*.bin
+apps/desktop/src-tauri/resources/whisper-cpp/
+apps/desktop/src-tauri/resources/lfai-render
 .cache/
 apps/desktop/src-tauri/*.mp4
 artifacts/

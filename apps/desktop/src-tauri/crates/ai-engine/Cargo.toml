@@ -1,0 +1,21 @@
+[package]
+name = "ai-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ONNX Runtime bindings for running face-detection / VAD models without Python.
+ort = { version = "=2.0.0-rc.15", features = [] }
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tauri = "2"
+
+[features]
+default = []
+# Bật các execution provider phần cứng (CUDA/NVIDIA, CoreML/Apple Silicon,
+# DirectML/Intel). Chỉ cần thiết khi license là Pro; trên máyFree tier chỉ dùng CPU.
+gpu = ["ort/cuda", "ort/coreml", "ort/directml"]
+
+[dev-dependencies]

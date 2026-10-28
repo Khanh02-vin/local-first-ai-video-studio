@@ -13,8 +13,15 @@ export type RuntimeInfo = {
   device: string;
   model: string;
   components: { ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; model: boolean };
-  bundled: { node: boolean; ffmpeg: boolean; ffprobe: boolean };
+  whisperEngine?: string;
+  whisperCpp?: boolean;
+  whisperCppModelReady?: boolean;
+  whisperCppSmokePassed?: boolean;
+  whisperCppModels?: Array<{ name: string; path: string; ready: boolean; bytes?: number }>;
+  bundled: { node: boolean; ffmpeg: boolean; ffprobe: boolean; whisperCli?: boolean; whisperModel?: boolean };
   loaded: boolean;
+  // Whisper bootstrap progress (phase 0=not started, 1=installing, 2=copying model, 3=ready, 4=error)
+  whisperBootstrap: { phase: number; progress: number; message: string; error?: string } | null;
 };
 
 export const runtimeStore = $state<RuntimeInfo>({
@@ -25,8 +32,10 @@ export const runtimeStore = $state<RuntimeInfo>({
   device: "cpu",
   model: "tiny",
   components: { ffmpeg: false, ffprobe: false, node: false, whisper: false, model: false },
-  bundled: { node: false, ffmpeg: false, ffprobe: false },
+  bundled: { node: false, ffmpeg: false, ffprobe: false, whisperCli: false, whisperModel: false },
+  whisperCppSmokePassed: false,
   loaded: false,
+  whisperBootstrap: null,
 });
 
 
@@ -47,12 +56,16 @@ export async function refreshRuntime(force = false): Promise<void> {
   inflight = (async () => {
     try {
       const license = await invoke<{ licensed: boolean; tier?: string; licensee?: string | null; error?: string; configured?: boolean }>("license_status");
-      const runtime = await invoke<{ ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; modelReady: boolean; device?: string; model?: string; bundled?: { node: boolean; ffmpeg: boolean; ffprobe: boolean } }>("runtime_status");
+      const runtime = await invoke<{ ffmpeg: boolean; ffprobe: boolean; node: boolean; whisper: boolean; modelReady: boolean; whisperEngine?: string; whisperCpp?: boolean; whisperCppModelReady?: boolean; whisperCppSmokePassed?: boolean; device?: string; model?: string; bundled?: { node: boolean; ffmpeg: boolean; ffprobe: boolean; whisperCli?: boolean; whisperModel?: boolean } }>("runtime_status");
       const storage = await invoke<{ home: { ready: boolean; freeBytes?: number; requiredBytes: number }; temp: { ready: boolean; freeBytes?: number } }>("storage_status");
       const storageReady = storage.home.ready && storage.temp.ready;
       runtimeStore.ready = runtime.ffmpeg && runtime.ffprobe && runtime.node && runtime.whisper && runtime.modelReady && storageReady;
       runtimeStore.components = { ffmpeg: runtime.ffmpeg, ffprobe: runtime.ffprobe, node: runtime.node, whisper: runtime.whisper, model: runtime.modelReady };
       runtimeStore.bundled = runtime.bundled ?? runtimeStore.bundled;
+      runtimeStore.whisperEngine = runtime.whisperEngine ?? "python";
+      runtimeStore.whisperCpp = runtime.whisperCpp ?? false;
+      runtimeStore.whisperCppModelReady = runtime.whisperCppModelReady ?? false;
+      runtimeStore.whisperCppSmokePassed = runtime.whisperCppSmokePassed ?? false;
       runtimeStore.device = runtime.device ?? "cpu";
       runtimeStore.model = runtime.model ?? "tiny";
       runtimeStore.runtimeMessage = runtimeStore.ready ? `Engine ready · ${runtimeStore.device === "cuda" ? "GPU (CUDA)" : "CPU"}` : "Whisper/model, media runtime, or storage is missing.";
@@ -65,6 +78,63 @@ export async function refreshRuntime(force = false): Promise<void> {
     } finally { inflight = null; }
   })();
   return inflight;
+}
+
+export async function refreshWhisperCppModels(): Promise<void> {
+  if (!isTauri()) return;
+  const status = await invoke<{ models: RuntimeInfo["whisperCppModels"] }>("whisper_cpp_model_status");
+  runtimeStore.whisperCppModels = status.models ?? [];
+}
+
+export async function downloadWhisperCppModel(model: "base" | "small-q5_1"): Promise<void> {
+  if (!isTauri()) throw new Error("WHISPER_CPP_DESKTOP_ONLY");
+  await invoke("download_whisper_cpp_model", { model });
+  await refreshWhisperCppModels();
+  await refreshRuntime(true);
+}
+
+export async function smokeWhisperCpp(): Promise<void> {
+  if (!isTauri()) throw new Error("WHISPER_CPP_DESKTOP_ONLY");
+  await invoke("whisper_cpp_smoke");
+  await refreshRuntime(true);
+}
+
+export async function setupWhisperCpp(): Promise<void> {
+  if (!isTauri()) throw new Error("WHISPER_CPP_DESKTOP_ONLY");
+  await invoke("setup_whisper_cpp");
+  await refreshRuntime(true);
+}
+
+let bootstrapPoll: ReturnType<typeof setInterval> | null = null;
+
+export async function startWhisperBootstrap(): Promise<void> {
+  if (!isTauri()) return;
+  // Kick off the bootstrap
+  await invoke("bootstrap_whisper");
+  // Start polling
+  bootstrapPoll = setInterval(async () => {
+    if (!isTauri()) { stopBootstrapPoll(); return; }
+    try {
+      const status = await invoke<{ phase: number; progress: number; message: string; error?: string } | null>("whisper_bootstrap_status");
+      if (status) {
+        runtimeStore.whisperBootstrap = { phase: status.phase, progress: status.progress, message: status.message, error: status.error };
+        if (status.phase === 3 || status.phase === 4) {
+          // 3 = ready, 4 = error - stop polling
+          stopBootstrapPoll();
+          // Refresh full runtime status to pick up the new Whisper state
+          await refreshRuntime(true);
+        }
+      } else {
+        stopBootstrapPoll();
+      }
+    } catch {
+      stopBootstrapPoll();
+    }
+  }, 1000);
+}
+
+export function stopBootstrapPoll(): void {
+  if (bootstrapPoll) { clearInterval(bootstrapPoll); bootstrapPoll = null; }
 }
 
 export function formatBytes(bytes: number) { return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`; }

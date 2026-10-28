@@ -72,6 +72,25 @@ pub(crate) async fn project_save(project: project_store::Project) -> Result<proj
 }
 
 #[tauri::command]
+pub(crate) async fn project_delete(id: String) -> Result<project_store::Project, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let project = project_store::delete(&data_dir(), &id)?;
+        // The analysis DB is Node-owned, but deletion is coordinated here so a
+        // removed project cannot leave its job/result rows behind.
+        if let Some(job_id) = project.analysis_job_id.as_deref() {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/analysis-status.ts");
+            let _ = script;
+            let db_path = crate::paths::jobs_path();
+            if let Ok(connection) = rusqlite::Connection::open(&db_path) {
+                let _ = connection.execute("DELETE FROM analysis_chunks WHERE job_id=?1", [job_id]);
+                let _ = connection.execute("DELETE FROM analysis_jobs WHERE id=?1", [job_id]);
+            }
+        }
+        Ok(project)
+    }).await.map_err(|error| format!("PROJECT_DELETE_WORKER:{error}"))?
+}
+
+#[tauri::command]
 pub(crate) async fn project_create(
     source_path: String,
     source_name: String,

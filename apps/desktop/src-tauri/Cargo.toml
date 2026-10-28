@@ -7,10 +7,15 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [workspace]
-members = [".", "crates/render-engine", "crates/lfai-render"]
+members = [".", "crates/render-engine", "crates/lfai-render", "crates/ai-engine"]
 
 [dependencies]
 render-engine = { path = "crates/render-engine" }
+ai-engine = { path = "crates/ai-engine" }
+# reqwest for LLM API calls (generate_transcript_variants) — replaces the Node subprocess.
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+image = { version = "0.25", features = ["jpeg"] }
+base64 = "0.22"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 # Second launches hand their argv to the running instance and exit before the
@@ -32,8 +37,10 @@ command-group = "5"
 typeshare = "1.0.5"
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# SHA-256 for the analysis transcript-cache fingerprints (same input the Node
+# cache module hashes, so both sides agree on cache file locations).
+sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["std"] }
-base64 = "0.22"
 time = { version = "0.3", features = ["parsing", "macros"] }
 url = "2"
 

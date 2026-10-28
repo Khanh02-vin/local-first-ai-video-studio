@@ -174,6 +174,16 @@ pub fn get(dir: &Path, id: &str) -> Result<Project, String> {
     read_project(&open(dir)?, id)?.ok_or_else(|| "PROJECT_NOT_FOUND".into())
 }
 
+pub fn delete(dir: &Path, id: &str) -> Result<Project, String> {
+    validate_id(id)?;
+    let mut db = open(dir)?;
+    let project = read_project(&db, id)?.ok_or_else(|| "PROJECT_NOT_FOUND".to_string())?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| format!("PROJECT_DB:{e}"))?;
+    tx.execute("DELETE FROM projects WHERE id=?1", [id]).map_err(|e| format!("PROJECT_DB:{e}"))?;
+    tx.commit().map_err(|e| format!("PROJECT_DB:{e}"))?;
+    Ok(project)
+}
+
 pub fn list(dir: &Path) -> Result<Vec<Project>, String> {
     let db = open(dir)?;
     let mut stmt = db

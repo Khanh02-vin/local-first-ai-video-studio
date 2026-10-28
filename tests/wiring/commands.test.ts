@@ -20,8 +20,24 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+// Bundled binary resolution: ffmpeg/ffprobe must be resolved via bundled_bin()
+// so production builds (with resources/ populated) work offline without PATH.
+const pathsRs = readFileSync(join(repoRoot, "apps", "desktop", "src-tauri", "src", "paths.rs"), "utf8");
+assert.match(pathsRs, /pub\(crate\) fn ffmpeg_bin\(app: &tauri::AppHandle\) -> PathBuf/, "ffmpeg_bin must take AppHandle for resource resolution");
+assert.match(pathsRs, /bundled_bin\(app, "ffmpeg"/, "ffmpeg must resolve via bundled_bin(resources/ffmpeg)");
+assert.match(pathsRs, /pub\(crate\) fn ffprobe_bin\(app: &tauri::AppHandle\) -> PathBuf/, "ffprobe_bin must take AppHandle for resource resolution");
+assert.match(pathsRs, /bundled_bin\(app, "ffprobe"/, "ffprobe must resolve via bundled_bin(resources/ffprobe)");
+assert.match(pathsRs, /whisper_cpp_bin/, "whisper.cpp binary must resolve from Tauri resources");
+assert.match(pathsRs, /whisper_cpp_model/, "whisper.cpp ggml model must resolve from Tauri resources");
+assert.match(pathsRs, /WHISPER_ENGINE.*cpp|cpp_default/, "Rust helper env must default to CPP and protect legacy Python values");
+assert.match(readFileSync(join(repoRoot, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8"), /whisper-cpp|ggml-tiny/, "Tauri must package whisper-cpp and ggml model resources");
 const handlerBlock = readFileSync(mainRs, "utf8").match(/generate_handler!\[[^\]]*\]/s)?.[0] ?? "";
 assert.ok(handlerBlock, "generate_handler![...] not found in main.rs");
+assert.match(handlerBlock, /setup_whisper_cpp/, "System Doctor setup_whisper_cpp command must be registered");
+assert.match(handlerBlock, /whisper_cpp_status/, "whisper_cpp_status command must be registered");
+assert.match(handlerBlock, /whisper_cpp_smoke/, "whisper_cpp_smoke command must be registered");
+assert.match(handlerBlock, /project_delete/, "project delete cascade command must be registered");
+
 const registered = new Set([...handlerBlock.matchAll(/[a-z_][a-z0-9_]*/g)].map((m) => m[0]));
 
 const invoked = new Map<string, string>();

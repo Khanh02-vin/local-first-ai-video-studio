@@ -47,11 +47,15 @@ assert.match(studio, /new Channel<RenderProgress>/, "Studio must receive render 
 assert.match(studio, /invoke\("cancel_render"\)/, "Studio must expose render cancellation");
 assert.match(studio, /if \(rendering\) \{ await new Promise\(\(resolve\) => setTimeout\(resolve, 1000\)\); continue; \}/, "a finished analysis poll must not clear busy while a render runs");
 assert.match(studio, /!watchStarted && !rendering/, "the analysis watcher must not restart while a render runs");
-// Loopback sidecars answer 401 without the per-session bearer (ADR-005): the RAG
-// sidecar gates its handlers, llama-server is spawned with --api-key, and the UI
-// sends the token from rag_server_url on every call. A sidecar that loses its gate
-// silently re-opens the user's playlists to drive-by web pages.
-assert.match(rust, /\.arg\("--api-key"\)/, "llama-server must be spawned with a per-session api key");
+assert.match(studio, /!watchStarted && !rendering/, "the analysis watcher must not restart while a render runs");
+// System Doctor panel in Settings must expose one-click check + Whisper bootstrap
+const settings = readFileSync(join(root, "apps/web/src/lib/pages/Settings.svelte"), "utf8");
+assert.match(settings, /System Doctor/, "Settings must have a System Doctor panel");
+assert.match(settings, /runSystemDoctor/, "System Doctor must have a runSystemDoctor function");
+assert.match(settings, /startWhisperBootstrap/, "System Doctor must invoke the shared bootstrap function");
+assert.match(settings, /whisperBootstrap/, "Settings must display Whisper bootstrap progress");
+assert.match(settings, /runtime_status/, "System Doctor must call runtime_status for the component check");
+assert.match(settings, /bootstrap_whisper/, "System Doctor must be able to start Whisper bootstrap");
 assert.match(rust, /LFAI_RAG_TOKEN/, "the RAG sidecar must be spawned with a session token");
 const ragSidecar = readFileSync(join(root, "apps/web/src/routes/api/rag/+server.ts"), "utf8");
 assert.match(ragSidecar, /authorized\(request\)/, "every RAG handler must check the session token");

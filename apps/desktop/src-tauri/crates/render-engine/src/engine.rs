@@ -59,22 +59,35 @@ pub fn render_fraction(path: &Path, span_seconds: f64) -> Option<f64> {
 /// Spawns one FFmpeg child and watches it until it exits, the cancel flag flips, or it
 /// has to be killed. `window` is the (start, end) slice of the overall 0→100 progress
 /// this child owns; `span_seconds` is how much source this child encodes, which is what
-/// turns FFmpeg's `out_time` into a percentage of that slice.
+/// turns FFmpeg's `out_time` into a percentage of that slice. `progress_log` is the path
+/// FFmpeg writes `-progress` to, kept inside the app-private temp dir.
 pub fn run_render_child(
     command: &mut std::process::Command,
     on_progress: &dyn ProgressSink,
     window: (f64, f64),
     span_seconds: f64,
     phase: &str,
+    progress_log: &Path,
 ) -> Result<(), String> {
     if RENDER_CANCELLED.load(Ordering::SeqCst) {
+        on_progress.report(RenderProgress { percent: 0.0, phase: "cancelled".into(), error_code: Some("RENDER_CANCELLED".into()) });
         return Err("RENDER_CANCELLED".into());
     }
-    let progress_log = std::env::temp_dir().join(format!("local-first-render-progress-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&progress_log);
+    let _ = std::fs::remove_file(progress_log);
     let progress_arg = progress_log.to_string_lossy().into_owned();
     command.args(["-progress", progress_arg.as_str()]);
-    let child = command.spawn().map_err(|error| format!("FFMPEG_SPAWN:{error}"))?;
+    // Put the child in its own process group so a cancel can kill the whole tree
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    command.creation_flags(0x0001_0000); // CREATE_NEW_PROCESS_GROUP
+    let child = command.spawn().map_err(|error| {
+        on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("FFMPEG_SPAWN".into()) });
+        format!("FFMPEG_SPAWN:{error}")
+    })?;
     {
         let mut active = ACTIVE_RENDER_CHILD.lock().map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
         *active = Some(child);
@@ -89,19 +102,28 @@ pub fn run_render_child(
             let mut active = ACTIVE_RENDER_CHILD.lock().map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
             match active.as_mut() {
                 Some(child) => child.try_wait().map_err(|error| format!("FFMPEG_WAIT:{error}"))?,
-                None => return Err("RENDER_CHILD_MISSING".into()),
+                None => {
+                    on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("RENDER_CHILD_MISSING".into()) });
+                    return Err("RENDER_CHILD_MISSING".into());
+                }
             }
         };
         if let Some(status) = status {
             if let Ok(mut active) = ACTIVE_RENDER_CHILD.lock() { active.take(); }
-            if RENDER_CANCELLED.load(Ordering::SeqCst) { return Err("RENDER_CANCELLED".into()); }
-            if !status.success() { return Err(format!("FFMPEG_EXIT:{status}")); }
-            on_progress.report(RenderProgress { percent: window.1, phase: phase.to_string() });
+            if RENDER_CANCELLED.load(Ordering::SeqCst) {
+                on_progress.report(RenderProgress { percent: 0.0, phase: "cancelled".into(), error_code: Some("RENDER_CANCELLED".into()) });
+                return Err("RENDER_CANCELLED".into());
+            }
+            if !status.success() {
+                on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("FFMPEG_EXIT".into()) });
+                return Err(format!("FFMPEG_EXIT:{status}"));
+            }
+            on_progress.report(RenderProgress { percent: window.1, phase: phase.to_string(), error_code: None });
             return Ok(());
         }
         if let Some(fraction) = render_fraction(&progress_log, span_seconds) {
             let percent = window.0 + fraction * (window.1 - window.0);
-            on_progress.report(RenderProgress { percent, phase: phase.to_string() });
+            on_progress.report(RenderProgress { percent, phase: phase.to_string(), error_code: None });
         }
         thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -187,13 +209,37 @@ pub struct TemporarySubtitle(pub PathBuf);
 
 pub struct TemporaryRenderDir(pub PathBuf);
 
-pub fn create_temporary_render_dir() -> Result<TemporaryRenderDir, String> {
+pub fn create_temporary_render_dir(temp_dir: &Path) -> Result<TemporaryRenderDir, String> {
+    // Garbage collection: remove old render temp dirs (older than 24h) on each new render.
+    // This prevents scratch dirs from accumulating indefinitely after crashes.
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("lfai-render-") && path.is_dir() {
+                // Check age by metadata
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(modified) = meta.modified() {
+                        let age = SystemTime::now().duration_since(modified).unwrap_or_default();
+                        if age.as_secs() > 86400 {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
+            // Clean up stale progress log files
+            if name.starts_with("local-first-render-progress-") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
     for attempt in 0..100 {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("CLOCK:{e}"))?
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = temp_dir.join(format!(
             "lfai-render-{}-{suffix}-{attempt}",
             std::process::id()
         ));
@@ -350,11 +396,34 @@ pub fn side_by_side_graph(
     Some(graph)
 }
 
+/// Selects the H.264 encoder and preset based on platform + hardware preference.
+/// Falls back to libx264 (CPU) when no GPU encoder is available or hardware is not
+/// requested. Returns (codec, extra_args).
+pub fn video_codec(prefer_hardware: bool) -> (&'static str, Vec<&'static str>) {
+    if prefer_hardware {
+        #[cfg(target_os = "windows")]
+        {
+            return ("h264_nvenc", vec!["-preset", "p4", "-tune", "hq"]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return ("h264_videotoolbox", vec!["-real_time", ""]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return ("h264_qsv", vec!["-preset", "fast"]);
+        }
+    }
+    ("libx264", vec!["-preset", "fast", "-crf", "22"])
+}
+
 /// Renders the given source ranges into `output`.
 ///
 /// `media` is the resolved source list: one local path, or two when a separate audio
 /// track was downloaded. `plan` carries the optional crop/caption/hook information the
 /// editor produced; `None` renders a plain centre-cropped clip.
+/// `temp_dir` is the app-private scratch directory; `progress_log` is the FFmpeg progress
+/// log path inside it. `prefer_hardware` requests a GPU encoder when available.
 #[allow(clippy::too_many_arguments)]
 pub fn render_segments(
     ffmpeg: &Path,
@@ -365,6 +434,9 @@ pub fn render_segments(
     aspect_ratio: Option<String>,
     plan: Option<&serde_json::Value>,
     on_progress: &dyn ProgressSink,
+    temp_dir: &Path,
+    progress_log: &Path,
+    prefer_hardware: bool,
 ) -> Result<String, String> {
     if ranges.is_empty() {
         return Err("INVALID_RENDER_RANGES".into());
@@ -548,7 +620,7 @@ pub fn render_segments(
     } else {
         Vec::new()
     };
-    let temp = create_temporary_render_dir()?;
+    let temp = create_temporary_render_dir(temp_dir)?;
     let mut segments = Vec::new();
     for (index, (start, end)) in ranges.iter().enumerate() {
         let mut boundaries: Vec<f64> = vec![*start, *end];
@@ -637,7 +709,7 @@ pub fn render_segments(
             if let Some(contents) =
                 remapped_captions_for_range(captions, &scene_subtitle_ranges, 0)?
             {
-                let subtitle = write_temporary_ass(&contents)?;
+                let subtitle = write_temporary_ass(temp_dir, &contents)?;
                 let filter = format!(
                     "ass='{}'",
                     escape_ass_filter_path(&subtitle.0.to_string_lossy())
@@ -672,10 +744,14 @@ pub fn render_segments(
             } else {
                 cmd.args(["-vf", &filters.join(","), "-map", "0:v:0"]);
             }
+            let (codec, codec_extra) = video_codec(prefer_hardware);
             cmd.args([
-                "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p", "-r",
-                "30",
+                "-c:v", codec, "-pix_fmt", "yuv420p", "-r", "30",
             ]);
+            cmd.args(codec_extra);
+            if !prefer_hardware {
+                cmd.args(["-crf", "22"]);
+            }
             if has_audio {
                 let audio_index = if media.len() > 1 { 1 } else { 0 };
                 cmd.args(["-map"])
@@ -697,7 +773,7 @@ pub fn render_segments(
             }
             let window_start = ((index as f64 + piece_index as f64 / windows_count) / ranges.len() as f64) * 90.0;
             let window_end = ((index as f64 + (piece_index + 1) as f64 / windows_count) / ranges.len() as f64) * 90.0;
-            run_render_child(cmd.arg(&segment), on_progress, (window_start, window_end), (end - start) / windows_count as f64, "segments")?;
+            run_render_child(cmd.arg(&segment), on_progress, (window_start, window_end), (end - start) / windows_count as f64, "segments", progress_log)?;
             drop(subtitle_file);
             segments.push(segment);
         }
@@ -709,18 +785,37 @@ pub fn render_segments(
         "16:9" => (1920, 1080),
         _ => (1080, 1920),
     };
-    let partial = join_segments(
-        ffmpeg,
-        ffprobe,
-        &segments,
-        has_audio,
-        total_duration,
-        expected_dimensions,
-        &temp,
-        on_progress,
-    )?;
-    std::fs::copy(&partial, &output_path).map_err(|e| format!("OUTPUT_COPY:{e}"))?;
-    on_progress.report(RenderProgress { percent: 100.0, phase: "completed".into() });
+            let partial = join_segments(
+                ffmpeg,
+                ffprobe,
+                &segments,
+                has_audio,
+                total_duration,
+                expected_dimensions,
+                &temp,
+                on_progress,
+                progress_log,
+            )?;
+
+    // Atomic output: write to a sibling .tmp file first, probe-verify it, then atomically
+    // rename onto the final path so a crashed render never leaves a half-written MP4.
+    let tmp_path = output_path.with_extension("tmp");
+    if let Err(e) = std::fs::copy(&partial, &tmp_path) {
+        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_COPY".into()) });
+        return Err(format!("OUTPUT_COPY:{e}"));
+    }
+    if let Err(e) = probe_duration(ffprobe, &tmp_path.to_string_lossy()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_PROBE_VERIFY".into()) });
+        return Err(format!("OUTPUT_PROBE_VERIFY:{e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &output_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_RENAME".into()) });
+        return Err(format!("OUTPUT_RENAME:{e}"));
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    on_progress.report(RenderProgress { percent: 100.0, phase: "completed".into(), error_code: None });
     Ok(output_path.to_string_lossy().into_owned())
 }
 
@@ -745,9 +840,10 @@ pub fn join_segments(
     expected_dimensions: (u32, u32),
     temp: &TemporaryRenderDir,
     on_progress: &dyn ProgressSink,
+    progress_log: &Path,
 ) -> Result<PathBuf, String> {
     let copy = temp.0.join("joined-copy.mp4");
-    let copied = join_segments_copy(ffmpeg, segments, has_audio, &copy, on_progress)
+    let copied = join_segments_copy(ffmpeg, segments, has_audio, &copy, on_progress, progress_log)
         .and_then(|_| {
             validate_joined_output(
                 ffprobe,
@@ -764,7 +860,7 @@ pub fn join_segments(
             // The filter path re-encodes, so it tolerates whatever the stream copy
             // could not preserve. If it fails too, report both causes.
             let _ = std::fs::remove_file(&copy);
-            join_segments_filter(ffmpeg, segments, has_audio, total_duration, temp, on_progress)
+            join_segments_filter(ffmpeg, segments, has_audio, total_duration, temp, on_progress, progress_log)
                 .map_err(|filter_error| {
                     format!("JOIN_COPY:{copy_error}; JOIN_FILTER:{filter_error}")
                 })
@@ -779,6 +875,7 @@ fn join_segments_copy(
     has_audio: bool,
     output: &Path,
     on_progress: &dyn ProgressSink,
+    progress_log: &Path,
 ) -> Result<(), String> {
     let list = output.with_file_name("joined-copy-list.txt");
     let mut listing = String::new();
@@ -798,7 +895,7 @@ fn join_segments_copy(
         // output gains a stream the old path never had.
         cmd.arg("-an");
     }
-    let result = run_render_child(cmd.arg(output), on_progress, (90.0, 98.0), 0.0, "joining");
+    let result = run_render_child(cmd.arg(output), on_progress, (90.0, 98.0), 0.0, "joining", progress_log);
     let _ = std::fs::remove_file(&list);
     result
 }
@@ -811,6 +908,7 @@ fn join_segments_filter(
     total_duration: f64,
     temp: &TemporaryRenderDir,
     on_progress: &dyn ProgressSink,
+    progress_log: &Path,
 ) -> Result<PathBuf, String> {
     let partial = temp.0.join("joined.mp4");
     let mut cmd = tool(ffmpeg);
@@ -852,7 +950,7 @@ fn join_segments_filter(
     if has_audio {
         cmd.args(["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]);
     }
-    run_render_child(cmd.arg(&partial), on_progress, (90.0, 98.0), total_duration, "joining")?;
+    run_render_child(cmd.arg(&partial), on_progress, (90.0, 98.0), total_duration, "joining", progress_log)?;
     Ok(partial)
 }
 
@@ -990,14 +1088,14 @@ pub fn ass_dialogue(
     Ok(Some(format!("{header}{}\n", events.join("\n"))))
 }
 
-pub fn write_temporary_ass(contents: &str) -> Result<TemporarySubtitle, String> {
+pub fn write_temporary_ass(temp_dir: &Path, contents: &str) -> Result<TemporarySubtitle, String> {
     use std::io::Write;
     for attempt in 0..100 {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("CLOCK:{e}"))?
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = temp_dir.join(format!(
             "lfai-subtitle-{}-{suffix}-{attempt}.ass",
             std::process::id()
         ));
@@ -1007,6 +1105,11 @@ pub fn write_temporary_ass(contents: &str) -> Result<TemporarySubtitle, String> 
             .open(&path)
         {
             Ok(mut file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                }
                 if let Err(error) = file.write_all(contents.as_bytes()) {
                     let _ = std::fs::remove_file(&path);
                     return Err(format!("SUBTITLE_WRITE:{error}"));

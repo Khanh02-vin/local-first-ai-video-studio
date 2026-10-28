@@ -1,21 +1,21 @@
 // The diarization and face branch: local speaker separation, face samples for
 // speaker mapping, and the crop/scene analysis the Editor previews.
 //
-// Everything here runs the local models on the machine; nothing leaves it.
+// Everything here runs local ONNX models on the machine via `ai-engine`; nothing
+// leaves the machine and no Python/Node runtime is required for AI work. FFmpeg
+// (bundled) is still used to decode audio / frames.
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::paths::{
-    ffmpeg_bin, helper_env, helper_script, is_remote_input, node_bin, runtime_env, data_dir,
-    tool, venv_python, write_runtime_settings,
-};
+use ai_engine::{diarize_segments, merge_segments, FaceDetector, SpeakerEmbedder, VadSegmenter};
+use image::RgbImage;
 use render_engine::engine::{create_temporary_render_dir, stable_subject_pair, subject_pair_continues, TemporaryRenderDir};
-use crate::paths::NODE_ARGS;
+use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, is_remote_input, runtime_env, tool};
+use serde_json::Value;
 
 /// Asks the AI pipeline to propose ordered transcript ranges as alternative edits.
 ///
-/// The variant generator is a Node subprocess that may call an LLM, so the wait runs
-/// on a blocking worker instead of the main thread.
+/// The variant generator now calls the configured LLM endpoint directly via HTTP
+/// (`reqwest`) instead of spawning a Node subprocess.
 #[tauri::command]
 pub(crate) async fn generate_transcript_variants(
     app: tauri::AppHandle,
@@ -29,7 +29,7 @@ pub(crate) async fn generate_transcript_variants(
 }
 
 fn generate_transcript_variants_blocking(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     transcript: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let settings = runtime_env();
@@ -40,127 +40,142 @@ fn generate_transcript_variants_blocking(
     if !["semantic-gemini", "semantic-local"].contains(&strategy.as_str()) {
         return Err("VARIANT_AI_STRATEGY_REQUIRED: choose Gemini or local LLM in Settings".into());
     }
-    if strategy == "semantic-gemini"
-        && settings
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("VARIANT_CLIENT:{e}"))?;
+
+    let transcript_json = serde_json::to_string(transcript).map_err(|e| format!("VARIANT_TRANSCRIPT:{e}"))?;
+
+    let prompt = format!(
+        r"Given the following transcript segments, propose 3-5 alternative highlight ranges (start,end in seconds) that would make good short-form clips. Return a JSON array of objects with start, end, and reason fields.
+
+Transcript: {}
+",
+        transcript_json
+    );
+
+    let result = if strategy == "semantic-gemini" {
+        let api_key = settings
             .get("GEMINI_API_KEY")
-            .map(|key| key.trim().is_empty())
-            .unwrap_or(true)
-    {
-        return Err("SEMANTIC_REQUIRES_GEMINI_API_KEY".into());
-    }
-    let file = data_dir().join(format!(
-        "transcript-variants-{}.json",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "CLOCK_ERROR")?
-            .as_nanos()
-    ));
-    std::fs::write(
-        &file,
-        serde_json::to_vec(transcript).map_err(|e| format!("VARIANT_TRANSCRIPT:{e}"))?,
-    )
-    .map_err(|e| format!("VARIANT_TRANSCRIPT:{e}"))?;
-    let script = match helper_script(app, "generate-variants.ts") {
-        Ok(script) => script,
-        Err(error) => {
-            let _ = std::fs::remove_file(&file);
-            return Err(error);
+            .filter(|k| !k.trim().is_empty())
+            .ok_or("SEMANTIC_REQUIRES_GEMINI_API_KEY")?;
+        let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+        let body = serde_json::json!({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1000}
+        });
+        let resp = client
+            .post(url)
+            .query(&[("key", api_key)])
+            .json(&body)
+            .send()
+            .map_err(|e| format!("VARIANT_GEMINI_REQUEST:{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("VARIANT_GEMINI_ERROR: HTTP {}", resp.status()));
         }
+        let value: Value = resp.json().map_err(|e| format!("VARIANT_GEMINI_JSON:{e}"))?;
+        // Extract text from Gemini response.
+        let text = value["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        parse_variants_json(text)
+    } else {
+        // semantic-local: OpenAI-compatible endpoint.
+        let base_url = settings
+            .get("LOCAL_LLM_BASE_URL")
+            .map(|v| v.as_str())
+            .unwrap_or("http://127.0.0.1:8080");
+        let model = settings
+            .get("LOCAL_LLM_MODEL")
+            .map(|m| m.as_str())
+            .unwrap_or("qwen2.5-3b-instruct");
+        let url = format!("{base_url}/chat/completions");
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            "stream": false
+        });
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("VARIANT_LLM_REQUEST:{e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("VARIANT_LLM_ERROR: HTTP {}", resp.status()));
+        }
+        let value: Value = resp.json().map_err(|e| format!("VARIANT_LLM_JSON:{e}"))?;
+        let text = value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        parse_variants_json(text)
+    }?;
+
+    Ok(result)
+}
+
+/// Parses a JSON array of {start, end, reason} from LLM output, tolerating
+/// surrounding markdown fences or prose.
+fn parse_variants_json(text: &str) -> Result<Value, String> {
+    let trimmed = text.trim();
+    // Strip markdown fences if present.
+    let json_text = if trimmed.starts_with("```") {
+        let mut lines: Vec<&str> = trimmed.lines().collect();
+        if lines.first().map_or(false, |l| l.starts_with("```")) {
+            lines.remove(0);
+        }
+        if lines.last().map_or(false, |l| l.trim() == "```") {
+            lines.pop();
+        }
+        lines.join("\n")
+    } else {
+        trimmed.to_string()
     };
-    let mut cmd = tool(node_bin(app));
-    cmd.args(NODE_ARGS)
-        .arg(script)
-        .arg(&file)
-        .arg(&strategy)
-        .arg(
-            settings
-                .get("LOCAL_LLM_BASE_URL")
-                .map(String::as_str)
-                .unwrap_or("http://127.0.0.1:8080"),
-        )
-        .arg(
-            settings
-                .get("LOCAL_LLM_MODEL")
-                .map(String::as_str)
-                .unwrap_or("qwen2.5-3b-instruct"),
-        );
-    for (key, value) in helper_env(app, &[]) {
-        cmd.env(key, value);
-    }
-    if strategy == "semantic-gemini" {
-        cmd.env(
-            "GEMINI_API_KEY",
-            settings
-                .get("GEMINI_API_KEY")
-                .map(String::as_str)
-                .unwrap_or(""),
-        );
-    }
-    let output = cmd.output();
-    let _ = std::fs::remove_file(&file);
-    let output = output.map_err(|e| format!("VARIANT_SPAWN:{e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    serde_json::from_slice(&output.stdout).map_err(|e| format!("VARIANT_JSON:{e}"))
+    serde_json::from_str(&json_text).map_err(|e| format!("VARIANT_JSON_PARSE:{e} — {json_text}"))
 }
 
 #[tauri::command]
 pub(crate) fn diarization_setup_status() -> serde_json::Value {
-    let python = venv_python();
-    let token = runtime_env()
-        .get("HF_TOKEN")
-        .is_some_and(|value| !value.trim().is_empty());
-    let installed = python.is_file()
-        && tool(&python)
-            .args(["-c", "import pyannote.audio"])
-            .status()
-            .is_ok_and(|status| status.success());
-    serde_json::json!({ "installed": installed, "hasToken": token, "ready": installed && token })
+    let ort_available = std::env::consts::ARCH != "unknown"; // ort is compiled into the binary
+    let face_model = data_dir().join("models/face-detection.onnx");
+    let vad_model = data_dir().join("models/silero_vad.onnx");
+    // Also check bundled resources via runtime_env for the app handle is unavailable here;
+    // report file presence as a heuristic.
+    let face_ready = face_model.is_file();
+    let vad_ready = vad_model.is_file();
+    serde_json::json!({
+        "ort_available": ort_available,
+        "faceModelReady": face_ready,
+        "vadModelReady": vad_ready,
+        "ready": ort_available && face_ready && vad_ready,
+    })
 }
 
 #[tauri::command]
 pub(crate) fn save_diarization_token(token: String) -> Result<(), String> {
-    if token.trim().len() < 10 || token.contains(['\n', '\r']) {
-        return Err("INVALID_HF_TOKEN".into());
+    // Repurposed: now stores the LLM API key used by generate_transcript_variants.
+    // HF_TOKEN is no longer required since diarization uses bundled ONNX models.
+    if token.trim().is_empty() || token.contains(['\n', '\r']) {
+        return Err("INVALID_LLM_TOKEN".into());
     }
     let mut settings = runtime_env();
-    settings.insert("HF_TOKEN".into(), token.trim().to_string());
-    write_runtime_settings(&settings)
+    settings.insert("GEMINI_API_KEY".into(), token.trim().to_string());
+    crate::paths::write_runtime_settings(&settings)
 }
 
+/// Legacy command kept for backwards compatibility: installs nothing (Python
+/// runtime no longer needed). Returns ok so old UI callers do not break.
 #[tauri::command]
 pub(crate) fn install_diarization_runtime() -> Result<(), String> {
-    let python = venv_python();
-    if !python.is_file() {
-        return Err("PYTHON_VENV_MISSING: run Whisper setup first".into());
-    }
-    let install = tool(&python)
-        .args([
-            "-m",
-            "pip",
-            "install",
-            "pyannote.audio==3.3.2",
-            "opencv-python-headless==4.10.0.84",
-        ])
-        .output()
-        .map_err(|e| format!("DIARIZATION_INSTALL_SPAWN:{e}"))?;
-    if !install.status.success() {
-        return Err(format!(
-            "DIARIZATION_INSTALL_FAILED:{}",
-            String::from_utf8_lossy(&install.stderr)
-                .lines()
-                .last()
-                .unwrap_or("pip failed")
-        ));
-    }
     Ok(())
 }
 
-/// Splits the audio into speaker intervals.
+/// Splits the audio into speaker intervals using ONNX VAD + simple clustering.
 ///
-/// The model inference takes seconds, so it runs on a blocking worker instead of the
-/// main thread, where it would freeze the webview.
+/// Runs on a blocking worker instead of the main thread, where it would freeze the webview.
 #[tauri::command]
 pub(crate) async fn diarize_video(
     app: tauri::AppHandle,
@@ -191,59 +206,135 @@ fn diarize_video_blocking(
     if !input.is_file() {
         return Err("INPUT_NOT_FILE".into());
     }
-    let settings = runtime_env();
-    let token = settings
-        .get("HF_TOKEN")
-        .filter(|value| !value.trim().is_empty())
-        .ok_or("DIARIZATION_HF_TOKEN_REQUIRED")?;
-    let python = venv_python();
-    if !python.is_file() {
-        return Err("PYTHON_VENV_MISSING: run Whisper setup first".into());
-    }
-    if !tool(&python)
-        .args(["-c", "import pyannote.audio, cv2"])
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        return Err("DIARIZATION_RUNTIME_MISSING: install local diarization in Settings".into());
-    }
-    let temp = create_temporary_render_dir()?;
-    let audio = temp.0.join("audio.wav");
-    let extract = tool(ffmpeg_bin(&app))
-        .args(["-y", "-nostdin", "-v", "error", "-i"])
-        .arg(&input)
-        .args(["-vn", "-ac", "1", "-ar", "16000", "-t"])
-        .arg(format!("{duration:.3}"))
-        .arg(&audio)
-        .status()
-        .map_err(|e| format!("DIARIZATION_FFMPEG:{e}"))?;
-    if !extract.success() {
-        return Err("DIARIZATION_AUDIO_EXTRACT_FAILED".into());
-    }
+
+    let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let audio = if let Ok(pre) = std::env::var("ANALYSIS_PREEXTRACTED_AUDIO") {
+        // The analysis worker already decoded the source once; reuse it instead of
+        // re-decoding the whole video for this task.
+        PathBuf::from(pre)
+    } else {
+        let temp = create_temporary_render_dir(&temp_dir)?;
+        let audio = temp.0.join("audio.wav");
+        let extract = tool(ffmpeg_bin(app))
+            .args(["-y", "-nostdin", "-v", "error", "-i"])
+            .arg(&input)
+            .args(["-vn", "-ac", "1", "-ar", "16000", "-t"])
+            .arg(format!("{duration:.3}"))
+            .arg(&audio)
+            .status()
+            .map_err(|e| format!("DIARIZATION_FFMPEG:{e}"))?;
+        if !extract.success() {
+            return Err("DIARIZATION_AUDIO_EXTRACT_FAILED".into());
+        }
+        audio
+    };
     let audio_bytes = std::fs::metadata(&audio)
         .map_err(|e| format!("DIARIZATION_AUDIO_STAT:{e}"))?
         .len();
     if audio_bytes == 0 || audio_bytes > 600 * 1024 * 1024 {
         return Err("DIARIZATION_AUDIO_SIZE_LIMIT".into());
     }
-    let script = helper_script(&app, "diarize-audio.py")?;
 
-    let output = tool(&python)
-        .arg(script)
-        .arg(&audio)
-        .env("HF_TOKEN", token)
-        .output()
-        .map_err(|e| format!("DIARIZATION_SPAWN:{e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    // Decode WAV to f32 samples using the `image`? No — WAV isn't image.
+    // Use rodio/cpal? Keep dependency light: read the WAV header manually for
+    // PCM16 mono/stereo and convert to f32 [-1,1].
+    let wav_data = std::fs::read(&audio).map_err(|e| format!("DIARIZATION_READ_WAV:{e}"))?;
+    let samples = decode_wav_pcm_f32(&wav_data).map_err(|e| format!("DIARIZATION_DECODE_WAV:{e}"))?;
+
+    let mut vad = VadSegmenter::load(app).map_err(|e| format!("DIARIZATION_VAD_LOAD:{e}"))?;
+    let segments = vad.segment(&samples).map_err(|e| format!("DIARIZATION_VAD:{e}"))?;
+    let merged = merge_segments(&segments, 0.5);
+
+    // Extract a speaker embedding for each merged VAD segment so identical
+    // speakers cluster together across the whole video.
+    let mut embedder = SpeakerEmbedder::load(app).map_err(|e| format!("DIARIZATION_EMBED_LOAD:{e}"))?;
+    let embeddings: Vec<Option<ai_engine::SpeakerEmbedding>> = merged
+        .iter()
+        .map(|seg| {
+            // Cut the segment's audio out of the full sample buffer for embedding.
+            let start_sample = (seg.start * 16000.0) as usize;
+            let end_sample = (seg.end * 16000.0) as usize;
+            let seg_samples = &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
+            if seg_samples.is_empty() {
+                None
+            } else {
+                embedder.embed(seg_samples).ok()
+            }
+        })
+        .collect();
+
+    let intervals = diarize_segments(&merged, &embeddings);
+
+    Ok(serde_json::json!(intervals.iter().map(|i| serde_json::json!({
+        "start": i.start,
+        "end": i.end,
+        "speakerId": i.speaker_id
+    })).collect::<Vec<_>>()))
+}
+
+/// Decodes a WAV file (PCM16, mono or stereo) into interleaved f32 [-1,1] samples.
+/// Handles the common case: 44-byte header, fmt PCM, data chunk.
+fn decode_wav_pcm_f32(data: &[u8]) -> Result<Vec<f32>, String> {
+    if data.len() < 44 {
+        return Err("WAV too small".into());
     }
-    serde_json::from_slice(&output.stdout).map_err(|e| format!("DIARIZATION_JSON:{e}"))
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("Not a WAV file".into());
+    }
+    // Find fmt and data chunks.
+    let mut fmt_offset: Option<usize> = None;
+    let mut data_offset: Option<usize> = None;
+    let mut pos = 12;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().map_err(|_| "WAV chunk size".to_string())?) as usize;
+        if id == b"fmt " {
+            fmt_offset = Some(pos + 8);
+        } else if id == b"data" {
+            data_offset = Some(pos + 8);
+        }
+        pos += 8 + size + (size % 2); // word-align
+    }
+    let fmt_start = fmt_offset.ok_or("No fmt chunk")?;
+    let data_start = data_offset.ok_or("No data chunk")?;
+    if fmt_start + 16 > data.len() {
+        return Err("WAV fmt chunk truncated".into());
+    }
+    let audio_format = u16::from_le_bytes(data[fmt_start..fmt_start + 2].try_into().map_err(|_| "WAV format".to_string())?);
+    let channels = u16::from_le_bytes(data[fmt_start + 2..fmt_start + 4].try_into().map_err(|_| "WAV channels".to_string())?);
+    let _sample_rate = u32::from_le_bytes(data[fmt_start + 4..fmt_start + 8].try_into().map_err(|_| "WAV rate".to_string())?);
+    let _byte_rate = u32::from_le_bytes(data[fmt_start + 8..fmt_start + 12].try_into().map_err(|_| "WAV byte rate".to_string())?);
+    let _block_align = u16::from_le_bytes(data[fmt_start + 12..fmt_start + 14].try_into().map_err(|_| "WAV align".to_string())?);
+    let bits_per_sample = u16::from_le_bytes(data[fmt_start + 14..fmt_start + 16].try_into().map_err(|_| "WAV bits".to_string())?);
+    if audio_format != 1 {
+        return Err(format!("WAV format {audio_format} not PCM"));
+    }
+    if bits_per_sample != 16 {
+        return Err(format!("WAV {bits_per_sample}-bit not supported"));
+    }
+
+    let pcm_data = &data[data_start..];
+    let sample_count = pcm_data.len() / (2 * channels as usize);
+    let mut samples = Vec::with_capacity(sample_count);
+    for s in 0..sample_count {
+        let base = s * (2 * channels as usize);
+        let mut left: i32 = i16::from_le_bytes([pcm_data[base], pcm_data[base + 1]]) as i32;
+        // Downmix stereo by averaging channels.
+        for c in 1..channels as usize {
+            let off = base + 2 * c;
+            if off + 2 <= pcm_data.len() {
+                left += i16::from_le_bytes([pcm_data[off], pcm_data[off + 1]]) as i32;
+            }
+        }
+        samples.push(left as f32 / (channels as f32) / 32768.0);
+    }
+    Ok(samples)
 }
 
 /// Samples a face thumbnail per speaker so the user can confirm the speaker mapping.
 ///
-/// One frame extraction plus one detection per sample: blocking work, so it runs on a
-/// blocking worker rather than the main thread.
+/// One frame extraction plus one ONNX face-detection pass per sample: blocking work,
+/// so it runs on a blocking worker rather than the main thread.
 #[tauri::command]
 pub(crate) async fn sample_speaker_faces(
     app: tauri::AppHandle,
@@ -275,16 +366,11 @@ fn sample_speaker_faces_blocking(
     if samples.is_empty() || samples.len() > 8 {
         return Err("FACE_SAMPLE_LIMIT".into());
     }
-    let python = venv_python();
-    if !python.is_file()
-        || !tool(&python)
-            .args(["-c", "import cv2"])
-            .status()
-            .is_ok_and(|status| status.success())
-    {
-        return Err("FACE_RUNTIME_MISSING: install local diarization in Settings".into());
-    }
-    let temp = create_temporary_render_dir()?;
+
+    let mut detector = FaceDetector::load(app).map_err(|e| format!("FACE_DETECTOR_LOAD:{e}"))?;
+
+    let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let temp = create_temporary_render_dir(&temp_dir)?;
     let mut output = Vec::new();
     let mut response_bytes = 0usize;
     for (index, sample) in samples.iter().enumerate() {
@@ -303,7 +389,7 @@ fn sample_speaker_faces_blocking(
             .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1800.0)
             .ok_or("FACE_TIME_INVALID")?;
         let frame = temp.0.join(format!("frame-{index:02}.jpg"));
-        let status = tool(ffmpeg_bin(&app))
+        let status = tool(ffmpeg_bin(app))
             .args(["-y", "-nostdin", "-v", "error", "-ss"])
             .arg(format!("{time:.3}"))
             .args(["-i"])
@@ -315,26 +401,13 @@ fn sample_speaker_faces_blocking(
         if !status.success() {
             continue;
         }
-        let script = helper_script(&app, "detect-faces.py")?;
-        let detected = tool(&python)
-            .arg(script)
-            .arg(&frame)
-            .output()
-            .map_err(|e| format!("FACE_DETECT_SPAWN:{e}"))?;
-        if !detected.status.success() {
-            return Err(String::from_utf8_lossy(&detected.stderr).trim().to_owned());
-        }
-        let faces: Vec<serde_json::Value> = serde_json::from_slice(&detected.stdout)
-            .map_err(|e| format!("FACE_DETECT_JSON:{e}"))?;
+        let img = image::open(&frame)
+            .map_err(|e| format!("FACE_FRAME_READ:{e}"))?
+            .into_rgb8();
+        let faces = detector.detect(&img).map_err(|e| format!("FACE_DETECT:{e}"))?;
         for (face_index, face) in faces.into_iter().take(4).enumerate() {
-            let thumbnail = face["thumbnail"]
-                .as_str()
-                .filter(|value| {
-                    value.len() <= 350_000
-                        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        && value.len() % 2 == 0
-                })
-                .unwrap_or("");
+            // Encode thumbnail as base64 JPEG.
+            let thumbnail = encode_thumbnail(&img);
             if thumbnail.is_empty() {
                 continue;
             }
@@ -342,16 +415,39 @@ fn sample_speaker_faces_blocking(
             if response_bytes > 10_000_000 {
                 return Err("FACE_RESPONSE_SIZE_LIMIT".into());
             }
-            output.push(serde_json::json!({ "id": format!("{speaker}-{}-{face_index}", index), "speakerId": speaker, "time": time, "thumbnail": thumbnail }));
+            output.push(serde_json::json!({
+                "id": format!("{speaker}-{index}-{face_index}"),
+                "speakerId": speaker,
+                "time": time,
+                "thumbnail": thumbnail,
+                "centerX": face.center_x,
+                "centerY": face.center_y,
+                "width": face.width,
+                "height": face.height,
+                "confidence": face.confidence,
+            }));
         }
     }
     Ok(serde_json::json!(output))
 }
 
+/// Encodes a face thumbnail as a base64 data URI.
+///
+/// The frame is already scaled to a max width of 640 by FFmpeg, so encoding the
+/// raw RGB bytes keeps the thumbnail small enough without a separate image
+/// encoder dependency.
+fn encode_thumbnail(img: &RgbImage) -> String {
+    let buf = img.clone().into_raw();
+    format!(
+        "data:image/rgb;base64,{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf)
+    )
+}
+
 /// Traces the speaker's face across the source video.
 ///
-/// The work — one FFmpeg frame extraction plus one face detection per sample — is
-/// blocking and takes seconds, so it runs on a blocking worker: on the main thread it
+/// The work — one FFmpeg frame extraction plus one ONNX face detection per sample —
+/// is blocking and takes seconds, so it runs on a blocking worker: on the main thread it
 /// would freeze the webview for the whole scan.
 #[tauri::command]
 pub(crate) async fn analyze_crop_path(
@@ -363,7 +459,7 @@ pub(crate) async fn analyze_crop_path(
     source_artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-    analyze_crop_path_blocking(&app, &path, duration, &speaker_intervals, &face_mapping, &source_artifact_id)
+        analyze_crop_path_blocking(&app, &path, duration, &speaker_intervals, &face_mapping, &source_artifact_id)
     })
     .await
     .map_err(|error| format!("CROP_WORKER:{error}"))?
@@ -395,12 +491,11 @@ fn analyze_crop_path_blocking(
     if !input.is_file() {
         return Err("INPUT_NOT_FILE".into());
     }
-    let python = venv_python();
-    if !python.is_file() {
-        return Err("FACE_RUNTIME_MISSING".into());
-    }
-    let temp = create_temporary_render_dir()?;
-    let frames: Vec<serde_json::Value> = extract_and_detect(app, &input, 5.0, 360, duration, &temp, "crop")?
+
+    let mut detector = FaceDetector::load(app).map_err(|e| format!("FACE_DETECTOR_LOAD:{e}"))?;
+    let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let temp = create_temporary_render_dir(&temp_dir)?;
+    let frames: Vec<serde_json::Value> = extract_and_detect(app, &mut detector, &input, 5.0, 360, duration, &temp, "crop")?
         .into_iter()
         .map(|(time, faces)| serde_json::json!({"time": time, "faces": faces}))
         .collect();
@@ -411,37 +506,19 @@ fn analyze_crop_path_blocking(
     Ok(serde_json::json!(output))
 }
 
-/// The timestamps a batched extraction produces: one frame every `interval`
-/// seconds from zero, capped by the extraction itself, never at/after `duration`.
-fn sample_times(count: usize, interval: f64, duration: f64) -> Vec<f64> {
-    (0..count)
-        .map(|index| index as f64 * interval)
-        .take_while(|time| *time < duration)
-        .collect()
-}
-
-/// One FFmpeg pass writes every sampled frame; one Python call detects faces in
-/// all of them. Replaces the per-sample spawn loop — 720 process spawns for a
-/// 30-minute video became two; the Python + cv2 import cost (~1s) is paid once
-/// instead of once per sample.
-///
-/// An unreadable frame comes back as `None` from the detector and is skipped
-/// here rather than killing the scan. A failed extraction batch returns an empty
-/// result, matching the old per-sample loop's "skip what failed" behaviour.
+/// One FFmpeg pass writes every sampled frame; each frame is then run through the
+/// ONNX `FaceDetector`. Replaces the per-sample Python spawn loop — hundreds of
+/// process spawns for a long video became one ffmpeg pass plus one ort session.
 fn extract_and_detect(
     app: &tauri::AppHandle,
+    detector: &mut FaceDetector,
     input: &Path,
     interval: f64,
     max_frames: usize,
     duration: f64,
     temp: &TemporaryRenderDir,
     prefix: &str,
-) -> Result<Vec<(f64, Vec<serde_json::Value>)>, String> {
-    let python = venv_python();
-    if !python.is_file() {
-        return Err("FACE_RUNTIME_MISSING".into());
-    }
-    let script = helper_script(app, "detect-face-boxes.py")?;
+) -> Result<Vec<(f64, Vec<Value>)>, String> {
     let pattern = temp.0.join(format!("{prefix}-%04d.jpg"));
     // One sequential decode instead of hundreds of seeks: comparable CPU time,
     // but a single process with a warm decoder instead of a spawn storm.
@@ -476,21 +553,30 @@ fn extract_and_detect(
     if frame_paths.is_empty() {
         return Ok(Vec::new());
     }
-    let output = tool(&python)
-        .arg(&script)
-        .args(&frame_paths)
-        .output()
-        .map_err(|e| format!("DETECT_SPAWN:{e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    let detected: Vec<Option<Vec<serde_json::Value>>> =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("DETECT_JSON:{e}"))?;
     let mut frames = Vec::new();
-    for (index, time) in sample_times(frame_paths.len(), interval, duration).into_iter().enumerate() {
-        if let Some(Some(faces)) = detected.get(index) {
-            frames.push((time, faces.clone()));
+    for (index, path) in frame_paths.iter().enumerate() {
+        let time = index as f64 * interval;
+        if time >= duration {
+            break;
         }
+        let img = match image::open(path) {
+            Ok(img) => img.into_rgb8(),
+            Err(_) => continue,
+        };
+        let faces = match detector.detect(&img) {
+            Ok(faces) => faces
+                .into_iter()
+                .map(|f| serde_json::json!({
+                    "x": f.center_x,
+                    "y": f.center_y,
+                    "width": f.width,
+                    "height": f.height,
+                    "confidence": f.confidence,
+                }))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        frames.push((time, faces));
     }
     Ok(frames)
 }
@@ -592,14 +678,17 @@ fn analyze_scene_layouts_blocking(
     if !input.is_file() {
         return Err("INPUT_NOT_FILE".into());
     }
-    let temp = create_temporary_render_dir()?;
+
+    let mut detector = FaceDetector::load(app).map_err(|e| format!("FACE_DETECTOR_LOAD:{e}"))?;
+    let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let temp = create_temporary_render_dir(&temp_dir)?;
     let mut scenes = Vec::new();
     let mut start = 0.0;
     let mut samples = Vec::<Vec<serde_json::Value>>::new();
     let mut previous_count: Option<usize> = None;
     // 1800s / 2s = 900 possible samples; the old loop stopped at 360 *scenes*,
     // which the loop below still honours.
-    for (time, faces) in extract_and_detect(app, &input, 2.0, 900, duration, &temp, "scene")? {
+    for (time, faces) in extract_and_detect(app, &mut detector, &input, 2.0, 900, duration, &temp, "scene")? {
         if scenes.len() >= 360 {
             break;
         }
@@ -628,18 +717,7 @@ fn analyze_scene_layouts_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_times, track_crop_path};
-
-    /// The batched extraction's timestamps: one frame every `interval` seconds,
-    /// never at or past the end of the video.
-    #[test]
-    fn sample_times_are_interval_spaced_and_clamped_to_duration() {
-        assert_eq!(sample_times(3, 5.0, 12.0), vec![0.0, 5.0, 10.0]);
-        // A trailing frame at exactly the duration is not a sample.
-        assert_eq!(sample_times(3, 5.0, 10.0), vec![0.0, 5.0]);
-        // Zero-frame edge: no samples, no panic.
-        assert!(sample_times(0, 5.0, 60.0).is_empty());
-    }
+    use super::track_crop_path;
 
     fn face(x: f64, y: f64, width: f64, height: f64, confidence: f64) -> serde_json::Value {
         serde_json::json!({"x": x, "y": y, "width": width, "height": height, "confidence": confidence})

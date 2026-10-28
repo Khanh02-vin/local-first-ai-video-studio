@@ -260,6 +260,7 @@ jobs:
         run: find dist -type f | head -40
       - name: Zip macOS .app bundle (App Store bundles are directories)
         run: |
+          mkdir -p dist/macos-app
           cd dist/macos-app
           # The uploaded artifact holds the .app directory as zip archives
           # (upload-artifact archives directories); unpack those, then zip each
