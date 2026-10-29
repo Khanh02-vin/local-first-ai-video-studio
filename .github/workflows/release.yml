@@ -278,8 +278,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.1
-          name: Local-first AI Video Studio v0.1.1
+          tag_name: v0.1.2
+          name: Local-first AI Video Studio v0.1.2
           body: |
             Desktop builds (local-first, offline).
 
@@ -296,9 +296,9 @@ jobs:
       - name: Rename portable asset in release
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         run: |
-          gh release upload v0.1.1 dist/windows-portable/*.zip --clobber
+          gh release upload v0.1.2 dist/windows-portable/*.zip --clobber
           # Rename the uploaded asset to customer-facing name
-          gh api repos/${{ github.repository }}/releases/tags/v0.1.1 --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -I {} gh api repos/${{ github.repository }}/releases/assets/{} -X PATCH -f name="Local-first AI Video Studio Portable.zip"
+          gh api repos/${{ github.repository }}/releases/tags/v0.1.2 --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -I {} gh api repos/${{ github.repository }}/releases/assets/{} -X PATCH -f name="Local-first AI Video Studio Portable.zip"
       - name: Upload installers to Google Drive (customer-facing links)
         run: |
           RCLONE=/home/khanh/.local/bin/rclone
@@ -315,14 +315,20 @@ jobs:
           msi=$(ls dist/windows-installer/*.msi | head -1)
           appimage=$(ls dist/linux-installer/*.AppImage | head -1)
           portable=$(ls dist/windows-portable/*.zip | head -1)
+          # MSI/AppImage Drive names used to embed the version, so every bump
+          # minted a NEW Drive file and broke the customer link. moveto renames
+          # the existing file in place (Drive keeps the file id across renames);
+          # once renamed, the old names are gone and this is a no-op.
+          "$RCLONE" moveto "$DEST/Local-first AI Video Studio_0.1.1_x64_en-US.msi"  "$DEST/Local-first AI Video Studio.msi" 2>/dev/null || true
+          "$RCLONE" moveto "$DEST/Local-first AI Video Studio_0.1.1_amd64.AppImage" "$DEST/Local-first AI Video Studio.AppImage" 2>/dev/null || true
           "$RCLONE" copyto "$mac_zip"   "$DEST/Local-first AI Video Studio.zip"
-          "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio_0.1.1_x64_en-US.msi"
-          "$RCLONE" copyto "$appimage"  "$DEST/Local-first AI Video Studio_0.1.1_amd64.AppImage"
+          "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio.msi"
+          "$RCLONE" copyto "$appimage"  "$DEST/Local-first AI Video Studio.AppImage"
           "$RCLONE" copyto "$portable"  "$DEST/Local-first AI Video Studio Portable.zip"
           # Self-heal: remove the stray that pre-fix publishes left behind.
           "$RCLONE" deletefile "$DEST/portable-windows.zip" 2>/dev/null || true
           echo "=== Customer download links (Google Drive):"
-          for f in "Local-first AI Video Studio Portable.zip" "Local-first AI Video Studio.zip" "Local-first AI Video Studio_0.1.1_amd64.AppImage" "Local-first AI Video Studio_0.1.1_x64_en-US.msi"; do
+          for f in "Local-first AI Video Studio Portable.zip" "Local-first AI Video Studio.zip" "Local-first AI Video Studio.AppImage" "Local-first AI Video Studio.msi"; do
             echo "$("$RCLONE" link "$DEST/$f")"
           done | tee drive-links.txt
           cat drive-links.txt >> "$GITHUB_STEP_SUMMARY"
