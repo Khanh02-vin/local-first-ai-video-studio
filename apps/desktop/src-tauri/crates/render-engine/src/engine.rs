@@ -83,7 +83,13 @@ pub fn run_render_child(
         command.process_group(0);
     }
     #[cfg(windows)]
-    command.creation_flags(0x0001_0000); // CREATE_NEW_PROCESS_GROUP
+    {
+        use std::os::windows::process::CommandExt;
+        // creation_flags replaces rather than ORs: keep CREATE_NO_WINDOW from tool(),
+        // keep the cancel-kill group, and drop to BELOW_NORMAL so encoding doesn't
+        // starve the webview's compositor mid-export.
+        command.creation_flags(0x0800_0000 | 0x0001_0000 | 0x0000_4000);
+    } // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
     let child = command.spawn().map_err(|error| {
         on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("FFMPEG_SPAWN".into()) });
         format!("FFMPEG_SPAWN:{error}")

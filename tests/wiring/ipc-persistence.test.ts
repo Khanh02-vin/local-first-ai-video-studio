@@ -74,6 +74,7 @@ assert.doesNotMatch(rust, /RAG_PORT: u16 = /, "the fixed RAG port must stay gone
 // compiles and runs them for real.
 assert.match(rust, /taskkill[\s\S]{0,120}?\/F[\s\S]{0,40}?\/T[\s\S]{0,40}?\/PID/, "windows cancel must kill the whole process tree (/T)");
 assert.match(rust, /tasklist[\s\S]{0,80}?PID eq/, "the windows liveness probe must filter tasklist by pid");
-assert.match(rust, /group_spawn\(\)/, "the analysis worker must be spawned in a group/job object");
+assert.match(rust, /cmd\.group\(\)[\s\S]{0,200}?group\.spawn\(\)/, "the analysis worker must be spawned in a group/job object");
+assert.match(rust, /group\.creation_flags\(/, "worker creation flags must go through the group builder — its spawn() overwrites the Command's own flags");
 
 console.log("IPC and shared persistence contract tests: ok");

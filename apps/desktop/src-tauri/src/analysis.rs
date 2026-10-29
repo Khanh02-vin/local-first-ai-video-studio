@@ -232,12 +232,22 @@ pub(crate) fn spawn_analysis_worker_reserved(
             for (key, value) in helper_env(&app, &[]) {
                 cmd.env(key, value);
             }
+            // BELOW_NORMAL keeps the webview responsive while whisper/ffmpeg saturate
+            // the CPU — every grandchild inherits the parent's priority class. Must go
+            // through the group builder: its spawn() REPLACES the Command's creation
+            // flags (it starts from zero), so any flags set on cmd itself are lost —
+            // including tool()'s CREATE_NO_WINDOW, which is re-added here.
+            #[cfg(windows)]
+            let group_flags = 0x0800_0000 | 0x0000_4000; // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
             // group_spawn puts the worker in its own process group (Unix) or a Job
             // Object with KILL_ON_JOB_CLOSE (Windows): one kill reaches the whisper
             // and chunk-ffmpeg grandchildren on every platform we ship, and a crashed
             // app can no longer leave an orphaned tree behind.
             use command_group::CommandGroup;
-            let child = cmd.group_spawn().map_err(|e| io_error("NODE_SPAWN", e))?;
+            let mut group = cmd.group();
+            #[cfg(windows)]
+            group.creation_flags(group_flags);
+            let child = group.spawn().map_err(|e| io_error("NODE_SPAWN", e))?;
             let worker_pid = child.id();
             register_analysis_worker(&job_id, worker_pid);
             // The GroupChild owns the Windows Job Object, so it must outlive the
