@@ -53,7 +53,11 @@ if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
   # real weights are only needed when Whisper actually runs).
   mkdir -p "$RES/models"
   [[ -e "$RES/models/tiny.pt" ]] || : > "$RES/models/tiny.pt"
-  [[ -e "$RES/whisper-cli" ]] || : > "$RES/whisper-cli"
+  # tauri.conf.json bundles ./resources/whisper-cpp as a directory: like the
+  # models glob above, a missing or empty dir fails tauri-build's resource
+  # validation, so seed it with a placeholder CLI.
+  mkdir -p "$RES/whisper-cpp"
+  [[ -e "$RES/whisper-cpp/whisper-cli" ]] || : > "$RES/whisper-cpp/whisper-cli"
   [[ -e "$RES/models/ggml-tiny.bin" ]] || : > "$RES/models/ggml-tiny.bin"
   echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models, whisper-cli)"
   exit 0
