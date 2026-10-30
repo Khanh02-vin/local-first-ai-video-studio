@@ -122,7 +122,7 @@ jobs:
           # ffmpeg.exe and ffprobe.exe on Windows — a layout drift here shipped
           # a portable whose analysis/RAG helpers silently fell back to PATH.
           RES=apps/desktop/src-tauri/resources
-          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe; do
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe whisper-cpp/whisper-cli.exe; do
             if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
           done
           echo "all bundled helpers present"
@@ -157,6 +157,11 @@ jobs:
           done
           mkdir -p portable/models
           cp "$RES"/models/*.pt portable/models/ 2>/dev/null || true
+          # whisper.cpp ships in the portable too: the cpp engine is the default
+          # and setup_whisper_cpp errors out without a bundled binary — unlike
+          # ggml models, the binary has no runtime downloader.
+          cp -r "$RES/whisper-cpp" portable/whisper-cpp
+          cp "$RES"/models/*.bin portable/models/ 2>/dev/null || true
           # RAG sidecar (build-node is gitignored; beforeBuildCommand built it
           # during the MSI build above) — without it YouTube Studio RAG is dead.
           ROOT=../../../../..
