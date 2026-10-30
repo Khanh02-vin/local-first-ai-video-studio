@@ -59,7 +59,11 @@ if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
   mkdir -p "$RES/whisper-cpp"
   [[ -e "$RES/whisper-cpp/whisper-cli" ]] || : > "$RES/whisper-cpp/whisper-cli"
   [[ -e "$RES/models/ggml-tiny.bin" ]] || : > "$RES/models/ggml-tiny.bin"
-  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models, whisper-cli)"
+  # lfai-render is gitignored and bundle.resources globs it — a fresh checkout
+  # matches nothing and tauri-build fails. The *.onnx glob is satisfied by the
+  # committed face-detection/silero_vad models, so only lfai-render needs this.
+  [[ -e "$RES/lfai-render" ]] || : > "$RES/lfai-render"
+  echo "==> LIGHTWEIGHT: placeholder paths created (node dir, ffmpeg, ffprobe, models, whisper-cpp, lfai-render)"
   exit 0
 fi
 
@@ -170,10 +174,9 @@ fi
 lf_target() {
   if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then echo "$RES/$1.exe"; else echo "$RES/$1"; fi
 }
-if [[ "${LIGHTWEIGHT:-0}" == "1" ]]; then
-  [[ -e "$RES/lfai-render" ]] || : > "$RES/lfai-render"
-  echo "==> LIGHTWEIGHT: lfai-render placeholder created"
-elif [[ -e "$(lf_target lfai-render)" && -s "$(lf_target lfai-render)" ]]; then
+# The LIGHTWEIGHT placeholder for lfai-render lives in the early block above —
+# this block is unreachable after it exits.
+if [[ -e "$(lf_target lfai-render)" && -s "$(lf_target lfai-render)" ]]; then
   echo "==> lfai-render already present"
 else
   echo "==> lfai-render: building from workspace (cargo build --release -p lfai-render)"
