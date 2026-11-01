@@ -1,11 +1,70 @@
 // The app-level commands: project CRUD, the licence tier, and the small probes the
 // window asks for on start (app info, last panic, media probe).
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::contracts::ProbeMetadata;
-use crate::paths::{ffprobe_bin, license_tier, data_dir, tool, LICENSE_PUBLIC_KEY_B64};
+use crate::paths::{ffprobe_bin, license_tier, data_dir, tool, write_private_file, LICENSE_PUBLIC_KEY_B64};
 use crate::project_store;
+
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mts", "m2ts", "3gp"];
+
+fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| VIDEO_EXTENSIONS.iter().any(|allowed| extension.eq_ignore_ascii_case(allowed)))
+        .unwrap_or(false)
+}
+
+fn collect_video_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    if root.is_file() {
+        if is_video_path(root) { files.push(root.to_path_buf()); }
+        return Ok(());
+    }
+    if !root.is_dir() { return Err("INPUT_NOT_FILE_OR_DIRECTORY".into()); }
+    for entry in std::fs::read_dir(root).map_err(|error| format!("INPUT_READ_DIRECTORY:{error}"))? {
+        let entry = entry.map_err(|error| format!("INPUT_READ_DIRECTORY_ENTRY:{error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_video_files(&path, files)?;
+        } else if is_video_path(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn list_video_files(path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = Path::new(&path)
+            .canonicalize()
+            .map_err(|error| format!("INPUT_PATH:{error}"))?;
+        let mut files = Vec::new();
+        collect_video_files(&root, &mut files)?;
+        files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        files.dedup();
+        Ok(files
+            .into_iter()
+            .map(|file| file.to_string_lossy().into_owned())
+            .collect())
+    })
+    .await
+    .map_err(|error| format!("LIST_VIDEO_FILES_WORKER:{error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn save_recording(data: Vec<u8>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if data.is_empty() { return Err("RECORDING_EMPTY".into()); }
+        let directory = data_dir().join("recordings");
+        std::fs::create_dir_all(&directory).map_err(|error| format!("RECORDING_DIRECTORY:{error}"))?;
+        let filename = format!("recording-{}.webm", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| format!("CLOCK:{error}"))?.as_millis());
+        let path = directory.join(filename);
+        write_private_file(&path, &data).map_err(|error| format!("RECORDING_WRITE:{error}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    }).await.map_err(|error| format!("RECORDING_WORKER:{error}"))?
+}
 
 #[tauri::command]
 pub(crate) fn license_status() -> serde_json::Value {

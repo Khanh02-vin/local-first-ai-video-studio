@@ -534,6 +534,64 @@ pub(crate) fn youtube_ingest_captions(
     Ok(serde_json::json!({ "videoId": video_id, "segments": segments.len() }))
 }
 
+/// Validates one public, single-video URL before it reaches yt-dlp or render.
+/// This intentionally does not accept credentials, playlists, fragments, or
+/// hosts that merely end with a supported domain.
+pub(crate) fn public_video_url(value: &str) -> bool {
+    let url = match url::Url::parse(value.trim()) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let host = match url.host_str() {
+        Some(host) => host.to_ascii_lowercase(),
+        None => return false,
+    };
+    if host == "youtube.com"
+        || host == "www.youtube.com"
+        || host == "m.youtube.com"
+        || host == "youtu.be"
+    {
+        if url.query_pairs().any(|(key, _)| key == "list" || key == "playlist") {
+            return false;
+        }
+        return youtube_video_id(value).is_some();
+    }
+    if !matches!(
+        host.as_str(),
+        "tiktok.com" | "www.tiktok.com" | "vm.tiktok.com" | "vt.tiktok.com"
+    ) {
+        return false;
+    }
+    let segments: Vec<_> = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return false;
+    }
+    match host.as_str() {
+        "vm.tiktok.com" | "vt.tiktok.com" => segments.len() == 1,
+        _ => {
+            segments.len() >= 3
+                && segments[0].starts_with('@')
+                && segments[1] == "video"
+                && segments[2].chars().all(|c| c.is_ascii_digit())
+                && segments[2].len() >= 18
+                && segments[2].len() <= 19
+        }
+    }
+}
+
 /// Extracts a video id from a youtube.com/youtu.be link for validation only —
 /// the original (case-preserved) URL is what reaches yt-dlp afterwards.
 pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
@@ -648,8 +706,8 @@ pub(crate) fn start_youtube_analysis(
     url: String,
 ) -> Result<serde_json::Value, String> {
     let url = url.trim().to_string();
-    if youtube_video_id(&url).is_none() {
-        return Err("INVALID_YOUTUBE_URL".into());
+    if !public_video_url(&url) {
+        return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }
     let (title, duration) = yt_video_meta(&app, &url)?;
     if !analysis_range_allowed(0.0, duration) {

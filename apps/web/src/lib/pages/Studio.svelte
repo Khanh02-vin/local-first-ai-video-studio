@@ -99,6 +99,12 @@
   let sourceVerified = $state(false);
   let probeError = $state("");
   let dragOver = $state(false);
+  let folderFiles = $state<string[]>([]);
+  let recording = $state(false);
+  let cameraSupported = $state(false);
+  let recorder: MediaRecorder | null = null;
+  let recordingStream: MediaStream | null = null;
+  let recordingChunks: Blob[] = [];
   let resumableJobs = $state<JobRow[]>([]);
   let currentStep = $state<1 | 2 | 3 | 4>(1);
 
@@ -111,9 +117,70 @@
   async function choose() {
     if (!isTauri()) { message = "File dialogs only work in the desktop app — open the installed app to load a video."; return; }
     if (e2eVideo) { await loadVideo(e2eVideo); return; }
-    const path = await open({ multiple: false, directory: false, filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm"] }] });
-    if (typeof path === "string") await loadVideo(path);
+    const path = await open({ multiple: false, directory: false, filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mts", "m2ts", "3gp"] }] });
+    if (typeof path === "string") { folderFiles = []; await loadVideo(path); }
   }
+
+  async function chooseFolder() {
+    if (!isTauri()) { message = "Folder import only works in the desktop app."; return; }
+    const path = await open({ multiple: false, directory: true });
+    if (typeof path !== "string") return;
+    await importPath(path);
+  }
+
+  async function importPath(path: string) {
+    try {
+      const files = await invoke<string[]>("list_video_files", { path });
+      if (!files.length) { message = "No supported video files were found in that location."; return; }
+      folderFiles = files;
+      message = files.length === 1 ? "Video found. Verifying…" : `${files.length} videos found. Choose one to verify.`;
+      await loadVideo(files[0]);
+    } catch (error) {
+      folderFiles = [];
+      await loadVideo(path);
+    }
+  }
+  async function startCameraRecording() {
+    if (!isTauri()) { message = "Camera recording is available in the desktop app."; return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { message = "This desktop runtime does not support camera recording. Record with the system camera, then import the file."; return; }
+    try {
+      recordingStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const mimeType = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"].find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
+      recorder = new MediaRecorder(recordingStream, mimeType ? { mimeType } : undefined);
+      recordingChunks = [];
+      recorder.ondataavailable = (event) => { if (event.data.size) recordingChunks.push(event.data); };
+      recorder.onerror = () => { message = "Camera recording failed. You can record with the system camera and import the file instead."; stopCameraRecording(); };
+      recorder.onstop = async () => {
+        const currentRecorder = recorder;
+        const blob = new Blob(recordingChunks, { type: currentRecorder?.mimeType || "video/webm" });
+        recordingChunks = [];
+        recorder = null;
+        try {
+          const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+          const path = await invoke<string>("save_recording", { data: bytes });
+          await importPath(path);
+        } catch (error) { message = `Could not save camera recording: ${String(error)}`; }
+      };
+      recorder.start(1000);
+      recording = true;
+      message = "Recording camera video… click Stop recording when finished.";
+    } catch (error) {
+      recording = false;
+      recordingStream?.getTracks().forEach((track) => track.stop());
+      recordingStream = null;
+      message = `Camera access failed: ${String(error)}. You can import a camera file instead.`;
+    }
+  }
+
+  function stopCameraRecording() {
+    if (!recorder || recorder.state === "inactive") return;
+    recording = false;
+    recorder.stop();
+    recordingStream?.getTracks().forEach((track) => track.stop());
+    recordingStream = null;
+  }
+
+
 
   async function refreshDiarizationStatus() {
     if (!isTauri()) return;
@@ -739,6 +806,7 @@ function renderErrorCodeToMessage(code: string | undefined, fallback: string): s
 }
 function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   onMount(() => {
+    cameraSupported = Boolean(typeof Reflect.get(navigator.mediaDevices, "getUserMedia") === "function" && typeof Reflect.get(window, "MediaRecorder") === "function");
     void refreshRuntime(); void reconnectJobs(); void refreshProjects(); void refreshDiarizationStatus();
     if (isTauri()) invoke<string>("preview_origin").then((base) => previewBase = base).catch(() => {});
     if (isTauri()) invoke<number>("recover_render_jobs").catch(() => {});
@@ -748,12 +816,12 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
       if (payload.type === "drop") {
         dragOver = false;
         const path = payload.paths?.[0];
-        if (path) void loadVideo(path);
+        if (path) void importPath(path);
       }
     });
     // Browser-preview drop blocking lives in +layout.svelte (once per app
     // session — the old per-mount window listeners leaked on every visit).
-    return () => { stopTimer(); unlisten.then((fn) => fn()); };
+    return () => { stopCameraRecording(); stopTimer(); unlisten.then((fn) => fn()); };
   });
   // Refresh job lists only while visible; keep-alive pages remain mounted.
   $effect(() => {
@@ -786,9 +854,24 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
           <h2>Drop a video to start</h2>
           <p>Drag & drop here, or</p>
           <button class="browse" onclick={choose} disabled={busy}><Icon name="folder" size={15} /> Browse files</button>
-          <p class="hint">MP4 · MOV · MKV — processed 100% on your device</p>
+          <button class="browse" onclick={chooseFolder} disabled={busy}><Icon name="folder" size={15} /> Import camera folder</button>
+          {#if cameraSupported}
+            <button class="browse" onclick={recording ? stopCameraRecording : startCameraRecording} disabled={busy}>
+              <Icon name="film" size={15} /> {recording ? "Stop recording" : "Record from camera"}
+            </button>
+          {/if}
+          <p class="hint">MP4 · MOV · MKV · MTS · M2TS · AVI — processed 100% on your device</p>
+          {#if folderFiles.length > 1}
+            <div class="source-list" aria-label="Videos found in folder">
+              {#each folderFiles as file}
+                <button type="button" class="source-item" class:selected={inputPath === file} onclick={() => loadVideo(file)} disabled={busy}>
+                  {file.split(/[\\/]/).pop() ?? file}
+                </button>
+              {/each}
+            </div>
+          {/if}
           <div style="display:flex;gap:.5rem;margin-top:1rem;flex-wrap:wrap;justify-content:center;">
-            <input type="url" placeholder="…or paste a YouTube URL" aria-label="YouTube URL" bind:value={youtubeUrl} disabled={busy} style="flex:1;min-width:220px;" />
+            <input type="url" placeholder="…or paste a supported public video URL" aria-label="Public video URL" bind:value={youtubeUrl} disabled={busy} style="flex:1;min-width:220px;" />
             <button class="browse" onclick={analyzeYoutube} disabled={busy || !youtubeUrl.trim()}>{#if busy}<span class="spinner"></span>{:else}Analyze link{/if}</button>
           </div>
           <p class="hint">YouTube: reads the transcript in seconds — no download, no Whisper.</p>
@@ -802,7 +885,7 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
           </div>
           <button class="btn btn-primary btn-sm" disabled={!sourceVerified} onclick={() => currentStep = 2}>Continue to config →</button>
           {#if probeError}<p class="hint" aria-live="polite">{probeError}</p>{/if}
-          <button class="btn btn-quiet btn-sm" onclick={() => { inputPath = ""; meta = null; sourceVerified = false; probeError = ""; youtubeVideoId = ""; message = "Drop a video to begin."; }}>Remove</button>
+          <button class="btn btn-quiet btn-sm" onclick={() => { inputPath = ""; folderFiles = []; meta = null; sourceVerified = false; probeError = ""; youtubeVideoId = ""; message = "Drop a video to begin."; }}>Remove</button>
         </div>
       {/if}
     </div>
@@ -1007,5 +1090,8 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
     .variant-select li { margin:.35rem 0; }
     .variant-select li small { display:block; color:var(--ink-2); }
     .variant-card .field-row { margin-top:.6rem; }
+    .source-list { display:grid; gap:.35rem; width:100%; max-height:10rem; overflow:auto; margin-top:.75rem; text-align:left; }
+    .source-item { border:1px solid var(--line-soft); border-radius:8px; background:var(--surface); color:var(--ink); padding:.45rem .6rem; text-align:left; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .source-item:hover,.source-item.selected { border-color:var(--volt); }
   </style>
 </main>

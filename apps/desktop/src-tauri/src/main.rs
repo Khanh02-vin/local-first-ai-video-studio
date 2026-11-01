@@ -19,8 +19,8 @@ mod shell;
 mod youtube;
 
 use app::{
-    app_info, last_panic, license_status, probe_video, project_create, project_delete, project_get, project_list,
-    project_save,
+    app_info, last_panic, license_status, list_video_files, probe_video, project_create, project_delete, project_get, project_list,
+    project_save, save_recording,
 };
 use analysis::{
     abandon_analysis, analysis_status, list_analysis_jobs, preflight_analyze, resume_queued_jobs,
@@ -151,6 +151,8 @@ fn main() {
             abandon_analysis,
             stop_analysis,
             probe_video,
+            list_video_files,
+            save_recording,
             prepare_video_preview,
             render::render_video,
             render::cancel_render,
@@ -211,7 +213,7 @@ mod tests {
         download_and_verify, find_runtime_server, llama_runtime_asset, run_whisper_bootstrap,
         sha256_file, write_runtime_env, LLAMA_RUNTIME_ASSETS, LLAMA_VERSION,
     };
-    use crate::youtube::{preview_page, preview_query, youtube_search_query};
+    use crate::youtube::{preview_page, preview_query, public_video_url, youtube_search_query, youtube_video_id};
 
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
@@ -917,6 +919,30 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
                 None => std::env::remove_var("WHISPER_COMMAND"),
             }
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn public_video_url_accepts_supported_hosts_and_rejects_unsafe_inputs() {
+        assert!(public_video_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(public_video_url("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(public_video_url("https://www.tiktok.com/@creator/video/7123456789012345678"));
+        assert!(public_video_url("https://vm.tiktok.com/ZMrabcd123/"));
+        assert!(public_video_url("https://vt.tiktok.com/ZMrabcd123/"));
+
+        for value in [
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://user:pass@www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com:8443/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ#t=10",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLtest",
+            "https://evil-youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.tiktok.com/@creator/video/123",
+            "https://www.tiktok.com/@creator/video/12345678901234567890",
+            "https://www.tiktok.com/evil",
+            "https://tiktok.com",
+        ] {
+            assert!(!public_video_url(value), "{value}");
         }
     }
 
