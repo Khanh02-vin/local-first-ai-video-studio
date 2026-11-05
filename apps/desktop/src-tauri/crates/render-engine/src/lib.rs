@@ -10,6 +10,4 @@ pub mod probe;
 pub mod process;
 
 pub use contracts::{RenderPlan, RenderProgress, RenderRange, RenderRequest};
-pub use engine::{
-    render_segments, ProgressSink, RENDER_CANCELLED,
-};
+pub use engine::{render_segments, ProgressSink, RENDER_CANCELLED};

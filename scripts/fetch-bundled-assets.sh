@@ -22,6 +22,35 @@ OS="$(uname -s)"
 
 mkdir -p "$RES/models"
 
+# --- PP-OCRv6 text-region detector -------------------------------------------
+# RapidOCR v3.10.0 conversion of PaddleOCR PP-OCRv6_small_det, Apache-2.0.
+# Pin the artifact hash so a changed or partial model cannot be bundled silently.
+OCR_MODEL="$RES/models/PP-OCRv6_det_small.onnx"
+OCR_MODEL_SHA256="090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f"
+OCR_MODEL_URL="https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx"
+if [[ "${LIGHTWEIGHT:-0}" != "1" ]]; then
+  actual=""
+  if [[ -f "$OCR_MODEL" ]]; then
+    if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$OCR_MODEL" | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$OCR_MODEL" | cut -d' ' -f1)"
+    fi
+  fi
+  if [[ "$actual" != "$OCR_MODEL_SHA256" ]]; then
+    tmp_model="$OCR_MODEL.part"
+    rm -f "$tmp_model"
+    echo "==> OCR model: downloading pinned PP-OCRv6_det_small.onnx"
+    curl -L --fail --retry 3 -o "$tmp_model" "$OCR_MODEL_URL"
+    if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$tmp_model" | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$tmp_model" | cut -d' ' -f1)"
+    else echo "No SHA-256 utility available" >&2; rm -f "$tmp_model"; exit 1
+    fi
+    [[ "$actual" == "$OCR_MODEL_SHA256" ]] || { echo "PP-OCRv6 model SHA-256 mismatch: $actual" >&2; rm -f "$tmp_model"; exit 1; }
+    mv "$tmp_model" "$OCR_MODEL"
+  else
+    echo "==> OCR model already present and hash-verified"
+  fi
+fi
+
 # --- extract_zip: try unzip, then python3, then python, then tar --------------
 extract_zip() {
   local pkg="$1" dest="$2"

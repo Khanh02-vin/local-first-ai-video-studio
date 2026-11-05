@@ -534,6 +534,10 @@ try {
       const savedMessage = await text("css selector", ".message");
       const outputStat = await stat(output);
       if (!outputStat.isFile() || outputStat.size === 0) throw new Error(`Export output is missing or empty: ${output}`);
+      const reportResult = await invokeTauri("auto_person_layouts_last_report", {});
+      if (!reportResult || reportResult.detectorLoaded !== true) throw new Error(`ONNX auto-person report did not run: ${JSON.stringify(reportResult)}`);
+      if (!reportResult.layoutsCount || reportResult.layoutsCount <= 0) throw new Error(`ONNX auto-person produced no layouts: ${JSON.stringify(reportResult)}`);
+      report.observations.push(`ONNX auto-person: detectorLoaded=${reportResult.detectorLoaded}, layoutsCount=${reportResult.layoutsCount}.`);
       report.observations.push(`${savedMessage}; exported ${outputStat.size} bytes to a temporary file.`);
       await screenshot("04-export-complete");
       report.output = output;

@@ -20,6 +20,23 @@ export * from "./diarization.ts";
 export type ClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
 export type LocalClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
 
+/**
+ * Resolves the highlight strategy the analysis worker should run. An explicit
+ * "semantic-*" value is honored as-is; unset, empty, or "heuristic" means auto:
+ * prefer the activated OpenAI-compatible provider, then a saved Gemini key.
+ * Installs without credentials fall through to the offline heuristic selector,
+ * which stays the fallback. The local llama.cpp provider stays opt-in — auto-
+ * connecting to a default localhost endpoint would be surprising.
+ */
+export function resolveHighlightStrategy(env: Record<string, string | undefined> = process.env): string {
+  const explicit = env.HIGHLIGHT_STRATEGY?.trim();
+  if (explicit && explicit !== "heuristic") return explicit;
+  const has = (value?: string) => Boolean(value?.trim());
+  if (has(env.ACTIVE_PROVIDER_BASE_URL) && has(env.ACTIVE_PROVIDER_API_KEY) && has(env.ACTIVE_PROVIDER_MODEL)) return "semantic-openai";
+  if (has(env.GEMINI_API_KEY)) return "semantic-gemini";
+  return "heuristic";
+}
+
 export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAnalysis {
   const transcript: Transcript = { version: 1, sourceArtifactId, language: "und", duration, provider: "mock", words: [{ id: "w1", text: "placeholder", start: 0, end: duration }], segments: [{ id: "s1", text: "placeholder", start: 0, end: duration, wordIds: ["w1"] }] };
   validateTranscript(transcript);

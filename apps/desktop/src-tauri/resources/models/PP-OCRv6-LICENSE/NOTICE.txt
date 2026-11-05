@@ -1,0 +1,11 @@
+PP-OCRv6_det_small.onnx
+
+Model: RapidOCR conversion of PaddleOCR PP-OCRv6_small_det
+RapidOCR release: v3.10.0
+SHA-256: 090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f
+Artifact: https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx
+Model declaration and attribution: https://rapidai.github.io/RapidOCRDocs/main/model_licenses/
+
+Declared license: Apache License 2.0. The pretrained weights derive from PaddleOCR PP-OCRv6_small_det; upstream model-weight copyright remains with Baidu and the relevant PaddleOCR rights holders. The bundled LICENSE file contains the Apache-2.0 license text. No separate model NOTICE was identified in the license declaration at the time this model was added.
+
+The ONNX file is redistributed without modification. The model is provided AS IS; use of project or product trademarks does not imply endorsement.

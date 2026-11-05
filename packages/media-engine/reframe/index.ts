@@ -11,6 +11,17 @@
 // so once made the stored crop drift away from the subject.
 import type { RenderPlan } from "../../contracts/render-plan.ts";
 
+export {
+  CONTAINMENT_PADDING,
+  MIN_PORTRAIT_WIDTH,
+  contains,
+  normalizeSpanBox,
+  resolveFrameByContainment,
+  type ContainmentAnchor,
+  type ContainmentResolution,
+  type SpanBox,
+} from "./containment.ts";
+
 export type CropKeyframe = NonNullable<RenderPlan["cropKeyframes"]>[number];
 
 export type CropCenter = { x: number; y: number };

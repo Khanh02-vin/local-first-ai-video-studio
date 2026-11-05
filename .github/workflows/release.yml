@@ -18,10 +18,10 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   lint-test:
@@ -52,7 +52,6 @@ jobs:
         working-directory: apps/desktop/src-tauri
 
   macos:
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,7 +105,6 @@ jobs:
           path: apps/desktop/src-tauri/target/release/bundle/macos/*.app
 
   windows:
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +120,7 @@ jobs:
           # ffmpeg.exe and ffprobe.exe on Windows — a layout drift here shipped
           # a portable whose analysis/RAG helpers silently fell back to PATH.
           RES=apps/desktop/src-tauri/resources
-          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe whisper-cpp/whisper-cli.exe; do
+          for f in node/bin/node.exe ffmpeg.exe ffprobe.exe whisper-cpp/whisper-cli.exe models/PP-OCRv6_det_small.onnx models/PP-OCRv6-LICENSE/NOTICE.txt; do
             if [[ ! -f "$RES/$f" ]]; then echo "missing bundled helper: $RES/$f" >&2; exit 1; fi
           done
           echo "all bundled helpers present"
@@ -157,11 +155,13 @@ jobs:
           done
           mkdir -p portable/models
           cp "$RES"/models/*.pt portable/models/ 2>/dev/null || true
+          cp "$RES"/models/*.bin portable/models/ 2>/dev/null || true
+          cp "$RES"/models/*.onnx portable/models/ 2>/dev/null || true
+          cp -r "$RES"/models/PP-OCRv6-LICENSE portable/models/PP-OCRv6-LICENSE 2>/dev/null || true
           # whisper.cpp ships in the portable too: the cpp engine is the default
           # and setup_whisper_cpp errors out without a bundled binary — unlike
           # ggml models, the binary has no runtime downloader.
           cp -r "$RES/whisper-cpp" portable/whisper-cpp
-          cp "$RES"/models/*.bin portable/models/ 2>/dev/null || true
           # RAG sidecar (build-node is gitignored; beforeBuildCommand built it
           # during the MSI build above) — without it YouTube Studio RAG is dead.
           ROOT=../../../../..
@@ -224,14 +224,13 @@ jobs:
           cd apps/desktop
           npm install
           npx tauri build -b appimage
-      - name: Stage linux installer for publish (same machine — skip GitHub round-trip)
-        run: |
-          mkdir -p ~/lfavis-dist/linux
-          cp apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage ~/lfavis-dist/linux/
-          ls -lh ~/lfavis-dist/linux/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
 
   publish:
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: [macos, windows, linux]
     # Chạy trên self-hosted runner — nơi có rclone đã đăng nhập Drive của bạn.
     runs-on: [self-hosted, self-vostro]
@@ -246,36 +245,27 @@ jobs:
         run: |
           mkdir -p dist
           TOKEN="${{ github.token }}"
-          REPO_API="repos/${{ github.repository }}/actions/artifacts"
-          for artifact in windows-installer windows-portable macos-app; do
-            ID=$(curl -sS -H "Authorization: Bearer $TOKEN" "$REPO_API?name=$artifact" | python3 -c "import json,sys; print(json.load(sys.stdin)['artifacts'][0]['id'])")
+          REPO_API="https://api.github.com/repos/${{ github.repository }}"
+          RUN_ARTIFACTS="$REPO_API/actions/runs/${{ github.run_id }}/artifacts"
+          for artifact in windows-installer windows-portable macos-app linux-installer; do
+            ID=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$RUN_ARTIFACTS?name=$artifact" | python3 -c "import json,sys; items=json.load(sys.stdin)['artifacts']; print(next((a['id'] for a in items if a['name']=='$artifact' and not a['expired']), ''))")
+            [ -n "$ID" ] || { echo "artifact $artifact missing from run ${{ github.run_id }}" >&2; exit 1; }
             ATTEMPT=0
-            until curl -sS -L -C - -H "Authorization: Bearer $TOKEN" -o "dist/$artifact.zip" "$REPO_API/$ID/zip"; do
+            until curl -fsS -L -C - -H "Authorization: Bearer $TOKEN" -o "dist/$artifact.zip" "$REPO_API/actions/artifacts/$ID/zip"; do
               ATTEMPT=$((ATTEMPT+1))
               [ $ATTEMPT -ge 30 ] && echo "artifact $artifact: download failed after 30 resumes" >&2 && exit 1
               sleep 5
             done
+            mkdir -p "dist/$artifact"
+            unzip -q -o "dist/$artifact.zip" -d "dist/$artifact"
+            rm "dist/$artifact.zip"
           done
-      - name: Pick up linux AppImage from the shared staging dir
-        run: |
-          mkdir -p dist/linux-installer
-          cp ~/lfavis-dist/linux/*.AppImage dist/linux-installer/
-          ls -lh dist/linux-installer/
       - name: Show collected artifacts
         run: find dist -type f | head -40
-      - name: Zip macOS .app bundle (App Store bundles are directories)
+      - name: Zip macOS .app bundle
         run: |
-          mkdir -p dist/macos-app
           cd dist/macos-app
-          # The uploaded artifact holds the .app directory as zip archives
-          # (upload-artifact archives directories); unpack those, then zip each
-          # bundle itself so users get one clean download per platform.
-          for z in *.zip; do
-            [ -f "$z" ] || continue
-            unzip -q -o "$z"
-            rm -f "$z"
-          done
-          rm -rf macos-app/ 2>/dev/null || true   # drop any stale nested dir
+          # The downloaded artifact archive contains the .app directory directly.
           for app in *.app; do
             [ -d "$app" ] && zip -qry "${app%.app}.zip" "$app"
           done
@@ -283,8 +273,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.2
-          name: Local-first AI Video Studio v0.1.2
+          tag_name: ${{ github.ref_name }}
+          name: Local-first AI Video Studio ${{ github.ref_name }}
           body: |
             Desktop builds (local-first, offline).
 
@@ -301,12 +291,15 @@ jobs:
       - name: Rename portable asset in release
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
         run: |
-          gh release upload v0.1.2 dist/windows-portable/*.zip --clobber
+          TAG="${{ github.ref_name }}"
+          gh release upload "$TAG" dist/windows-portable/*.zip --clobber
           # Rename the uploaded asset to customer-facing name
-          gh api repos/${{ github.repository }}/releases/tags/v0.1.2 --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -I {} gh api repos/${{ github.repository }}/releases/assets/{} -X PATCH -f name="Local-first AI Video Studio Portable.zip"
+          gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -r -I {} gh api "repos/${{ github.repository }}/releases/assets/{}" -X PATCH -f name="Local-first AI Video Studio Portable.zip"
       - name: Upload installers to Google Drive (customer-facing links)
         run: |
           RCLONE=/home/khanh/.local/bin/rclone
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
           DEST="gdrive:LFaIVS-Releases"
           # rclone copy matches by destination FILENAME. The portable's staging
           # name (portable-windows.zip) never matched the canonical customer
@@ -321,10 +314,9 @@ jobs:
           appimage=$(ls dist/linux-installer/*.AppImage | head -1)
           portable=$(ls dist/windows-portable/*.zip | head -1)
           # MSI/AppImage Drive names used to embed the version, so every bump
-          # minted a NEW Drive file and broke the customer link. moveto renames
-          # the existing file in place (Drive keeps the file id across renames);
-          # once renamed, the old names are gone and this is a no-op.
-          "$RCLONE" moveto "$DEST/Local-first AI Video Studio_0.1.1_x64_en-US.msi"  "$DEST/Local-first AI Video Studio.msi" 2>/dev/null || true
+          # minted a NEW Drive file and broke the customer link. Keep these
+          # compatibility renames for old 0.1.1 links, then update stable names.
+          "$RCLONE" moveto "$DEST/Local-first AI Video Studio_0.1.1_x64_en-US.msi" "$DEST/Local-first AI Video Studio.msi" 2>/dev/null || true
           "$RCLONE" moveto "$DEST/Local-first AI Video Studio_0.1.1_amd64.AppImage" "$DEST/Local-first AI Video Studio.AppImage" 2>/dev/null || true
           "$RCLONE" copyto "$mac_zip"   "$DEST/Local-first AI Video Studio.zip"
           "$RCLONE" copyto "$msi"       "$DEST/Local-first AI Video Studio.msi"

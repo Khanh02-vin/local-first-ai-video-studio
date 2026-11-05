@@ -12,7 +12,7 @@
 /// path a second time. The stored crop then drifted away from the subject, and the
 /// renderer — which reads the plan — followed the drifted path.
 import assert from "node:assert/strict";
-import { cropCenterAt } from "../../packages/media-engine/reframe/index.ts";
+import { cropCenterAt, resolveFrameByContainment, MIN_PORTRAIT_WIDTH, contains, normalizeSpanBox } from "../../packages/media-engine/reframe/index.ts";
 import { cropKeyframesFromPath, type RawCropPathPoint } from "../../packages/media-engine/reframe/crop-keyframes.ts";
 import { validateMediaInput } from "../../packages/media-engine/validation/index.ts";
 
@@ -78,5 +78,56 @@ const jumped: RawCropPathPoint[] = [
 const stored = cropKeyframesFromPath(jumped, { mappingConfirmed: false, sourceArtifactId: "src" });
 assert.equal(stored[1].centerX, 0.8, "the crop must follow the tracker, not a second smoothing pass");
 assert.ok(Math.abs(stored[1].centerX - 0.8) < 1e-9);
+
+// --- Containment solver: P (person) and T (baked-in title/subtitle) decide the frame.
+// Rule: whichever box fully contains the other horizontally becomes the frame standard
+// ("cái nào chứa trọn cái nào thì lấy cái đó làm chuẩn"); neither contains → union.
+const person = { left: 0.30, right: 0.52, top: 0.10, bottom: 0.90 };
+
+// No text: a narrow person stays at the standard full-bleed portrait width.
+const noText = resolveFrameByContainment(person);
+assert.equal(noText.anchorType, "person");
+assert.ok(Math.abs(noText.centerX - 0.41) < 1e-9);
+assert.equal(noText.frameWidth, MIN_PORTRAIT_WIDTH);
+assert.equal(noText.needsZoomOut, false);
+
+// P contains T in both axes: the person keeps ownership of the frame.
+const subtitle = { left: 0.34, right: 0.48, top: 0.30, bottom: 0.50 };
+assert.ok(contains(person, subtitle));
+const personOwns = resolveFrameByContainment(person, subtitle);
+assert.equal(personOwns.anchorType, "person");
+assert.ok(Math.abs(personOwns.centerX - 0.41) < 1e-9);
+assert.equal(personOwns.frameWidth, MIN_PORTRAIT_WIDTH);
+
+// T contains P in both axes: ownership passes to the text; the frame widens to T.
+const wideTitle = { left: 0.02, right: 0.66, top: 0.02, bottom: 0.98 };
+assert.ok(contains(wideTitle, person));
+const textOwns = resolveFrameByContainment(person, wideTitle);
+assert.equal(textOwns.anchorType, "text");
+assert.ok(Math.abs(textOwns.centerX - 0.34) < 1e-9);
+assert.ok(Math.abs(textOwns.frameWidth - (0.66 - 0.02 + 0.04)) < 1e-9);
+assert.equal(textOwns.needsZoomOut, true);
+
+// Neither contains: the union box becomes the frame standard.
+const offTitle = { left: 0.70, right: 0.98, top: 0.02, bottom: 0.98 };
+const union = resolveFrameByContainment(person, offTitle);
+assert.equal(union.anchorType, "union");
+assert.ok(Math.abs(union.centerX - (0.30 + 0.98) / 2) < 1e-9);
+assert.ok(Math.abs(union.frameWidth - (0.98 - 0.30 + 0.04)) < 1e-9);
+assert.ok(union.frameWidth <= 1);
+
+// A wide person on its own also zooms out instead of being cropped away.
+const widePerson = resolveFrameByContainment({ left: 0.05, right: 0.60, top: 0.1, bottom: 0.9 });
+assert.equal(widePerson.anchorType, "person");
+assert.equal(widePerson.needsZoomOut, true);
+assert.ok(Math.abs(widePerson.frameWidth - (0.60 - 0.05 + 0.04)) < 1e-9);
+
+// Union wider than the source clamps to 1 rather than overflowing.
+const clipped = resolveFrameByContainment(person, { left: 0.0, right: 0.99, top: 0, bottom: 0.2 });
+assert.equal(clipped.frameWidth, 1);
+
+// Normalisation: non-finite and inverted coordinates cannot escape 0..1 or flip the box.
+assert.deepEqual(normalizeSpanBox({ left: -0.2, right: 1.7, top: 0.3, bottom: 0.3 }), { left: 0, right: 1, top: 0.3, bottom: 0.3 });
+assert.deepEqual(normalizeSpanBox({ left: Number.NaN, right: 0.5, top: 0.2, bottom: Number.NaN }), { left: 0, right: 0.5, top: 0.2, bottom: 0.2 });
 
 console.log("media engine tests: ok");

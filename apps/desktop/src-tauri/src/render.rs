@@ -9,11 +9,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::analysis::RunningGuard;
-use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, is_remote_input, render_progress_log};
-use crate::project_store::{save};
+use crate::paths::{
+    app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, is_remote_input, render_progress_log,
+};
+use crate::project_store::save;
 use crate::youtube::resolve_stream_url;
 use render_engine::contracts::{RenderProgress, RenderRequest};
-use render_engine::engine::{render_segments};
+use render_engine::engine::render_segments;
 use serde_json::Value;
 
 /// Set while a render is being asked to stop. This is the engine's own flag: the app
@@ -87,6 +89,48 @@ pub(crate) async fn render_video(
                 }
                 vec![input_path.to_string_lossy().into_owned()]
             };
+            // Auto composition: sample the local face detector across each 9:16 range
+            // so the crop follows the detected subject instead of a static centre
+            // crop; ranges without a stable face get no layout and keep the centre
+            // crop. Local single-file sources only — remote streams are never decoded
+            // for sampling, and user-provided layouts are never overwritten.
+            if request.plan.aspect_ratio == "9:16"
+                && media.len() == 1
+                && !is_remote_input(&request.input)
+                && plan
+                    .get("compositionLayouts")
+                    .and_then(Value::as_array)
+                    .map_or(true, |items| items.is_empty())
+            {
+                let layouts = crate::diarization::auto_person_layouts(
+                    &app,
+                    Path::new(&media[0]),
+                    &ranges,
+                    plan.get("sourceArtifactId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                if !layouts.is_empty() {
+                    if let Some(fields) = plan.as_object_mut() {
+                        fields.insert("compositionLayouts".into(), Value::Array(layouts));
+                    }
+                }
+            }
+            // OCR is local-only. Geometry goes in a separate render-plan field so
+            // user-authored composition layouts are preserved byte-for-byte.
+            if media.len() == 1 && !is_remote_input(&request.input) {
+                let text_boxes = crate::diarization::auto_text_boxes(
+                    &app,
+                    Path::new(&media[0]),
+                    &ranges,
+                    plan.get("sourceArtifactId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )?;
+                if let Some(fields) = plan.as_object_mut() {
+                    fields.insert("autoTextBoxes".into(), Value::Array(text_boxes));
+                }
+            }
             render_segments(
                 &ffmpeg_bin(&app),
                 &ffprobe_bin(&app),

@@ -3,6 +3,7 @@ import { chooseHeuristicHighlights } from "../services/ai-pipeline/heuristic.ts"
 import { generateSemanticHighlights, SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/semantic.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
+import { resolveHighlightStrategy } from "../services/ai-pipeline/index.ts";
 import { transcriptFromCaptions, type CaptionPayload } from "../services/ai-pipeline/youtube-transcript.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
@@ -55,7 +56,9 @@ try {
   const transcript = transcriptFromCaptions({ ...payload, duration });
   store.update(jobId, { phase: "transcribe", progress: 0.7 });
 
-  const strategy = process.env.HIGHLIGHT_STRATEGY ?? "heuristic";
+  // Unset or "heuristic" resolves by available credentials (see helper);
+  // explicit "semantic-*" values pass through untouched.
+  const strategy = resolveHighlightStrategy();
   const geminiKey = process.env.GEMINI_API_KEY ?? "";
   const activeBaseUrl = process.env.ACTIVE_PROVIDER_BASE_URL ?? "";
   const activeApiKey = process.env.ACTIVE_PROVIDER_API_KEY ?? "";

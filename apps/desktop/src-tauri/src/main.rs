@@ -11,42 +11,43 @@ mod contracts;
 mod diarization;
 mod paths;
 mod preview;
-mod providers;
 mod project_store;
+mod providers;
 mod render;
 mod runtime;
 mod shell;
 mod youtube;
 
-use app::{
-    app_info, last_panic, license_status, list_video_files, probe_video, project_create, project_delete, project_get, project_list,
-    project_save, save_recording,
-};
 use analysis::{
     abandon_analysis, analysis_status, list_analysis_jobs, preflight_analyze, resume_queued_jobs,
     retry_analysis, spawn_analysis_worker, start_analysis, stop_analysis, stop_analysis_workers,
     Jobs, RunningGuard,
 };
+use app::{
+    app_info, last_panic, license_status, list_video_files, probe_video, project_create,
+    project_delete, project_get, project_list, project_save, save_recording,
+};
 use diarization::{
-    analyze_crop_path, analyze_scene_layouts, diarization_setup_status, diarize_video,
-    generate_transcript_variants, install_diarization_runtime, sample_speaker_faces,
-    save_diarization_token,
+    analyze_crop_path, analyze_scene_layouts, auto_person_layouts_last_report,
+    diarization_setup_status, diarize_video, generate_transcript_variants,
+    install_diarization_runtime, sample_speaker_faces, save_diarization_token,
 };
 use paths::*;
 use preview::prepare_video_preview;
-use runtime::{set_runtime_model, stop_sidecars};
-use shell::{install_panic_hook, APP_HANDLE};
 use providers::{
     activate_ai_provider, delete_ai_provider, highlight_strategy_status, list_ai_providers,
     save_ai_provider, set_highlight_strategy,
 };
 use runtime::{
-    bootstrap_whisper, clear_analysis_cache, download_llm_model, download_whisper_model,
-    install_local_llm, local_llm_setup_status, model_download_status, rag_server_url,
-    runtime_status, setup_whisper_cpp, whisper_cpp_status, whisper_cpp_smoke, download_whisper_cpp_model, whisper_cpp_model_status, start_local_llm, stop_local_llm, storage_status,
-    whisper_bootstrap_status, whisper_model_download_status, BootstrapState,
-    LlamaDownloadState, LlamaState, ModelDownloadState, RagState, WhisperDlState,
+    bootstrap_whisper, clear_analysis_cache, download_llm_model, download_whisper_cpp_model,
+    download_whisper_model, install_local_llm, local_llm_setup_status, model_download_status,
+    rag_server_url, runtime_status, setup_whisper_cpp, start_local_llm, stop_local_llm,
+    storage_status, whisper_bootstrap_status, whisper_cpp_model_status, whisper_cpp_smoke,
+    whisper_cpp_status, whisper_model_download_status, BootstrapState, LlamaDownloadState,
+    LlamaState, ModelDownloadState, RagState, WhisperDlState,
 };
+use runtime::{set_runtime_model, stop_sidecars};
+use shell::{install_panic_hook, APP_HANDLE};
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
@@ -178,7 +179,8 @@ fn main() {
             diarize_video,
             sample_speaker_faces,
             analyze_crop_path,
-            analyze_scene_layouts
+            analyze_scene_layouts,
+            auto_person_layouts_last_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
@@ -207,14 +209,17 @@ mod tests {
         subject_pair_continues, write_temporary_ass,
     };
 
-    use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, render_progress_log};
+    use crate::paths::{
+        app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, render_progress_log,
+    };
 
     use crate::runtime::{
         download_and_verify, find_runtime_server, llama_runtime_asset, run_whisper_bootstrap,
         sha256_file, write_runtime_env, LLAMA_RUNTIME_ASSETS, LLAMA_VERSION,
     };
-    use crate::youtube::{preview_page, preview_query, public_video_url, youtube_search_query, youtube_video_id};
-
+    use crate::youtube::{
+        preview_page, preview_query, public_video_url, youtube_search_query, youtube_video_id,
+    };
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
     /// process-wide env vars, so they take turns on this lock.
@@ -225,9 +230,15 @@ mod tests {
 
     #[test]
     fn endpoint_validation_allows_custom_provider_but_limits_local_llm_to_loopback() {
-        assert_eq!(valid_provider_url("https://api.example.test/v1/"), Some("https://api.example.test/v1".into()));
+        assert_eq!(
+            valid_provider_url("https://api.example.test/v1/"),
+            Some("https://api.example.test/v1".into())
+        );
         assert!(valid_provider_url("https://api.example.test").is_some());
-        assert_eq!(valid_provider_url("http://127.0.0.1:1234/v1"), Some("http://127.0.0.1:1234/v1".into()));
+        assert_eq!(
+            valid_provider_url("http://127.0.0.1:1234/v1"),
+            Some("http://127.0.0.1:1234/v1".into())
+        );
         assert!(valid_provider_url("ftp://api.example.test").is_none());
         assert!(valid_provider_url("https://user:pass@example.test/v1").is_none());
         assert!(valid_provider_url("https://api.example.test/v1?x=1").is_none());
@@ -243,14 +254,17 @@ mod tests {
     #[test]
     fn private_file_writes_owner_only_on_unix() {
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let file = dir.0.join("secret.txt");
         write_private_file(&file, b"secret").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -268,8 +282,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
     #[test]
     fn preview_cache_quota_evicts_oldest_first() {
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let cache = dir.0.join("preview-cache");
         std::fs::create_dir_all(&cache).unwrap();
         // Three 4-byte previews with ordered mtimes: successive writes a few
@@ -282,7 +296,10 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
 
         // Quota 8 bytes over three 4-byte files: one must go, the oldest.
         preview::enforce_preview_cache_quota_at(&cache, 8);
-        assert!(!cache.join("a.mp4").exists(), "the oldest preview must be evicted");
+        assert!(
+            !cache.join("a.mp4").exists(),
+            "the oldest preview must be evicted"
+        );
         assert!(cache.join("b.mp4").exists());
         assert!(cache.join("c.mp4").exists());
 
@@ -293,13 +310,16 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
         // A foreign file type in the cache dir is not evicted (only *.mp4 entries).
         std::fs::write(cache.join("notes.txt"), b"keep me around").unwrap();
         preview::enforce_preview_cache_quota_at(&cache, 0);
-        assert!(cache.join("notes.txt").exists(), "non-mp4 entries must be left alone");
+        assert!(
+            cache.join("notes.txt").exists(),
+            "non-mp4 entries must be left alone"
+        );
     }
 
     fn preview_proxy_cache_key_tracks_source_version_and_rejects_remote_inputs() {
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.webm");
         std::fs::write(&source, b"source").unwrap();
         let source = source.canonicalize().unwrap();
@@ -325,8 +345,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             return;
         }
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.mp4");
         let generated = Command::new(ffmpeg)
             .args([
@@ -441,11 +461,24 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
         };
         let fixture = Command::new("ffmpeg")
             .args([
-                "-y", "-v", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=2",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=2",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=30:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2",
                 "-shortest",
-                "-vf", "scale=160:120,setsar=1", "-r", "30", "-pix_fmt", "yuv420p",
+                "-vf",
+                "scale=160:120,setsar=1",
+                "-r",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
             ])
             .args(video_codec_args)
             .args(["-c:a", "aac", "-b:a", "128k"])
@@ -460,7 +493,9 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
     /// the validation must reject the ways it could go wrong.
     #[test]
     fn joined_copy_validates_shape_duration_and_audio_presence() {
-        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _render_guard = RENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ffmpeg = Path::new("ffmpeg");
         let ffprobe = Path::new("ffprobe");
         if Command::new(ffmpeg).arg("-version").output().is_err()
@@ -470,8 +505,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             return;
         }
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
             build_segment(&dir.0, "seg-b.mp4", "h264"),
@@ -500,12 +535,7 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             ((160, 120), 4.0, false, "JOIN_COPY_UNEXPECTED_AUDIO"),
         ] {
             let error = render_engine::engine::validate_joined_output(
-                ffprobe,
-                &joined,
-                has_audio,
-                dims,
-                total,
-                2,
+                ffprobe, &joined, has_audio, dims, total, 2,
             )
             .expect_err("the doctored expectation must be rejected");
             assert!(error.contains(code), "expected {code}, got {error}");
@@ -517,7 +547,9 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
     /// the filter path produced.
     #[test]
     fn joined_copy_drops_the_generated_silent_track_when_source_has_no_audio() {
-        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _render_guard = RENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ffmpeg = Path::new("ffmpeg");
         let ffprobe = Path::new("ffprobe");
         if Command::new(ffmpeg).arg("-version").output().is_err()
@@ -527,8 +559,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             return;
         }
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
             build_segment(&dir.0, "seg-b.mp4", "h264"),
@@ -550,7 +582,14 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             .expect("the audio-less shape must validate");
         // And the file really has no audio stream.
         let probe = Command::new(ffprobe)
-            .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(&joined)
             .output()
             .unwrap();
@@ -562,7 +601,9 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
     /// correct h264 output — the rendered file never regresses.
     #[test]
     fn join_falls_back_to_filter_when_copy_cannot_preserve_the_streams() {
-        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _render_guard = RENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ffmpeg = Path::new("ffmpeg");
         let ffprobe = Path::new("ffprobe");
         if Command::new(ffmpeg).arg("-version").output().is_err()
@@ -572,8 +613,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             return;
         }
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         // seg-b is mpeg4: the copy demuxer cannot stream-copy a mixed-codec join.
         let segments = vec![
             build_segment(&dir.0, "seg-a.mp4", "h264"),
@@ -596,9 +637,12 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             .expect("the fallback output must validate");
         let probe = Command::new(ffprobe)
             .args([
-                "-v", "error", "-show_entries",
+                "-v",
+                "error",
+                "-show_entries",
                 "stream=codec_type,codec_name,width,height:format=duration",
-                "-of", "json",
+                "-of",
+                "json",
             ])
             .arg(&joined)
             .output()
@@ -610,14 +654,26 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             .iter()
             .find(|s| s["codec_type"] == "video")
             .unwrap();
-        assert_eq!(video["codec_name"], "h264", "the fallback re-encodes to h264");
-        let duration = metadata["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap();
-        assert!((duration - 4.0).abs() < 0.3, "unexpected fallback duration: {duration}");
+        assert_eq!(
+            video["codec_name"], "h264",
+            "the fallback re-encodes to h264"
+        );
+        let duration = metadata["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(
+            (duration - 4.0).abs() < 0.3,
+            "unexpected fallback duration: {duration}"
+        );
     }
 
     #[test]
     fn ffmpeg_renderer_handles_ranges_captions_audio_and_side_by_side() {
-        let _render_guard = RENDER_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _render_guard = RENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ffmpeg = Path::new("ffmpeg");
         let ffprobe = Path::new("ffprobe");
         if Command::new(ffmpeg).arg("-version").output().is_err()
@@ -627,8 +683,8 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             return;
         }
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
-let _ = std::fs::create_dir_all(&temp_dir);
-let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
         let source = dir.0.join("source.mp4");
         let fixture = Command::new(ffmpeg)
             .args([
@@ -809,7 +865,7 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             serde_json::json!({"text": "hello {world}\nline", "start": 4.5, "end": 6.0}),
             serde_json::json!({"text": "after", "start": 9.0, "end": 10.0}),
         ];
-        let ass = ass_dialogue(&captions, 5.0, 3.0).unwrap().unwrap();
+        let ass = ass_dialogue(&captions, 5.0, 3.0, 650).unwrap().unwrap();
         assert!(!ass.contains("before"));
         assert!(!ass.contains("after"));
         assert!(
@@ -822,15 +878,15 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
     fn ass_dialogue_uses_centiseconds_and_returns_none_when_empty() {
         assert_eq!(ass_timestamp(3661.239), "1:01:01.23");
         let captions = vec![serde_json::json!({"text": "outside", "start": 1.0, "end": 2.0})];
-        assert_eq!(ass_dialogue(&captions, 2.0, 3.0).unwrap(), None);
-        assert_eq!(ass_dialogue(&[], 2.0, 3.0).unwrap(), None);
+        assert_eq!(ass_dialogue(&captions, 2.0, 3.0, 650).unwrap(), None);
+        assert_eq!(ass_dialogue(&[], 2.0, 3.0, 650).unwrap(), None);
     }
 
     #[test]
     fn ass_dialogue_rejects_invalid_caption_timings() {
         let captions = vec![serde_json::json!({"text": "bad", "start": 2.0, "end": 1.0})];
         assert_eq!(
-            ass_dialogue(&captions, 0.0, 3.0).unwrap_err(),
+            ass_dialogue(&captions, 0.0, 3.0, 650).unwrap_err(),
             "INVALID_RENDER_CAPTION"
         );
     }
@@ -850,10 +906,10 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
             serde_json::json!({"text":"gap", "start":4.0, "end":5.0}),
         ];
         let ranges = vec![(6.0, 8.0), (1.0, 3.0)];
-        let first = ass_dialogue(&captions, ranges[0].0, ranges[0].1 - ranges[0].0)
+        let first = ass_dialogue(&captions, ranges[0].0, ranges[0].1 - ranges[0].0, 650)
             .unwrap()
             .unwrap();
-        let second = ass_dialogue(&captions, ranges[1].0, ranges[1].1 - ranges[1].0)
+        let second = ass_dialogue(&captions, ranges[1].0, ranges[1].1 - ranges[1].0, 650)
             .unwrap()
             .unwrap();
         assert!(first.contains("0:00:00.00,0:00:02.00"), "{first}");
@@ -924,9 +980,13 @@ let dir = create_temporary_render_dir(&temp_dir).unwrap();
 
     #[test]
     fn public_video_url_accepts_supported_hosts_and_rejects_unsafe_inputs() {
-        assert!(public_video_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(public_video_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
         assert!(public_video_url("https://youtu.be/dQw4w9WgXcQ"));
-        assert!(public_video_url("https://www.tiktok.com/@creator/video/7123456789012345678"));
+        assert!(public_video_url(
+            "https://www.tiktok.com/@creator/video/7123456789012345678"
+        ));
         assert!(public_video_url("https://vm.tiktok.com/ZMrabcd123/"));
         assert!(public_video_url("https://vt.tiktok.com/ZMrabcd123/"));
 

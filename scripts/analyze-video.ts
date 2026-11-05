@@ -1,9 +1,9 @@
-import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
+import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, resolveHighlightStrategy, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
 import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
-import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
+import { validateTranscript, type Transcript } from "../packages/contracts/transcript.ts";
 import { dirname, join } from "node:path";
 import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
@@ -71,7 +71,9 @@ try {
   assertAudioTrack(mediaPath);
   store?.update(jobId!, { status: "running", phase: "transcribe", progress: 0.1 });
   store?.setWorkerPid(jobId!, process.pid);
-  const strategy = process.env.HIGHLIGHT_STRATEGY ?? "heuristic";
+  // Unset or "heuristic" resolves by available credentials (see helper);
+  // explicit "semantic-*" values pass through untouched.
+  const strategy = resolveHighlightStrategy();
   const geminiKey = process.env.GEMINI_API_KEY ?? "";
   const activeBaseUrl = process.env.ACTIVE_PROVIDER_BASE_URL ?? "";
   const activeApiKey = process.env.ACTIVE_PROVIDER_API_KEY ?? "";

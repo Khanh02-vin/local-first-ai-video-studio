@@ -70,7 +70,11 @@ pub fn run_render_child(
     progress_log: &Path,
 ) -> Result<(), String> {
     if RENDER_CANCELLED.load(Ordering::SeqCst) {
-        on_progress.report(RenderProgress { percent: 0.0, phase: "cancelled".into(), error_code: Some("RENDER_CANCELLED".into()) });
+        on_progress.report(RenderProgress {
+            percent: 0.0,
+            phase: "cancelled".into(),
+            error_code: Some("RENDER_CANCELLED".into()),
+        });
         return Err("RENDER_CANCELLED".into());
     }
     let _ = std::fs::remove_file(progress_log);
@@ -91,45 +95,79 @@ pub fn run_render_child(
         command.creation_flags(0x0800_0000 | 0x0001_0000 | 0x0000_4000);
     } // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
     let child = command.spawn().map_err(|error| {
-        on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("FFMPEG_SPAWN".into()) });
+        on_progress.report(RenderProgress {
+            percent: 0.0,
+            phase: "error".into(),
+            error_code: Some("FFMPEG_SPAWN".into()),
+        });
         format!("FFMPEG_SPAWN:{error}")
     })?;
     {
-        let mut active = ACTIVE_RENDER_CHILD.lock().map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
+        let mut active = ACTIVE_RENDER_CHILD
+            .lock()
+            .map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
         *active = Some(child);
     }
     loop {
         if RENDER_CANCELLED.load(Ordering::SeqCst) {
             if let Ok(mut active) = ACTIVE_RENDER_CHILD.lock() {
-                if let Some(child) = active.as_mut() { let _ = child.kill(); }
+                if let Some(child) = active.as_mut() {
+                    let _ = child.kill();
+                }
             }
         }
         let status = {
-            let mut active = ACTIVE_RENDER_CHILD.lock().map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
+            let mut active = ACTIVE_RENDER_CHILD
+                .lock()
+                .map_err(|_| "RENDER_STATE_LOCK_POISONED")?;
             match active.as_mut() {
-                Some(child) => child.try_wait().map_err(|error| format!("FFMPEG_WAIT:{error}"))?,
+                Some(child) => child
+                    .try_wait()
+                    .map_err(|error| format!("FFMPEG_WAIT:{error}"))?,
                 None => {
-                    on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("RENDER_CHILD_MISSING".into()) });
+                    on_progress.report(RenderProgress {
+                        percent: 0.0,
+                        phase: "error".into(),
+                        error_code: Some("RENDER_CHILD_MISSING".into()),
+                    });
                     return Err("RENDER_CHILD_MISSING".into());
                 }
             }
         };
         if let Some(status) = status {
-            if let Ok(mut active) = ACTIVE_RENDER_CHILD.lock() { active.take(); }
+            if let Ok(mut active) = ACTIVE_RENDER_CHILD.lock() {
+                active.take();
+            }
             if RENDER_CANCELLED.load(Ordering::SeqCst) {
-                on_progress.report(RenderProgress { percent: 0.0, phase: "cancelled".into(), error_code: Some("RENDER_CANCELLED".into()) });
+                on_progress.report(RenderProgress {
+                    percent: 0.0,
+                    phase: "cancelled".into(),
+                    error_code: Some("RENDER_CANCELLED".into()),
+                });
                 return Err("RENDER_CANCELLED".into());
             }
             if !status.success() {
-                on_progress.report(RenderProgress { percent: 0.0, phase: "error".into(), error_code: Some("FFMPEG_EXIT".into()) });
+                on_progress.report(RenderProgress {
+                    percent: 0.0,
+                    phase: "error".into(),
+                    error_code: Some("FFMPEG_EXIT".into()),
+                });
                 return Err(format!("FFMPEG_EXIT:{status}"));
             }
-            on_progress.report(RenderProgress { percent: window.1, phase: phase.to_string(), error_code: None });
+            on_progress.report(RenderProgress {
+                percent: window.1,
+                phase: phase.to_string(),
+                error_code: None,
+            });
             return Ok(());
         }
         if let Some(fraction) = render_fraction(&progress_log, span_seconds) {
             let percent = window.0 + fraction * (window.1 - window.0);
-            on_progress.report(RenderProgress { percent, phase: phase.to_string(), error_code: None });
+            on_progress.report(RenderProgress {
+                percent,
+                phase: phase.to_string(),
+                error_code: None,
+            });
         }
         thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -158,6 +196,37 @@ pub fn probe_duration(ffprobe: &Path, input: &str) -> Result<f64, String> {
         .map_err(|_| "INVALID_SOURCE_DURATION".to_string())
 }
 
+/// Reads the dimensions of the first video stream with ffprobe.
+fn probe_video_dimensions(ffprobe: &Path, input: &str) -> Result<(u32, u32), String> {
+    let output = tool(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+        ])
+        .arg(input)
+        .output()
+        .map_err(|error| format!("FFPROBE_SPAWN:{error}"))?;
+    if !output.status.success() {
+        return Err("SOURCE_DIMENSIONS_UNAVAILABLE".into());
+    }
+    let dimensions: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .split('x')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| "SOURCE_DIMENSIONS_UNAVAILABLE".to_string())?;
+    match dimensions.as_slice() {
+        [width, height] if *width > 0 && *height > 0 => Ok((*width, *height)),
+        _ => Err("SOURCE_DIMENSIONS_UNAVAILABLE".into()),
+    }
+}
+
 /// True when the media file carries an audio stream; a video without audio gets a
 /// synthetic silent track so the output still has an audio stream.
 fn audio_present(ffprobe: &Path, media: &[String]) -> bool {
@@ -183,12 +252,13 @@ pub fn remapped_captions_for_range(
     captions: Option<&Vec<serde_json::Value>>,
     ranges: &[(f64, f64)],
     index: usize,
+    margin_v: u32,
 ) -> Result<Option<String>, String> {
     let Some(captions) = captions else {
         return Ok(None);
     };
     let (start, end) = ranges[index];
-    ass_dialogue(captions, start, end - start)
+    ass_dialogue(captions, start, end - start, margin_v)
 }
 
 pub fn remap_hook(
@@ -227,7 +297,9 @@ pub fn create_temporary_render_dir(temp_dir: &Path) -> Result<TemporaryRenderDir
                 // Check age by metadata
                 if let Ok(meta) = std::fs::metadata(&path) {
                     if let Ok(modified) = meta.modified() {
-                        let age = SystemTime::now().duration_since(modified).unwrap_or_default();
+                        let age = SystemTime::now()
+                            .duration_since(modified)
+                            .unwrap_or_default();
                         if age.as_secs() > 86400 {
                             let _ = std::fs::remove_dir_all(&path);
                         }
@@ -258,7 +330,10 @@ pub fn create_temporary_render_dir(temp_dir: &Path) -> Result<TemporaryRenderDir
     Err("RENDER_TEMP_COLLISION".into())
 }
 
-pub fn subject_pair_continues(previous: &[serde_json::Value], current: &[serde_json::Value]) -> bool {
+pub fn subject_pair_continues(
+    previous: &[serde_json::Value],
+    current: &[serde_json::Value],
+) -> bool {
     if previous.len() != 2 || current.len() != 2 {
         return false;
     }
@@ -399,6 +474,132 @@ pub fn side_by_side_graph(
             format!(",{}", post_filters.join(","))
         }
     ));
+    Some(graph)
+}
+
+/// A composition layout box must be a normalized 0..1 span with ordered edges.
+fn valid_span_box(candidate: &serde_json::Value) -> bool {
+    let (Some(left), Some(right), Some(top), Some(bottom)) = (
+        candidate["left"].as_f64(),
+        candidate["right"].as_f64(),
+        candidate["top"].as_f64(),
+        candidate["bottom"].as_f64(),
+    ) else {
+        return false;
+    };
+    (0.0..=1.0).contains(&left)
+        && (0.0..=1.0).contains(&right)
+        && left <= right
+        && (0.0..=1.0).contains(&top)
+        && (0.0..=1.0).contains(&bottom)
+        && top <= bottom
+}
+
+/// Builds the filter graph for a piece covered by a composition layout, mirroring the
+/// TypeScript containment solver (packages/media-engine/reframe/containment.ts): the box
+/// that contains the other horizontally owns the frame; when neither does, their union
+/// does. The crop is constant for the whole piece — layouts resolve per segment, never
+/// per caption cue, so the frame does not shake when subtitles change length.
+///
+/// Creates a source-space delogo filter for a normalized text box.
+///
+/// Applying this before crop/scale keeps the same source box valid in both the
+/// ordinary `-vf` path and the composition graph (including its blurred split).
+fn text_box_delogo_filter(layout: &serde_json::Value, source_size: (u32, u32)) -> Option<String> {
+    let text = &layout["textBox"];
+    let left = text["left"].as_f64()?;
+    let right = text["right"].as_f64()?;
+    let top = text["top"].as_f64()?;
+    let bottom = text["bottom"].as_f64()?;
+    let (width, height) = source_size;
+    if width == 0
+        || height == 0
+        || ![left, right, top, bottom]
+            .iter()
+            .all(|value| value.is_finite())
+        || left < 0.0
+        || top < 0.0
+        || right > 1.0
+        || bottom > 1.0
+        || right <= left
+        || bottom <= top
+    {
+        return None;
+    }
+    let x = (left * f64::from(width)).floor() as u32;
+    let y = (top * f64::from(height)).floor() as u32;
+    let x2 = (right * f64::from(width)).ceil() as u32;
+    let y2 = (bottom * f64::from(height)).ceil() as u32;
+    Some(format!(
+        "delogo=x={x}:y={y}:w={}:h={}:show=0",
+        x2 - x,
+        y2 - y
+    ))
+}
+
+/// The window never narrows below the standard full-bleed portrait width. A wider window
+/// keeps the full source height, so after fitting the width the frame is shorter than
+/// 1080x1920; instead of letterboxing it over black bars the fitted frame is composited
+/// over a blurred, zoomed-to-fill copy of the same crop — the full-screen look a real
+/// portrait short uses for wide content. Resolved `centerX`/`frameWidth` win when
+/// present; otherwise they are recomputed from the boxes, so a plan without the resolved
+/// fields still renders a safe frame.
+///
+/// `tail` filters (hook drawtext, subtitles, setsar) run on the composed frame; the
+/// graph always ends at `[vout]`.
+pub fn composition_graph_filter(
+    layout: &serde_json::Value,
+    ratio: &str,
+    tail: &[String],
+    source_size: Option<(u32, u32)>,
+) -> Option<String> {
+    if ratio != "9:16" {
+        return None;
+    }
+    let calc_dominant = || -> Option<(f64, f64)> {
+        let span = |candidate: &serde_json::Value| {
+            Some((candidate["left"].as_f64()?, candidate["right"].as_f64()?))
+        };
+        let person = span(&layout["personBox"])?;
+        let text = span(&layout["textBox"]);
+        let contains =
+            |outer: (f64, f64), inner: (f64, f64)| outer.0 <= inner.0 && outer.1 >= inner.1;
+        Some(match text {
+            Some(text) if contains(person, text) => person,
+            Some(text) if contains(text, person) => text,
+            Some(text) => (person.0.min(text.0), person.1.max(text.1)),
+            None => person,
+        })
+    };
+    let center_x = layout["centerX"]
+        .as_f64()
+        .filter(|center| (0.0..=1.0).contains(center))
+        .or_else(|| calc_dominant().map(|(left, right)| (left + right) / 2.0))?;
+    let frame_width = layout["frameWidth"]
+        .as_f64()
+        .filter(|width| *width > 0.0 && *width <= 1.0)
+        .or_else(|| calc_dominant().map(|(left, right)| (right - left + 0.04).min(1.0)))?;
+    // Round the window up to an even pixel count: rounding down could dip below the
+    // standard full-bleed width, and after scale=1080:-2 the frame would then be
+    // taller than the 1920 output, which overlay would reject.
+    let window = format!("2*ceil(max(ih*9/16\\,{frame_width:.4}*iw)/2)");
+    let crop =
+        format!("crop={window}:ih:max(0\\,min(iw-({window})\\,({center_x:.4}*iw-({window})/2))):0");
+    let source_cover = source_size.and_then(|size| text_box_delogo_filter(layout, size));
+    let composed = if tail.is_empty() { "vout" } else { "pad0" };
+    let mut graph = format!(
+        "[0:v]{}{}{crop},split=2[fit][wide];[wide]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=24[bg];[fit]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[{composed}]",
+        source_cover.as_deref().unwrap_or(""),
+        if source_cover.is_some() { "," } else { "" }
+    );
+    for (index, filter) in tail.iter().enumerate() {
+        let output = if index + 1 == tail.len() {
+            "vout".to_string()
+        } else {
+            format!("pad{}", index + 1)
+        };
+        graph.push_str(&format!(";[pad{index}]{filter}[{output}]"));
+    }
     Some(graph)
 }
 
@@ -557,14 +758,66 @@ pub fn render_segments(
                 .collect()
         })
         .unwrap_or_default();
+    let composition_layouts: Vec<_> = plan
+        .and_then(|value| value["compositionLayouts"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|layout| {
+                    layout["confirmed"].as_bool() == Some(true)
+                        && layout["sourceArtifactId"].as_str()
+                            == plan.and_then(|value| value["sourceArtifactId"].as_str())
+                        && layout["start"]
+                            .as_f64()
+                            .is_some_and(|start| start.is_finite() && start >= 0.0)
+                        && layout["end"].as_f64().is_some_and(|end| {
+                            end.is_finite() && end > layout["start"].as_f64().unwrap_or(end)
+                        })
+                        && valid_span_box(&layout["personBox"])
+                        && (layout["textBox"].is_null() || valid_span_box(&layout["textBox"]))
+                })
+                .take(600)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let auto_text_boxes: Vec<_> = plan
+        .and_then(|value| value["autoTextBoxes"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item["confirmed"].as_bool() == Some(true)
+                        && item["sourceArtifactId"].as_str()
+                            == plan.and_then(|value| value["sourceArtifactId"].as_str())
+                        && item["start"]
+                            .as_f64()
+                            .is_some_and(|start| start.is_finite() && start >= 0.0)
+                        && item["end"].as_f64().is_some_and(|end| {
+                            end.is_finite() && end > item["start"].as_f64().unwrap_or(end)
+                        })
+                        && valid_span_box(&item["textBox"])
+                })
+                .take(600)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let source_size = if composition_layouts
+        .iter()
+        .any(|layout| !layout["textBox"].is_null())
+        || !auto_text_boxes.is_empty()
+    {
+        Some(probe_video_dimensions(ffprobe, &media[0])?)
+    } else {
+        None
+    };
     let crop_for_range = |start: f64| -> String {
         if keyframes.is_empty() {
             return crop.clone();
         }
         let expression = |axis: &str| {
-            let value = |key: &serde_json::Value| {
-                key[axis].as_f64().unwrap_or(0.5).clamp(0.0, 1.0)
-            };
+            let value = |key: &serde_json::Value| key[axis].as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
             let mut result = format!("{}", value(keyframes.last().unwrap()));
             for index in (0..keyframes.len()).rev() {
                 let key = &keyframes[index];
@@ -615,6 +868,29 @@ pub fn render_segments(
             .replace(']', "\\]")
             .replace(';', "\\;")
     }
+
+    /// Splits hook text into display lines short enough to fit the frame; drawtext does not wrap.
+    fn wrap_hook_lines(text: &str) -> Vec<String> {
+        const MAX_LINE: usize = 24;
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for word in text.split_whitespace() {
+            if !current.is_empty() && current.len() + 1 + word.len() > MAX_LINE {
+                lines.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
     let captions = plan
         .and_then(|value| value.get("captions"))
         .and_then(serde_json::Value::as_array);
@@ -663,6 +939,26 @@ pub fn render_segments(
                 boundaries.push(scene_end);
             }
         }
+        for layout in &composition_layouts {
+            let layout_start = layout["start"].as_f64().unwrap_or(*start);
+            let layout_end = layout["end"].as_f64().unwrap_or(*end);
+            if layout_start > *start && layout_start < *end {
+                boundaries.push(layout_start);
+            }
+            if layout_end > *start && layout_end < *end {
+                boundaries.push(layout_end);
+            }
+        }
+        for layout in &auto_text_boxes {
+            let layout_start = layout["start"].as_f64().unwrap_or(*start);
+            let layout_end = layout["end"].as_f64().unwrap_or(*end);
+            if layout_start > *start && layout_start < *end {
+                boundaries.push(layout_start);
+            }
+            if layout_end > *start && layout_end < *end {
+                boundaries.push(layout_end);
+            }
+        }
         boundaries.sort_by(f64::total_cmp);
         boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.001);
         let windows_count = boundaries.len().saturating_sub(1).max(1) as f64;
@@ -685,12 +981,53 @@ pub fn render_segments(
                 .filter(|scene| scene["layout"] == "side-by-side")
                 .and_then(|scene| scene["subjectBoxes"].as_array())
                 .and_then(|boxes| side_by_side_graph(boxes, &[], &ratio));
-            let mut filters = if side_by_side.is_some() {
+            let active_composition = composition_layouts.iter().find(|layout| {
+                layout["start"]
+                    .as_f64()
+                    .is_some_and(|value| piece_start >= value)
+                    && layout["end"]
+                        .as_f64()
+                        .is_some_and(|value| piece_start < value)
+            });
+            let active_ocr = auto_text_boxes.iter().find(|layout| {
+                layout["start"]
+                    .as_f64()
+                    .is_some_and(|value| piece_start >= value)
+                    && layout["end"]
+                        .as_f64()
+                        .is_some_and(|value| piece_start < value)
+            });
+            let active_composition_mask = active_composition.map(|layout| {
+                let mut masked = layout.clone();
+                if masked["textBox"].is_null() {
+                    if let Some(ocr_layout) = active_ocr {
+                        masked["textBox"] = ocr_layout["textBox"].clone();
+                    }
+                }
+                masked
+            });
+            let active_ocr_mask =
+                active_ocr.map(|layout| serde_json::json!({ "textBox": layout["textBox"] }));
+            let active_mask = active_composition_mask
+                .as_ref()
+                .or(active_ocr_mask.as_ref());
+            let use_composition = active_composition
+                .is_some_and(|layout| valid_span_box(&layout["personBox"]))
+                && ratio == "9:16";
+            let mut filters = if side_by_side.is_some() || use_composition {
                 Vec::new()
             } else {
                 vec![crop_for_range(piece_start)]
             };
+            if !use_composition {
+                if let Some(cover) = active_mask.and_then(|layout| {
+                    text_box_delogo_filter(layout, source_size.unwrap_or((0, 0)))
+                }) {
+                    filters.insert(0, cover);
+                }
+            }
             let mut complex_graph_filters = Vec::new();
+            let mut composition_tail = Vec::new();
             let mut subtitle_file = None;
             let piece_hook = hook_intervals
                 .iter()
@@ -709,11 +1046,36 @@ pub fn render_segments(
                     .and_then(|hook| hook.get("text"))
                     .and_then(serde_json::Value::as_str)
                     .ok_or("INVALID_RENDER_HOOK")?;
-                filters.push(format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.12:fontsize=h/18:fontcolor=white:borderw=3:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text)));
+                // drawtext does not wrap, so long hook text is split into short display
+                // lines stacked below y=h*0.12; a multi-line block uses a smaller font
+                // so the stack stays in the upper part of the frame.
+                let lines = wrap_hook_lines(text);
+                let fontsize = if lines.len() == 1 && lines[0].chars().count() <= 19 {
+                    "h/18"
+                } else {
+                    "h/24"
+                };
+                for (line, text_line) in lines.iter().enumerate() {
+                    let drawtext = format!("drawtext=text='{}':x=(w-text_w)/2:y=h*0.12+{line}*h*0.056:fontsize={fontsize}:fontcolor=white:borderw=3:enable='between(t,{from:.3},{to:.3})'", drawtext_escape(text_line));
+                    filters.push(drawtext.clone());
+                    composition_tail.push(drawtext);
+                }
             }
+            // When the composition keeps a baked-in text block that reaches the lower
+            // half of the frame, lift the burned captions above it instead of letting
+            // both white text blocks overlap.
+            let caption_margin_v = if use_composition
+                && active_mask
+                    .and_then(|layout| layout["textBox"]["bottom"].as_f64())
+                    .is_some_and(|bottom| bottom > 0.55)
+            {
+                900
+            } else {
+                650
+            };
             let scene_subtitle_ranges = [(piece_start, piece_end)];
             if let Some(contents) =
-                remapped_captions_for_range(captions, &scene_subtitle_ranges, 0)?
+                remapped_captions_for_range(captions, &scene_subtitle_ranges, 0, caption_margin_v)?
             {
                 let subtitle = write_temporary_ass(temp_dir, &contents)?;
                 let filter = format!(
@@ -721,20 +1083,38 @@ pub fn render_segments(
                     escape_ass_filter_path(&subtitle.0.to_string_lossy())
                 );
                 if side_by_side.is_some() {
-                    complex_graph_filters.push(filter);
+                    complex_graph_filters.push(filter.clone());
                 } else {
-                    filters.push(filter);
+                    filters.push(filter.clone());
                 }
+                composition_tail.push(filter);
                 subtitle_file = Some(subtitle);
             }
             filters.push("setsar=1".to_string());
-            let complex_graph = side_by_side.as_ref().and_then(|_| {
-                side_by_side_graph(
-                    active_scene?.get("subjectBoxes")?.as_array()?,
-                    &complex_graph_filters,
-                    &ratio,
-                )
-            });
+            composition_tail.push("setsar=1".to_string());
+            let complex_graph = side_by_side
+                .as_ref()
+                .and_then(|_| {
+                    let mut graph = side_by_side_graph(
+                        active_scene?.get("subjectBoxes")?.as_array()?,
+                        &complex_graph_filters,
+                        &ratio,
+                    )?;
+                    if let Some(cover) =
+                        active_mask.and_then(|layout| text_box_delogo_filter(layout, source_size?))
+                    {
+                        graph = graph.replacen("[0:v]split=2", &format!("[0:v]{cover},split=2"), 1);
+                    }
+                    Some(graph)
+                })
+                .or_else(|| {
+                    active_composition_mask
+                        .as_ref()
+                        .filter(|_| ratio == "9:16")
+                        .and_then(|layout| {
+                            composition_graph_filter(layout, &ratio, &composition_tail, source_size)
+                        })
+                });
             let mut cmd = tool(ffmpeg);
             cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"]);
             for source in media {
@@ -751,9 +1131,7 @@ pub fn render_segments(
                 cmd.args(["-vf", &filters.join(","), "-map", "0:v:0"]);
             }
             let (codec, codec_extra) = video_codec(prefer_hardware);
-            cmd.args([
-                "-c:v", codec, "-pix_fmt", "yuv420p", "-r", "30",
-            ]);
+            cmd.args(["-c:v", codec, "-pix_fmt", "yuv420p", "-r", "30"]);
             cmd.args(codec_extra);
             if !prefer_hardware {
                 cmd.args(["-crf", "22"]);
@@ -777,9 +1155,19 @@ pub fn render_segments(
                 .arg(format!("{audio_input_index}:a:0"))
                 .args(["-c:a", "aac", "-b:a", "128k"]);
             }
-            let window_start = ((index as f64 + piece_index as f64 / windows_count) / ranges.len() as f64) * 90.0;
-            let window_end = ((index as f64 + (piece_index + 1) as f64 / windows_count) / ranges.len() as f64) * 90.0;
-            run_render_child(cmd.arg(&segment), on_progress, (window_start, window_end), (end - start) / windows_count as f64, "segments", progress_log)?;
+            let window_start =
+                ((index as f64 + piece_index as f64 / windows_count) / ranges.len() as f64) * 90.0;
+            let window_end = ((index as f64 + (piece_index + 1) as f64 / windows_count)
+                / ranges.len() as f64)
+                * 90.0;
+            run_render_child(
+                cmd.arg(&segment),
+                on_progress,
+                (window_start, window_end),
+                (end - start) / windows_count as f64,
+                "segments",
+                progress_log,
+            )?;
             drop(subtitle_file);
             segments.push(segment);
         }
@@ -791,37 +1179,53 @@ pub fn render_segments(
         "16:9" => (1920, 1080),
         _ => (1080, 1920),
     };
-            let partial = join_segments(
-                ffmpeg,
-                ffprobe,
-                &segments,
-                has_audio,
-                total_duration,
-                expected_dimensions,
-                &temp,
-                on_progress,
-                progress_log,
-            )?;
+    let partial = join_segments(
+        ffmpeg,
+        ffprobe,
+        &segments,
+        has_audio,
+        total_duration,
+        expected_dimensions,
+        &temp,
+        on_progress,
+        progress_log,
+    )?;
 
     // Atomic output: write to a sibling .tmp file first, probe-verify it, then atomically
     // rename onto the final path so a crashed render never leaves a half-written MP4.
     let tmp_path = output_path.with_extension("tmp");
     if let Err(e) = std::fs::copy(&partial, &tmp_path) {
-        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_COPY".into()) });
+        on_progress.report(RenderProgress {
+            percent: 99.0,
+            phase: "error".into(),
+            error_code: Some("OUTPUT_COPY".into()),
+        });
         return Err(format!("OUTPUT_COPY:{e}"));
     }
     if let Err(e) = probe_duration(ffprobe, &tmp_path.to_string_lossy()) {
         let _ = std::fs::remove_file(&tmp_path);
-        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_PROBE_VERIFY".into()) });
+        on_progress.report(RenderProgress {
+            percent: 99.0,
+            phase: "error".into(),
+            error_code: Some("OUTPUT_PROBE_VERIFY".into()),
+        });
         return Err(format!("OUTPUT_PROBE_VERIFY:{e}"));
     }
     if let Err(e) = std::fs::rename(&tmp_path, &output_path) {
         let _ = std::fs::remove_file(&tmp_path);
-        on_progress.report(RenderProgress { percent: 99.0, phase: "error".into(), error_code: Some("OUTPUT_RENAME".into()) });
+        on_progress.report(RenderProgress {
+            percent: 99.0,
+            phase: "error".into(),
+            error_code: Some("OUTPUT_RENAME".into()),
+        });
         return Err(format!("OUTPUT_RENAME:{e}"));
     }
     let _ = std::fs::remove_file(&tmp_path);
-    on_progress.report(RenderProgress { percent: 100.0, phase: "completed".into(), error_code: None });
+    on_progress.report(RenderProgress {
+        percent: 100.0,
+        phase: "completed".into(),
+        error_code: None,
+    });
     Ok(output_path.to_string_lossy().into_owned())
 }
 
@@ -849,27 +1253,40 @@ pub fn join_segments(
     progress_log: &Path,
 ) -> Result<PathBuf, String> {
     let copy = temp.0.join("joined-copy.mp4");
-    let copied = join_segments_copy(ffmpeg, segments, has_audio, &copy, on_progress, progress_log)
-        .and_then(|_| {
-            validate_joined_output(
-                ffprobe,
-                &copy,
-                has_audio,
-                expected_dimensions,
-                total_duration,
-                segments.len(),
-            )
-        });
+    let copied = join_segments_copy(
+        ffmpeg,
+        segments,
+        has_audio,
+        &copy,
+        on_progress,
+        progress_log,
+    )
+    .and_then(|_| {
+        validate_joined_output(
+            ffprobe,
+            &copy,
+            has_audio,
+            expected_dimensions,
+            total_duration,
+            segments.len(),
+        )
+    });
     match copied {
         Ok(()) => Ok(copy),
         Err(copy_error) => {
             // The filter path re-encodes, so it tolerates whatever the stream copy
             // could not preserve. If it fails too, report both causes.
             let _ = std::fs::remove_file(&copy);
-            join_segments_filter(ffmpeg, segments, has_audio, total_duration, temp, on_progress, progress_log)
-                .map_err(|filter_error| {
-                    format!("JOIN_COPY:{copy_error}; JOIN_FILTER:{filter_error}")
-                })
+            join_segments_filter(
+                ffmpeg,
+                segments,
+                has_audio,
+                total_duration,
+                temp,
+                on_progress,
+                progress_log,
+            )
+            .map_err(|filter_error| format!("JOIN_COPY:{copy_error}; JOIN_FILTER:{filter_error}"))
         }
     }
 }
@@ -901,7 +1318,14 @@ fn join_segments_copy(
         // output gains a stream the old path never had.
         cmd.arg("-an");
     }
-    let result = run_render_child(cmd.arg(output), on_progress, (90.0, 98.0), 0.0, "joining", progress_log);
+    let result = run_render_child(
+        cmd.arg(output),
+        on_progress,
+        (90.0, 98.0),
+        0.0,
+        "joining",
+        progress_log,
+    );
     let _ = std::fs::remove_file(&list);
     result
 }
@@ -956,7 +1380,14 @@ fn join_segments_filter(
     if has_audio {
         cmd.args(["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]);
     }
-    run_render_child(cmd.arg(&partial), on_progress, (90.0, 98.0), total_duration, "joining", progress_log)?;
+    run_render_child(
+        cmd.arg(&partial),
+        on_progress,
+        (90.0, 98.0),
+        total_duration,
+        "joining",
+        progress_log,
+    )?;
     Ok(partial)
 }
 
@@ -992,9 +1423,7 @@ pub fn validate_joined_output(
     }
     let probe: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(|e| format!("JOIN_PROBE_JSON:{e}"))?;
-    let streams = probe["streams"]
-        .as_array()
-        .ok_or("JOIN_PROBE_NO_STREAMS")?;
+    let streams = probe["streams"].as_array().ok_or("JOIN_PROBE_NO_STREAMS")?;
     // Segment durations round to the frame grid independently, so the join may
     // drift by up to half a frame per boundary; beyond that is real breakage.
     let tolerance = 0.25 + 0.05 * segment_count as f64;
@@ -1004,7 +1433,12 @@ pub fn validate_joined_output(
         .ok_or("JOIN_COPY_NO_VIDEO")?;
     let width = video["width"].as_u64().ok_or("JOIN_COPY_NO_WIDTH")?;
     let height = video["height"].as_u64().ok_or("JOIN_COPY_NO_HEIGHT")?;
-    if (width, height) != (u64::from(expected_dimensions.0), u64::from(expected_dimensions.1)) {
+    if (width, height)
+        != (
+            u64::from(expected_dimensions.0),
+            u64::from(expected_dimensions.1),
+        )
+    {
         return Err(format!("JOIN_COPY_SHAPE:{width}x{height}"));
     }
     let video_duration = video["duration"]
@@ -1063,6 +1497,7 @@ pub fn ass_dialogue(
     captions: &[serde_json::Value],
     start: f64,
     duration: f64,
+    margin_v: u32,
 ) -> Result<Option<String>, String> {
     if !start.is_finite() || start < 0.0 || !duration.is_finite() || duration <= 0.0 {
         return Err("INVALID_RENDER_REQUEST".into());
@@ -1090,7 +1525,9 @@ pub fn ass_dialogue(
     if events.is_empty() {
         return Ok(None);
     }
-    let header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Shorts,Arial,70,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,1,6,0,2,40,40,650,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+    let header = format!(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Shorts,Arial,70,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,1,6,0,2,40,40,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    );
     Ok(Some(format!("{header}{}\n", events.join("\n"))))
 }
 
@@ -1147,5 +1584,149 @@ impl Drop for TemporaryRenderDir {
 impl Drop for TemporarySubtitle {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{composition_graph_filter, text_box_delogo_filter};
+    use serde_json::json;
+
+    fn layout(person_left: f64, person_right: f64, text: Option<(f64, f64)>) -> serde_json::Value {
+        json!({
+            "personBox": { "left": person_left, "right": person_right, "top": 0.1, "bottom": 0.9 },
+            "textBox": text.map(|(left, right)| json!({ "left": left, "right": right, "top": 0.02, "bottom": 0.18 })),
+        })
+    }
+
+    #[test]
+    fn keeps_the_standard_full_bleed_window_for_a_bare_person() {
+        // A narrow person's width is below the standard window; the max() in the
+        // expression clamps it to the full-bleed width at runtime.
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.52, None),
+            "9:16",
+            &["setsar=1".to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(
+            graph.contains("2*ceil(max(ih*9/16\\,0.2600*iw)/2)"),
+            "{graph}"
+        );
+        assert!(graph.contains("0.4100*iw"), "{graph}");
+        assert!(graph.contains("split=2"), "{graph}");
+        assert!(!graph.contains("delogo="), "{graph}");
+        assert!(graph.contains("gblur=sigma=24"), "{graph}");
+        assert!(graph.contains("overlay=(W-w)/2:(H-h)/2"), "{graph}");
+        assert!(graph.ends_with(";[pad0]setsar=1[vout]"), "{graph}");
+    }
+
+    #[test]
+    fn zooms_out_when_the_text_owns_the_frame() {
+        // The title spans 0.02..0.66 and contains the person, so it sets the width.
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.52, Some((0.02, 0.66))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.6800*iw)"), "{graph}");
+        assert!(graph.contains("0.3400*iw"), "{graph}");
+        assert!(graph.ends_with("[vout]"), "{graph}");
+    }
+
+    #[test]
+    fn unions_boxes_that_do_not_contain_each_other() {
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.52, Some((0.70, 0.98))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.7200*iw)"), "{graph}");
+        assert!(graph.contains("0.6400*iw"), "{graph}");
+    }
+
+    #[test]
+    fn prefers_the_resolved_center_and_width_when_present() {
+        let mut value = layout(0.30, 0.52, Some((0.02, 0.66)));
+        value["centerX"] = json!(0.40);
+        value["frameWidth"] = json!(0.75);
+        let graph = composition_graph_filter(&value, "9:16", &[], Some((1920, 1080))).unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.7500*iw)"), "{graph}");
+        assert!(graph.contains("0.4000*iw"), "{graph}");
+    }
+
+    #[test]
+    fn uses_resolved_layout_without_source_boxes() {
+        let value = json!({ "centerX": 0.5, "frameWidth": 0.8 });
+        let graph = composition_graph_filter(&value, "9:16", &[], Some((1920, 1080))).unwrap();
+        assert!(graph.contains("0.8000*iw"), "{graph}");
+        assert!(graph.contains("0.5000*iw"), "{graph}");
+    }
+
+    #[test]
+    fn delogo_uses_normalized_source_coordinates_and_rejects_invalid_boxes() {
+        let value = json!({ "textBox": { "left": 0.1, "right": 0.4, "top": 0.7, "bottom": 0.8 } });
+        assert_eq!(
+            text_box_delogo_filter(&value, (1920, 1080)).as_deref(),
+            Some("delogo=x=192:y=756:w=576:h=108:show=0")
+        );
+        let invalid =
+            json!({ "textBox": { "left": -0.1, "right": 0.4, "top": 0.7, "bottom": 0.8 } });
+        assert!(text_box_delogo_filter(&invalid, (1920, 1080)).is_none());
+    }
+
+    #[test]
+    fn masks_source_before_composition_split_and_caption_tail() {
+        let value = json!({
+            "personBox": { "left": 0.30, "right": 0.52, "top": 0.1, "bottom": 0.9 },
+            "textBox": { "left": 0.2, "right": 0.8, "top": 0.75, "bottom": 0.88 }
+        });
+        let graph = composition_graph_filter(
+            &value,
+            "9:16",
+            &["ass=captions.ass".to_string()],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        let mask = graph.find("delogo=").unwrap();
+        let split = graph.find("split=2").unwrap();
+        let caption = graph.find("ass=captions.ass").unwrap();
+        assert!(mask < split && split < caption, "{graph}");
+    }
+
+    #[test]
+    fn chains_the_tail_filters_onto_the_composed_frame() {
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.52, None),
+            "9:16",
+            &[
+                "drawtext=x".to_string(),
+                "ass=y.ass".to_string(),
+                "setsar=1".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(
+            graph.contains(";[pad0]drawtext=x[pad1];[pad1]ass=y.ass[pad2];[pad2]setsar=1[vout]"),
+            "{graph}"
+        );
+    }
+
+    #[test]
+    fn rejects_other_ratios_and_broken_layouts() {
+        assert_eq!(
+            composition_graph_filter(&layout(0.30, 0.52, None), "1:1", &[], None),
+            None
+        );
+        assert_eq!(
+            composition_graph_filter(&json!({}), "9:16", &[], Some((1920, 1080))),
+            None
+        );
     }
 }

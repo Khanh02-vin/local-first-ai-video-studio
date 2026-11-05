@@ -114,7 +114,8 @@ fn render_command(flags: &[String]) -> Result<String, String> {
     {
         return Err("INVALID_RENDER_PLAN".into());
     }
-    let mut plan = serde_json::to_value(&request.plan).map_err(|error| format!("RENDER_PLAN_JSON:{error}"))?;
+    let mut plan =
+        serde_json::to_value(&request.plan).map_err(|error| format!("RENDER_PLAN_JSON:{error}"))?;
     if let Some(fields) = plan.as_object_mut() {
         for (key, value) in &request.plan.extra {
             fields.insert(key.clone(), value.clone());

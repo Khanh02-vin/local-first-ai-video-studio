@@ -16,6 +16,21 @@ export type RenderRange = { start: Timestamp; end: Timestamp };
 export type CropKeyframe = { time: Timestamp; centerX: number; centerY?: number; speakerId?: string; sourceFaceId?: string; sourceArtifactId?: string; sceneId?: number; confidence: number; confirmed: boolean };
 export type SceneSubjectBox = { x: number; y: number; width: number; height: number; confidence: number };
 export type SceneLayout = { start: Timestamp; end: Timestamp; layout: Layout; confidence: number; confirmed: boolean; sourceArtifactId?: string; faceCount?: number; activeSpeakerId?: string; subjectBoxes?: SceneSubjectBox[] };
+export type SpanBox = { left: number; right: number; top: number; bottom: number };
+export type CompositionAnchor = "person" | "text" | "union";
+export type CompositionLayout = {
+  start: Timestamp;
+  end: Timestamp;
+  personBox: SpanBox;
+  textBox?: SpanBox;
+  anchorType?: CompositionAnchor;
+  centerX?: number;
+  centerY?: number;
+  frameWidth?: number;
+  confidence: number;
+  confirmed: boolean;
+  sourceArtifactId?: string;
+};
 
 export type RenderPlan = {
   version: number;
@@ -27,6 +42,7 @@ export type RenderPlan = {
   speakerMap?: Record<string, string>;
   cropKeyframes?: CropKeyframe[];
   sceneLayouts?: SceneLayout[];
+  compositionLayouts?: CompositionLayout[];
   captions: Caption[];
   hook?: { text: string; start: Timestamp; end: Timestamp };
   effects?: string[];
@@ -80,6 +96,29 @@ export function validateRenderPlan(plan: RenderPlan, duration: number): void {
       if (scene.faceCount !== undefined && (!Number.isInteger(scene.faceCount) || scene.faceCount < 0 || scene.faceCount > 4)) throw new Error("Invalid scene face count");
       if (scene.subjectBoxes !== undefined && (scene.subjectBoxes.length !== 2 || scene.subjectBoxes.some((box) => ![box.x, box.y, box.width, box.height, box.confidence].every(Number.isFinite) || box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0 || box.x + box.width > 1 || box.y + box.height > 1 || box.confidence < 0 || box.confidence > 1))) throw new Error("Invalid scene subject boxes");
       previousEnd = scene.end;
+    }
+  }
+  if (plan.compositionLayouts) {
+    if (plan.compositionLayouts.length > 600) throw new Error("Too many composition layouts");
+    let previousEnd = -Infinity;
+    for (const layout of plan.compositionLayouts) {
+      assertRange(layout.start, layout.end, duration);
+      const boxes = [layout.personBox, layout.textBox].filter((box): box is SpanBox => box !== undefined);
+      const validBox = (box: SpanBox) => [box.left, box.right, box.top, box.bottom].every(Number.isFinite)
+        && box.left >= 0 && box.right <= 1 && box.left <= box.right
+        && box.top >= 0 && box.bottom <= 1 && box.top <= box.bottom;
+      if (layout.start < previousEnd
+        || boxes.some((box) => !validBox(box))
+        || !Number.isFinite(layout.confidence) || layout.confidence < 0 || layout.confidence > 1
+        || typeof layout.confirmed !== "boolean"
+        || (layout.sourceArtifactId !== undefined && layout.sourceArtifactId !== plan.sourceArtifactId)
+        || (layout.anchorType !== undefined && !["person", "text", "union"].includes(layout.anchorType))
+        || (layout.centerX !== undefined && (!Number.isFinite(layout.centerX) || layout.centerX < 0 || layout.centerX > 1))
+        || (layout.centerY !== undefined && (!Number.isFinite(layout.centerY) || layout.centerY < 0 || layout.centerY > 1))
+        || (layout.frameWidth !== undefined && (!Number.isFinite(layout.frameWidth) || layout.frameWidth <= 0 || layout.frameWidth > 1))) {
+        throw new Error("Invalid composition layout");
+      }
+      previousEnd = layout.end;
     }
   }
   for (const caption of plan.captions) {

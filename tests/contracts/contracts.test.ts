@@ -73,6 +73,28 @@ validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-
 assert.throws(() => validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-by-side", confidence: 0.8, confirmed: true, subjectBoxes: [{ x: 0.9, y: 0.1, width: 0.3, height: 0.3, confidence: 0.8 }, { x: 0.2, y: 0.2, width: 0.1, height: 0.1, confidence: 0.8 }] }] }, 60), /subject boxes/);
 assert.throws(() => validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "picture-in-picture", confidence: 2, confirmed: true }] }, 60), /scene layout/);
 
+// Composition layouts are optional — a plan without them (and without sceneLayouts) stays valid.
+validateRenderPlan(plan, 60);
+const composition = {
+  start: 1, end: 8, confidence: 0.9, confirmed: true, sourceArtifactId: "src",
+  personBox: { left: 0.30, right: 0.52, top: 0.10, bottom: 0.90 },
+  textBox: { left: 0.34, right: 0.48, top: 0.80, bottom: 0.92 },
+  anchorType: "person" as const, centerX: 0.41, centerY: 0.5, frameWidth: 0.316,
+};
+validateRenderPlan({ ...plan, compositionLayouts: [composition] }, 60);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [composition, { ...composition, start: 4, end: 12 }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, sourceArtifactId: "other" }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, personBox: { left: 0.6, right: 0.5, top: 0.1, bottom: 0.9 } }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, textBox: { left: 0.1, right: 1.2, top: 0.8, bottom: 0.9 } }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, personBox: { left: 0.3, right: 0.5, top: Number.NaN, bottom: 0.9 } }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, anchorType: "diagonal" as never }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, centerX: 1.4 }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, frameWidth: 0 }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, frameWidth: 1.5 }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, confidence: 1.5 }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, confirmed: "yes" as never }] }, 60), /composition layout/);
+assert.throws(() => validateRenderPlan({ ...plan, compositionLayouts: [{ ...composition, end: 70 }] }, 60), /exceeds duration/);
+
 assertTransition("created", "queued");
 assert.throws(() => assertTransition("completed", "queued"));
 validateJob({ version: 1, id: "j1", type: "render", state: "queued", executionTarget: "local", inputArtifactIds: ["src"], outputArtifactIds: [], idempotencyKey: "key", retryCount: 0, createdAt: "now", updatedAt: "now" });

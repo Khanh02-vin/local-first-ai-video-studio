@@ -50,7 +50,7 @@ assert.match(bridge, /speaker_face_matches/, "speaker-to-face confirmation must 
 assert.match(studio, /diarization_setup_status/, "Studio must check opt-in diarization runtime status");
 assert.match(studio, /speaker-face-match/, "Studio must expose speaker/face confirmation UI");
 assert.match(bridge, /\.arg\(&frame\)/, "face detector must read frames from a temporary directory");
-assert.match(bridge, /ass_dialogue\(captions, start, end - start\)/, "each segment must clip captions to its source interval");
+assert.match(bridge, /ass_dialogue\(captions, start, end - start(, \w+)?\)/, "each segment must clip captions to its source interval");
 assert.match(bridge, /drawtext=text=/, "hook overlay must remain available for each segment");
 assert.doesNotMatch(bridge, /drawtext=text='\{\}':x=\(w-text_w\)\/2:y=h\*0\.78/, "captions must not be rendered as per-cue drawtext");
 assert.match(ranking, /rankCandidates/, "related results must be reranked from source semantics");

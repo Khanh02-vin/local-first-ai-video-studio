@@ -63,6 +63,41 @@ try {
   assert.ok(progress.length > 0, "the engine must report progress while rendering");
   assert.equal(progress[progress.length - 1], 1, "the last progress report must be the completed 100%");
 
+  // A composition layout whose text box owns the frame (the containment rule: T contains
+  // P) widens the crop window; the engine must keep the portrait canvas by scaling to
+  // width and padding vertically — same 1080x1920 output, never a distorted frame.
+  const zoomedOutput = join(root, "zoomed.mp4");
+  await render(
+    {
+      input,
+      output: zoomedOutput,
+      plan: {
+        version: 1,
+        sourceArtifactId: "engine-test",
+        ranges: [{ start: 0.5, end: 3.5 }],
+        aspectRatio: "9:16",
+        compositionLayouts: [
+          {
+            start: 0,
+            end: 6,
+            confidence: 0.9,
+            confirmed: true,
+            sourceArtifactId: "engine-test",
+            personBox: { left: 0.3, right: 0.52, top: 0.1, bottom: 0.9 },
+            textBox: { left: 0.02, right: 0.66, top: 0.02, bottom: 0.18 },
+          },
+        ],
+      },
+    },
+    { enginePath, ffmpegPath: ffmpeg, ffprobePath: ffprobe },
+  );
+  const zoomed = JSON.parse(
+    (await execFile(ffprobe, ["-v", "error", "-show_entries", "format=duration:stream=width,height", "-of", "json", zoomedOutput])).stdout,
+  ) as { format: { duration: string }; streams: Array<{ width?: number; height?: number }> };
+  assert.equal(zoomed.streams[0].width, 1080);
+  assert.equal(zoomed.streams[0].height, 1920);
+  assert.ok(Math.abs(Number(zoomed.format.duration) - 3) < 0.3, `expected the requested range, got ${zoomed.format.duration}`);
+
   // The engine refuses to overwrite its own input instead of corrupting the source.
   const sameOutput = join(root, "same.mp4");
   await writeFile(sameOutput, Buffer.alloc(4));

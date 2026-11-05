@@ -5,11 +5,17 @@
 // leaves the machine and no Python/Node runtime is required for AI work. FFmpeg
 // (bundled) is still used to decode audio / frames.
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use ai_engine::{diarize_segments, merge_segments, FaceDetector, SpeakerEmbedder, VadSegmenter};
-use image::RgbImage;
-use render_engine::engine::{create_temporary_render_dir, stable_subject_pair, subject_pair_continues, TemporaryRenderDir};
 use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, is_remote_input, runtime_env, tool};
+use ai_engine::{
+    diarize_segments, merge_segments, FaceDetector, SpeakerEmbedder, TextBox, TextRegionDetector,
+    VadSegmenter,
+};
+use image::RgbImage;
+use render_engine::engine::{
+    create_temporary_render_dir, stable_subject_pair, subject_pair_continues, TemporaryRenderDir,
+};
 use serde_json::Value;
 
 /// Asks the AI pipeline to propose ordered transcript ranges as alternative edits.
@@ -46,7 +52,8 @@ fn generate_transcript_variants_blocking(
         .build()
         .map_err(|e| format!("VARIANT_CLIENT:{e}"))?;
 
-    let transcript_json = serde_json::to_string(transcript).map_err(|e| format!("VARIANT_TRANSCRIPT:{e}"))?;
+    let transcript_json =
+        serde_json::to_string(transcript).map_err(|e| format!("VARIANT_TRANSCRIPT:{e}"))?;
 
     let prompt = format!(
         r"Given the following transcript segments, propose 3-5 alternative highlight ranges (start,end in seconds) that would make good short-form clips. Return a JSON array of objects with start, end, and reason fields.
@@ -75,7 +82,9 @@ Transcript: {}
         if !resp.status().is_success() {
             return Err(format!("VARIANT_GEMINI_ERROR: HTTP {}", resp.status()));
         }
-        let value: Value = resp.json().map_err(|e| format!("VARIANT_GEMINI_JSON:{e}"))?;
+        let value: Value = resp
+            .json()
+            .map_err(|e| format!("VARIANT_GEMINI_JSON:{e}"))?;
         // Extract text from Gemini response.
         let text = value["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
@@ -173,7 +182,39 @@ pub(crate) fn install_diarization_runtime() -> Result<(), String> {
     Ok(())
 }
 
-/// Splits the audio into speaker intervals using ONNX VAD + simple clustering.
+/// Last outcome of [`auto_person_layouts`], kept for observability/verification.
+/// Errors are still swallowed during render, but recorded here so an E2E or debug
+/// run can prove the real ONNX path actually executed.
+#[derive(Clone)]
+struct AutoPersonReport {
+    detector_loaded: bool,
+    detector_error: Option<String>,
+    ranges_total: usize,
+    ranges_with_layout: usize,
+    layouts_count: usize,
+    per_range: Vec<serde_json::Value>,
+}
+
+static LAST_AUTO_PERSON_REPORT: Mutex<Option<AutoPersonReport>> = Mutex::new(None);
+
+#[tauri::command]
+pub(crate) fn auto_person_layouts_last_report() -> serde_json::Value {
+    let guard = LAST_AUTO_PERSON_REPORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(r) => serde_json::json!({
+            "detectorLoaded": r.detector_loaded,
+            "detectorError": r.detector_error,
+            "rangesTotal": r.ranges_total,
+            "rangesWithLayout": r.ranges_with_layout,
+            "layoutsCount": r.layouts_count,
+            "perRange": r.per_range,
+        }),
+        None => serde_json::json!({ "ran": false }),
+    }
+}
+
 ///
 /// Runs on a blocking worker instead of the main thread, where it would freeze the webview.
 #[tauri::command]
@@ -182,11 +223,9 @@ pub(crate) async fn diarize_video(
     path: String,
     duration: f64,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        diarize_video_blocking(&app, &path, duration)
-    })
-    .await
-    .map_err(|error| format!("DIARIZATION_WORKER:{error}"))?
+    tauri::async_runtime::spawn_blocking(move || diarize_video_blocking(&app, &path, duration))
+        .await
+        .map_err(|error| format!("DIARIZATION_WORKER:{error}"))?
 }
 
 fn diarize_video_blocking(
@@ -239,22 +278,27 @@ fn diarize_video_blocking(
     // Use rodio/cpal? Keep dependency light: read the WAV header manually for
     // PCM16 mono/stereo and convert to f32 [-1,1].
     let wav_data = std::fs::read(&audio).map_err(|e| format!("DIARIZATION_READ_WAV:{e}"))?;
-    let samples = decode_wav_pcm_f32(&wav_data).map_err(|e| format!("DIARIZATION_DECODE_WAV:{e}"))?;
+    let samples =
+        decode_wav_pcm_f32(&wav_data).map_err(|e| format!("DIARIZATION_DECODE_WAV:{e}"))?;
 
     let mut vad = VadSegmenter::load(app).map_err(|e| format!("DIARIZATION_VAD_LOAD:{e}"))?;
-    let segments = vad.segment(&samples).map_err(|e| format!("DIARIZATION_VAD:{e}"))?;
+    let segments = vad
+        .segment(&samples)
+        .map_err(|e| format!("DIARIZATION_VAD:{e}"))?;
     let merged = merge_segments(&segments, 0.5);
 
     // Extract a speaker embedding for each merged VAD segment so identical
     // speakers cluster together across the whole video.
-    let mut embedder = SpeakerEmbedder::load(app).map_err(|e| format!("DIARIZATION_EMBED_LOAD:{e}"))?;
+    let mut embedder =
+        SpeakerEmbedder::load(app).map_err(|e| format!("DIARIZATION_EMBED_LOAD:{e}"))?;
     let embeddings: Vec<Option<ai_engine::SpeakerEmbedding>> = merged
         .iter()
         .map(|seg| {
             // Cut the segment's audio out of the full sample buffer for embedding.
             let start_sample = (seg.start * 16000.0) as usize;
             let end_sample = (seg.end * 16000.0) as usize;
-            let seg_samples = &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
+            let seg_samples =
+                &samples[start_sample.min(samples.len())..end_sample.min(samples.len())];
             if seg_samples.is_empty() {
                 None
             } else {
@@ -265,11 +309,14 @@ fn diarize_video_blocking(
 
     let intervals = diarize_segments(&merged, &embeddings);
 
-    Ok(serde_json::json!(intervals.iter().map(|i| serde_json::json!({
-        "start": i.start,
-        "end": i.end,
-        "speakerId": i.speaker_id
-    })).collect::<Vec<_>>()))
+    Ok(serde_json::json!(intervals
+        .iter()
+        .map(|i| serde_json::json!({
+            "start": i.start,
+            "end": i.end,
+            "speakerId": i.speaker_id
+        }))
+        .collect::<Vec<_>>()))
 }
 
 /// Decodes a WAV file (PCM16, mono or stereo) into interleaved f32 [-1,1] samples.
@@ -287,7 +334,11 @@ fn decode_wav_pcm_f32(data: &[u8]) -> Result<Vec<f32>, String> {
     let mut pos = 12;
     while pos + 8 <= data.len() {
         let id = &data[pos..pos + 4];
-        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().map_err(|_| "WAV chunk size".to_string())?) as usize;
+        let size = u32::from_le_bytes(
+            data[pos + 4..pos + 8]
+                .try_into()
+                .map_err(|_| "WAV chunk size".to_string())?,
+        ) as usize;
         if id == b"fmt " {
             fmt_offset = Some(pos + 8);
         } else if id == b"data" {
@@ -300,12 +351,36 @@ fn decode_wav_pcm_f32(data: &[u8]) -> Result<Vec<f32>, String> {
     if fmt_start + 16 > data.len() {
         return Err("WAV fmt chunk truncated".into());
     }
-    let audio_format = u16::from_le_bytes(data[fmt_start..fmt_start + 2].try_into().map_err(|_| "WAV format".to_string())?);
-    let channels = u16::from_le_bytes(data[fmt_start + 2..fmt_start + 4].try_into().map_err(|_| "WAV channels".to_string())?);
-    let _sample_rate = u32::from_le_bytes(data[fmt_start + 4..fmt_start + 8].try_into().map_err(|_| "WAV rate".to_string())?);
-    let _byte_rate = u32::from_le_bytes(data[fmt_start + 8..fmt_start + 12].try_into().map_err(|_| "WAV byte rate".to_string())?);
-    let _block_align = u16::from_le_bytes(data[fmt_start + 12..fmt_start + 14].try_into().map_err(|_| "WAV align".to_string())?);
-    let bits_per_sample = u16::from_le_bytes(data[fmt_start + 14..fmt_start + 16].try_into().map_err(|_| "WAV bits".to_string())?);
+    let audio_format = u16::from_le_bytes(
+        data[fmt_start..fmt_start + 2]
+            .try_into()
+            .map_err(|_| "WAV format".to_string())?,
+    );
+    let channels = u16::from_le_bytes(
+        data[fmt_start + 2..fmt_start + 4]
+            .try_into()
+            .map_err(|_| "WAV channels".to_string())?,
+    );
+    let _sample_rate = u32::from_le_bytes(
+        data[fmt_start + 4..fmt_start + 8]
+            .try_into()
+            .map_err(|_| "WAV rate".to_string())?,
+    );
+    let _byte_rate = u32::from_le_bytes(
+        data[fmt_start + 8..fmt_start + 12]
+            .try_into()
+            .map_err(|_| "WAV byte rate".to_string())?,
+    );
+    let _block_align = u16::from_le_bytes(
+        data[fmt_start + 12..fmt_start + 14]
+            .try_into()
+            .map_err(|_| "WAV align".to_string())?,
+    );
+    let bits_per_sample = u16::from_le_bytes(
+        data[fmt_start + 14..fmt_start + 16]
+            .try_into()
+            .map_err(|_| "WAV bits".to_string())?,
+    );
     if audio_format != 1 {
         return Err(format!("WAV format {audio_format} not PCM"));
     }
@@ -404,7 +479,9 @@ fn sample_speaker_faces_blocking(
         let img = image::open(&frame)
             .map_err(|e| format!("FACE_FRAME_READ:{e}"))?
             .into_rgb8();
-        let faces = detector.detect(&img).map_err(|e| format!("FACE_DETECT:{e}"))?;
+        let faces = detector
+            .detect(&img)
+            .map_err(|e| format!("FACE_DETECT:{e}"))?;
         for (face_index, face) in faces.into_iter().take(4).enumerate() {
             // Encode thumbnail as base64 JPEG.
             let thumbnail = encode_thumbnail(&img);
@@ -444,6 +521,274 @@ fn encode_thumbnail(img: &RgbImage) -> String {
     )
 }
 
+/// Largest face in a frame (the dominant subject), as a normalized 0..1 span.
+fn dominant_face(faces: &[ai_engine::Face]) -> Option<[f64; 4]> {
+    faces
+        .iter()
+        .max_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+        .map(|face| {
+            let half_w = face.width / 2.0;
+            let half_h = face.height / 2.0;
+            [
+                (face.center_x - half_w).max(0.0),
+                (face.center_x + half_w).min(1.0),
+                (face.center_y - half_h).max(0.0),
+                (face.center_y + half_h).min(1.0),
+            ]
+        })
+}
+
+/// Median of a non-empty coordinate list (even counts average the middle two).
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+/// Aggregates per-frame dominant-face spans into one stable person box plus the
+/// share of frames that contained a face. Returns None unless at least 60% of
+/// the sampled frames saw a face, so a range without a stable subject keeps the
+/// plain centre crop instead of chasing a face that is mostly absent.
+fn aggregate_person_box(frames: &[Option<[f64; 4]>]) -> Option<(serde_json::Value, f64)> {
+    let found: Vec<_> = frames.iter().flatten().collect();
+    let confidence = found.len() as f64 / frames.len() as f64;
+    if frames.is_empty() || confidence < 0.6 {
+        return None;
+    }
+    let coordinate = |index: usize| {
+        let mut values: Vec<f64> = found.iter().map(|span| span[index]).collect();
+        median(&mut values)
+    };
+    let (left, right, top, bottom) = (coordinate(0), coordinate(1), coordinate(2), coordinate(3));
+    Some((
+        serde_json::json!({ "left": left, "right": right, "top": top, "bottom": bottom }),
+        confidence,
+    ))
+}
+
+/// Samples a stable person box per render range by running the local face
+/// detector on a few frames (1 per second, capped at 5) spread across the range.
+///
+/// This is the auto path behind the composition crop: each returned layout makes
+/// the renderer centre the crop window on the detected subject instead of a
+/// static centre crop, and ranges without a stable face simply get no layout.
+/// Errors are swallowed by design — sampling must never block a render.
+pub(crate) fn auto_person_layouts(
+    app: &tauri::AppHandle,
+    input: &Path,
+    ranges: &[(f64, f64)],
+    source_artifact_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut report = AutoPersonReport {
+        detector_loaded: false,
+        detector_error: None,
+        ranges_total: ranges.len(),
+        ranges_with_layout: 0,
+        layouts_count: 0,
+        per_range: Vec::new(),
+    };
+
+    let mut detector = match FaceDetector::load(app) {
+        Ok(detector) => {
+            report.detector_loaded = true;
+            detector
+        }
+        Err(error) => {
+            report.detector_error = Some(error.to_string());
+            store_report(report);
+            return Vec::new();
+        }
+    };
+    let temp_dir = match app_render_temp_dir(app) {
+        Ok(dir) => dir,
+        Err(error) => {
+            report.detector_error = Some(format!("APP_TEMP_DIR:{error}"));
+            store_report(report);
+            return Vec::new();
+        }
+    };
+    let temp = match create_temporary_render_dir(&temp_dir) {
+        Ok(temp) => temp,
+        Err(error) => {
+            report.detector_error = Some(format!("TEMP_DIR:{error}"));
+            store_report(report);
+            return Vec::new();
+        }
+    };
+
+    let mut layouts = Vec::new();
+    for &(start, end) in ranges {
+        let mut range_info = serde_json::json!({ "start": start, "end": end });
+        if !start.is_finite() || !end.is_finite() || end <= start || end > 1800.0 {
+            range_info["skipped"] = serde_json::json!("invalid-range");
+            report.per_range.push(range_info);
+            continue;
+        }
+        let duration = end - start;
+        let samples = duration.min(5.0).ceil().max(1.0) as usize;
+        let mut frames = Vec::with_capacity(samples);
+        let mut face_frames = 0usize;
+        for index in 0..samples {
+            let time = start + duration * (index as f64 + 0.5) / samples as f64;
+            let frame = temp.0.join(format!("person-{index:02}.jpg"));
+            let status = tool(ffmpeg_bin(app))
+                .args(["-y", "-nostdin", "-v", "error", "-ss"])
+                .arg(format!("{time:.3}"))
+                .args(["-i"])
+                .arg(input)
+                .args(["-frames:v", "1", "-vf", "scale='min(640,iw)':-2"])
+                .arg(&frame)
+                .status();
+            let faces = if status.is_ok_and(|status| status.success()) {
+                image::open(&frame)
+                    .ok()
+                    .map(|image| image.into_rgb8())
+                    .and_then(|image| detector.detect(&image).ok())
+            } else {
+                None
+            };
+            if faces.as_ref().is_some_and(|f| !f.is_empty()) {
+                face_frames += 1;
+            }
+            frames.push(faces.and_then(|faces| dominant_face(&faces)));
+        }
+        let confidence = if frames.is_empty() {
+            0.0
+        } else {
+            frames.iter().filter(|f| f.is_some()).count() as f64 / frames.len() as f64
+        };
+        if let Some((person_box, conf)) = aggregate_person_box(&frames) {
+            report.ranges_with_layout += 1;
+            range_info["hasLayout"] = serde_json::json!(true);
+            range_info["confidence"] = serde_json::json!(conf);
+            range_info["personBox"] = person_box.clone();
+            layouts.push(serde_json::json!({
+                "start": start,
+                "end": end,
+                "personBox": person_box,
+                "confidence": confidence,
+                "confirmed": true,
+                "sourceArtifactId": source_artifact_id,
+            }));
+        } else {
+            range_info["hasLayout"] = serde_json::json!(false);
+            range_info["confidence"] = serde_json::json!(confidence);
+            range_info["faceFrames"] = serde_json::json!(face_frames);
+            range_info["sampleFrames"] = serde_json::json!(samples);
+        }
+        report.per_range.push(range_info);
+    }
+
+    report.layouts_count = layouts.len();
+    store_report(report);
+    layouts
+}
+
+/// Detects stable source text boxes locally for the burned-caption cover. Only
+/// normalized geometry is returned; OCR strings and frame contents are discarded.
+pub(crate) fn auto_text_boxes(
+    app: &tauri::AppHandle,
+    input: &Path,
+    ranges: &[(f64, f64)],
+    source_artifact_id: &str,
+) -> Result<Vec<Value>, String> {
+    let mut detector =
+        TextRegionDetector::load(app).map_err(|error| format!("OCR_MODEL_REQUIRED:{error}"))?;
+    const MAX_OCR_SAMPLES_PER_RENDER: usize = 60;
+    if ranges.len() > MAX_OCR_SAMPLES_PER_RENDER {
+        return Err("OCR_SAMPLE_LIMIT_EXCEEDED".into());
+    }
+    let desired_samples: Vec<usize> = ranges
+        .iter()
+        .map(|(start, end)| {
+            if start.is_finite() && end.is_finite() && end > start {
+                (end - start).ceil().clamp(1.0, 5.0) as usize
+            } else {
+                1
+            }
+        })
+        .collect();
+    let mut sample_counts = vec![1usize; ranges.len()];
+    let mut remaining = MAX_OCR_SAMPLES_PER_RENDER.saturating_sub(ranges.len());
+    for (index, desired) in desired_samples.iter().enumerate() {
+        let extra = desired.saturating_sub(1).min(remaining);
+        sample_counts[index] += extra;
+        remaining -= extra;
+    }
+    let temp_dir = app_render_temp_dir(app).map_err(|error| format!("APP_TEMP_DIR:{error}"))?;
+    let temp = create_temporary_render_dir(&temp_dir)?;
+    let mut layouts = Vec::new();
+
+    for (range_index, &(start, end)) in ranges.iter().enumerate() {
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start || end > 1800.0 {
+            return Err("OCR_INVALID_RANGE".into());
+        }
+        let samples = sample_counts[range_index];
+        let mut boxes = Vec::with_capacity(samples);
+        for index in 0..samples {
+            let time = start + (end - start) * (index as f64 + 0.5) / samples as f64;
+            let frame = temp.0.join(format!("ocr-{range_index:04}-{index:02}.jpg"));
+            let status = tool(ffmpeg_bin(app))
+                .args(["-y", "-nostdin", "-v", "error", "-ss"])
+                .arg(format!("{time:.3}"))
+                .args(["-i"])
+                .arg(input)
+                .args(["-frames:v", "1", "-vf", "scale='min(1280,iw)':-2"])
+                .arg(&frame)
+                .status()
+                .map_err(|error| format!("OCR_FRAME_EXTRACT:{error}"))?;
+            if !status.success() {
+                return Err("OCR_FRAME_EXTRACT_FAILED".into());
+            }
+            let image = image::open(&frame)
+                .map_err(|error| format!("OCR_FRAME_READ:{error}"))?
+                .into_rgb8();
+            boxes.push(
+                detector
+                    .detect(&image)
+                    .map_err(|error| format!("OCR_INFERENCE:{error}"))?,
+            );
+        }
+
+        let detected: Vec<TextBox> = boxes.into_iter().flatten().collect();
+        if detected.len() * 5 < samples * 3 {
+            continue;
+        }
+        let median = |field: fn(&TextBox) -> f64| {
+            let mut values: Vec<f64> = detected.iter().map(field).collect();
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let text_box = TextBox {
+            left: median(|b| b.left),
+            top: median(|b| b.top),
+            right: median(|b| b.right),
+            bottom: median(|b| b.bottom),
+        };
+        if text_box.right > text_box.left && text_box.bottom > text_box.top {
+            layouts.push(serde_json::json!({
+                "start": start,
+                "end": end,
+                "textBox": text_box,
+                "confidence": detected.len() as f64 / samples as f64,
+                "confirmed": true,
+                "sourceArtifactId": source_artifact_id,
+            }));
+        }
+    }
+    Ok(layouts)
+}
+
+fn store_report(report: AutoPersonReport) {
+    if let Ok(mut guard) = LAST_AUTO_PERSON_REPORT.lock() {
+        *guard = Some(report);
+    }
+}
+
 /// Traces the speaker's face across the source video.
 ///
 /// The work — one FFmpeg frame extraction plus one ONNX face detection per sample —
@@ -459,7 +804,14 @@ pub(crate) async fn analyze_crop_path(
     source_artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        analyze_crop_path_blocking(&app, &path, duration, &speaker_intervals, &face_mapping, &source_artifact_id)
+        analyze_crop_path_blocking(
+            &app,
+            &path,
+            duration,
+            &speaker_intervals,
+            &face_mapping,
+            &source_artifact_id,
+        )
     })
     .await
     .map_err(|error| format!("CROP_WORKER:{error}"))?
@@ -495,14 +847,29 @@ fn analyze_crop_path_blocking(
     let mut detector = FaceDetector::load(app).map_err(|e| format!("FACE_DETECTOR_LOAD:{e}"))?;
     let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
     let temp = create_temporary_render_dir(&temp_dir)?;
-    let frames: Vec<serde_json::Value> = extract_and_detect(app, &mut detector, &input, 5.0, 360, duration, &temp, "crop")?
-        .into_iter()
-        .map(|(time, faces)| serde_json::json!({"time": time, "faces": faces}))
-        .collect();
+    let frames: Vec<serde_json::Value> = extract_and_detect(
+        app,
+        &mut detector,
+        &input,
+        5.0,
+        360,
+        duration,
+        &temp,
+        "crop",
+    )?
+    .into_iter()
+    .map(|(time, faces)| serde_json::json!({"time": time, "faces": faces}))
+    .collect();
     let mapping_confirmed = face_mapping["confirmed"].as_bool() == Some(true)
         && face_mapping["sourceArtifactId"].as_str() == Some(source_artifact_id);
     let matches = face_mapping["matches"].as_object();
-    let output = track_crop_path(&frames, intervals, matches, mapping_confirmed, source_artifact_id);
+    let output = track_crop_path(
+        &frames,
+        intervals,
+        matches,
+        mapping_confirmed,
+        source_artifact_id,
+    );
     Ok(serde_json::json!(output))
 }
 
@@ -566,13 +933,15 @@ fn extract_and_detect(
         let faces = match detector.detect(&img) {
             Ok(faces) => faces
                 .into_iter()
-                .map(|f| serde_json::json!({
-                    "x": f.center_x,
-                    "y": f.center_y,
-                    "width": f.width,
-                    "height": f.height,
-                    "confidence": f.confidence,
-                }))
+                .map(|f| {
+                    serde_json::json!({
+                        "x": f.center_x,
+                        "y": f.center_y,
+                        "width": f.width,
+                        "height": f.height,
+                        "confidence": f.confidence,
+                    })
+                })
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -688,7 +1057,16 @@ fn analyze_scene_layouts_blocking(
     let mut previous_count: Option<usize> = None;
     // 1800s / 2s = 900 possible samples; the old loop stopped at 360 *scenes*,
     // which the loop below still honours.
-    for (time, faces) in extract_and_detect(app, &mut detector, &input, 2.0, 900, duration, &temp, "scene")? {
+    for (time, faces) in extract_and_detect(
+        app,
+        &mut detector,
+        &input,
+        2.0,
+        900,
+        duration,
+        &temp,
+        "scene",
+    )? {
         if scenes.len() >= 360 {
             break;
         }
@@ -714,10 +1092,9 @@ fn analyze_scene_layouts_blocking(
     Ok(serde_json::json!(scenes))
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::track_crop_path;
+    use super::{aggregate_person_box, dominant_face, track_crop_path};
 
     fn face(x: f64, y: f64, width: f64, height: f64, confidence: f64) -> serde_json::Value {
         serde_json::json!({"x": x, "y": y, "width": width, "height": height, "confidence": confidence})
@@ -728,7 +1105,10 @@ mod tests {
     }
 
     /// The speaker intervals and the confirmed face mapping a tracking run needs.
-    fn tracking_setup() -> (Vec<serde_json::Value>, serde_json::Map<String, serde_json::Value>) {
+    fn tracking_setup() -> (
+        Vec<serde_json::Value>,
+        serde_json::Map<String, serde_json::Value>,
+    ) {
         let intervals = vec![serde_json::json!({"start": 0.0, "end": 600.0, "speakerId": "A"})];
         let mut matches = serde_json::Map::new();
         // The face id's trailing number is the index of the face within a frame.
@@ -748,7 +1128,11 @@ mod tests {
             frame(10.0, vec![face(0.4, 0.4, 0.2, 0.2, 0.9)]),
         ];
         let path = track_crop_path(&frames, &intervals, Some(&matches), true, "src");
-        assert_eq!(path.len(), 2, "a frame with no face must not produce a keyframe");
+        assert_eq!(
+            path.len(),
+            2,
+            "a frame with no face must not produce a keyframe"
+        );
         assert_eq!(path[0]["time"], serde_json::json!(0.0));
         assert_eq!(path[1]["time"], serde_json::json!(10.0));
     }
@@ -771,7 +1155,10 @@ mod tests {
         // The second point is smoothed exactly once towards the new position:
         // 0.2 + 0.35 * (0.8 - 0.2) = 0.41. A second smoothing pass would give 0.2735.
         let second = path[1]["centerX"].as_f64().unwrap();
-        assert!((second - 0.41).abs() < 1e-9, "expected one smoothing pass, got {second}");
+        assert!(
+            (second - 0.41).abs() < 1e-9,
+            "expected one smoothing pass, got {second}"
+        );
         assert!(
             second > 0.4,
             "the crop must keep following the subject, not lag behind it"
@@ -790,7 +1177,11 @@ mod tests {
         let path = track_crop_path(&frames, &intervals, Some(&matches), true, "src");
         assert_eq!(path[0]["sceneId"], serde_json::json!(0));
         assert_eq!(path[1]["sceneId"], serde_json::json!(0));
-        assert_eq!(path[2]["sceneId"], serde_json::json!(1), "a subject that jumps is a new scene");
+        assert_eq!(
+            path[2]["sceneId"],
+            serde_json::json!(1),
+            "a subject that jumps is a new scene"
+        );
     }
 
     /// Without a confirmed speaker→face mapping the tracker has no way to pick a face,
@@ -801,11 +1192,61 @@ mod tests {
         let frames = vec![frame(0.0, vec![face(0.4, 0.4, 0.2, 0.2, 0.9)])];
 
         let unconfirmed = track_crop_path(&frames, &intervals, Some(&matches), false, "src");
-        assert!(unconfirmed.is_empty(), "an unconfirmed mapping must not produce a crop");
+        assert!(
+            unconfirmed.is_empty(),
+            "an unconfirmed mapping must not produce a crop"
+        );
 
         let confirmed = track_crop_path(&frames, &intervals, Some(&matches), true, "src");
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0]["speakerId"], serde_json::json!("A"));
         assert_eq!(confirmed[0]["faceIndex"], serde_json::json!(0));
+    }
+
+    fn ai_face(center_x: f64, center_y: f64, width: f64, height: f64) -> ai_engine::Face {
+        ai_engine::Face {
+            center_x,
+            center_y,
+            width,
+            height,
+            confidence: 0.9,
+        }
+    }
+
+    /// The dominant face wins: the largest area in the frame becomes the subject span.
+    #[test]
+    fn dominant_face_picks_the_largest_face() {
+        let faces = vec![ai_face(0.2, 0.3, 0.10, 0.10), ai_face(0.7, 0.4, 0.20, 0.20)];
+        let span = dominant_face(&faces).unwrap();
+        assert!((span[0] - 0.6).abs() < 1e-9 && (span[1] - 0.8).abs() < 1e-9);
+        assert!((span[2] - 0.3).abs() < 1e-9 && (span[3] - 0.5).abs() < 1e-9);
+        assert_eq!(dominant_face(&[]), None);
+    }
+
+    /// Enough frames with a face: one stable box from the per-coordinate medians.
+    #[test]
+    fn aggregate_person_box_takes_medians_when_most_frames_have_a_face() {
+        let frames: Vec<Option<[f64; 4]>> = vec![
+            Some([0.40, 0.60, 0.10, 0.30]),
+            Some([0.42, 0.58, 0.12, 0.28]),
+            Some([0.80, 0.90, 0.50, 0.70]),
+            Some([0.41, 0.59, 0.11, 0.29]),
+            Some([0.43, 0.61, 0.13, 0.31]),
+            None,
+        ];
+        let (box_json, confidence) = aggregate_person_box(&frames).unwrap();
+        assert_eq!(box_json["left"], serde_json::json!(0.42));
+        assert_eq!(box_json["right"], serde_json::json!(0.6));
+        assert_eq!(box_json["top"], serde_json::json!(0.12));
+        assert_eq!(box_json["bottom"], serde_json::json!(0.3));
+        assert!((confidence - 5.0 / 6.0).abs() < 1e-9);
+    }
+
+    /// A face that only appears in a minority of frames is not a stable subject.
+    #[test]
+    fn aggregate_person_box_requires_a_majority_of_face_frames() {
+        let frames: Vec<Option<[f64; 4]>> = vec![Some([0.4, 0.6, 0.1, 0.3]), None, None, None];
+        assert_eq!(aggregate_person_box(&frames), None);
+        assert_eq!(aggregate_person_box(&[]), None);
     }
 }
