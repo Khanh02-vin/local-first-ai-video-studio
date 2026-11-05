@@ -239,6 +239,7 @@ done
 # --- whisper-cli binary (standalone, no Python) --------------------------------
 # whisper.cpp official releases provide prebuilt binaries for major platforms.
 # We download the CLI binary directly; no Python/PyTorch needed at runtime.
+WHISPER_CPP_SOURCE_REF="${WHISPER_CPP_SOURCE_REF:-d1be6fde11ac6e0407606b4e42fe72d34add8037}"
 echo "==> whisper-cli binary: $WHISPER_CLI_VERSION"
 case "$OS-$ARCH" in
   Linux-x86_64)
@@ -251,11 +252,8 @@ case "$OS-$ARCH" in
     WHISPER_CLI_DIR="whisper-bin-ubuntu-arm64"
     WHISPER_CLI_BIN="whisper-cli"
     ;;
-  Darwin-arm64)
-    echo "whisper.cpp macOS binary bundle is not part of the pinned release; set WHISPER_CLI_URL to a signed build." >&2; exit 1
-    ;;
-  Darwin-x86_64)
-    echo "whisper.cpp macOS binary bundle is not part of the pinned release; set WHISPER_CLI_URL to a signed build." >&2; exit 1
+  Darwin-arm64|Darwin-x86_64)
+    WHISPER_CLI_BIN="whisper-cli"
     ;;
   MINGW*|MSYS*|CYGWIN*)
     WHISPER_CLI_URL="https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_CLI_VERSION}/whisper-bin-x64.zip"
@@ -268,6 +266,32 @@ esac
 WHISPER_CLI_TARGET="$RES/whisper-cpp/$WHISPER_CLI_BIN"
 if [[ -x "$WHISPER_CLI_TARGET" ]]; then
   echo "    whisper-cli already present"
+elif [[ "$OS" == Darwin ]]; then
+  # The pinned upstream release has no macOS CLI archive. Build that CLI from
+  # an exact source commit; keep the extracted source separate from CMake output.
+  command -v cmake >/dev/null 2>&1 || { echo "cmake is required to build whisper-cli on macOS" >&2; exit 1; }
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/source" "$tmp/build"
+  echo "  Fetching whisper.cpp source: $WHISPER_CPP_SOURCE_REF"
+  curl -L --fail --retry 3 -o "$tmp/whisper.cpp.tar.gz" \
+    "https://github.com/ggml-org/whisper.cpp/archive/${WHISPER_CPP_SOURCE_REF}.tar.gz"
+  tar -xzf "$tmp/whisper.cpp.tar.gz" -C "$tmp/source" --strip-components=1
+  cmake -S "$tmp/source" -B "$tmp/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DWHISPER_BUILD_EXAMPLES=ON \
+    -DWHISPER_BUILD_TESTS=OFF \
+    -DWHISPER_BUILD_SERVER=OFF \
+    -DWHISPER_SDL2=OFF
+  cmake --build "$tmp/build" --config Release --target whisper-cli --parallel 2
+  [[ -x "$tmp/build/bin/whisper-cli" ]] || { echo "whisper-cli build output missing" >&2; exit 1; }
+  mkdir -p "$RES/whisper-cpp"
+  install -m 755 "$tmp/build/bin/whisper-cli" "$WHISPER_CLI_TARGET"
+  "$WHISPER_CLI_TARGET" --help >/dev/null
+  rm -rf "$tmp"
+  trap - EXIT
+  echo "    whisper-cli built and smoke-tested from pinned source"
 else
   echo "  Fetching whisper-cli: $WHISPER_CLI_URL"
   tmp="$(mktemp -d)"
@@ -283,13 +307,11 @@ else
   if [[ -z "$found_cli" ]]; then
     echo "whisper-cli binary not found in archive" >&2; exit 1
   fi
-  WHISPER_CLI_TARGET="$RES/whisper-cpp/$WHISPER_CLI_BIN"
   mkdir -p "$RES/whisper-cpp"
   cp -f "$found_cli" "$WHISPER_CLI_TARGET"
-  # Copy the shared libraries shipped beside whisper-cli; the runtime resolver
-  # launches with this directory as its library root.
+  # Copy shared libraries shipped beside the CLI; the runtime resolver uses this directory.
   found_dir="$(dirname "$found_cli")"
-  find "$found_dir" -maxdepth 1 -type f \( -name 'libwhisper*.so*' -o -name 'libggml*.so*' -o -name 'libwhisper*.dylib' -o -name 'libggml*.dylib' -o -name '*.dll' \) -exec cp -f {} "$RES/whisper-cpp/" \;
+  find "$found_dir" -maxdepth 1 -type f \( -name 'libwhisper*.so*' -o -name 'libggml*.so*' -o -name '*.dll' \) -exec cp -f {} "$RES/whisper-cpp/" \;
   if [[ "$OS" == Linux* ]]; then
     for lib in libwhisper.so.1.9.5 libggml.so.0.26.0 libggml-base.so.0.26.0; do
       [[ -f "$RES/whisper-cpp/$lib" ]] || continue

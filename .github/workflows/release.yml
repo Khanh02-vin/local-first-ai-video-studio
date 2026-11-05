@@ -25,8 +25,8 @@ permissions:
 
 jobs:
   lint-test:
-    # Self-hosted runner (Vostro) — không tốn quota GitHub Actions.
-    runs-on: [self-hosted, self-vostro]
+    # Hosted runner keeps full-workspace linking away from the nearly full Vostro disk.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -74,6 +74,11 @@ jobs:
           security find-identity -v codesigning | grep 'Developer ID Application' | awk -F\" 'NR==1{print $2}' > "$RUNNER_TEMP/apple_signing_identity"
       - name: Fetch bundled core resources
         run: bash scripts/fetch-bundled-assets.sh
+      - name: Verify bundled Whisper CLI (macOS)
+        run: |
+          CLI=apps/desktop/src-tauri/resources/whisper-cpp/whisper-cli
+          test -x "$CLI"
+          "$CLI" --help >/dev/null
       - name: Build web frontend
         run: |
           cd apps/web
@@ -188,7 +193,7 @@ jobs:
           path: apps/desktop/src-tauri/target/release/portable-windows.zip
 
   linux:
-    runs-on: [self-hosted, self-vostro]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
